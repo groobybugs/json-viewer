@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist-electron/main.js",
   "description": "A simple JSON viewer app built with Vite and Electron.",
-  "author": "Groobybugs",
+  "author": "Groobybugs <groobybugs299@hotmail.com>",
+  "license": "MIT",
   "build": {
     "appId": "com.jsonviewer.app",
     "productName": "JSON Viewer",
