@@ -2,7 +2,7 @@
 
 A clean and modern desktop application for viewing, formatting, and manipulating JSON data. Built with Electron, React, and TypeScript.
 
-![App Screenshot](docs/screenshot.png)
+![App Screenshot](docs/img.png)
 
 ## Features
 
