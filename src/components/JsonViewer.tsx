@@ -1,9 +1,21 @@
-import { useCallback } from 'react';
+// src/components/JsonViewer.tsx
+import { useCallback, useRef } from 'react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Copy, Files, FileJson, MinusSquare, PlusSquare, Plus, X, Loader2 } from 'lucide-react';
+import {
+  Copy,
+  Files,
+  FileJson,
+  MinusSquare,
+  PlusSquare,
+  Plus,
+  X,
+  Loader2,
+  Download,
+  Upload
+} from 'lucide-react';
 import { useAppDispatch, useAppSelector } from '../store';
 import {
   addTab,
@@ -12,18 +24,21 @@ import {
   setActiveTab,
   setActiveTabContent,
   clearTab,
-  processJsonData
+  processJsonContent,
+  saveTabToDB
 } from '../store/tabsSlice';
+import { FileDropzone } from './FileDropzone';
+import { SearchBar, SearchResults } from './SearchBar';
 
-const JsonViewer = () => {
+const JSONViewer = () => {
   const dispatch = useAppDispatch();
   const {
     tabs,
     activeTabId,
     activeTabContent
   } = useAppSelector(state => state.tabs);
-
   const activeTab = tabs.find(tab => tab.id === activeTabId);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleAddTab = () => {
     dispatch(addTab());
@@ -42,11 +57,12 @@ const JsonViewer = () => {
     if (!tab?.input) return;
 
     try {
-      await dispatch(processJsonData({
+      await dispatch(processJsonContent({
         tabId,
         input: tab.input,
         action: 'format'
       })).unwrap();
+      dispatch(saveTabToDB(tab)); // Save to IndexedDB
     } catch (error) {
       console.error('Error formatting JSON:', error);
     }
@@ -57,11 +73,12 @@ const JsonViewer = () => {
     if (!tab?.input) return;
 
     try {
-      await dispatch(processJsonData({
+      await dispatch(processJsonContent({
         tabId,
         input: tab.input,
         action: 'minify'
       })).unwrap();
+      dispatch(saveTabToDB(tab)); // Save to IndexedDB
     } catch (error) {
       console.error('Error minifying JSON:', error);
     }
@@ -70,7 +87,7 @@ const JsonViewer = () => {
   const handleCopyToClipboard = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      // Could add a toast notification here
+      // You could add a toast notification here
     } catch (err) {
       console.error('Failed to copy text: ', err);
     }
@@ -79,6 +96,35 @@ const JsonViewer = () => {
   const handleClearTab = (tabId: string) => {
     dispatch(clearTab(tabId));
     dispatch(setActiveTabContent('input'));
+  };
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        if (event.target?.result) {
+          const content = event.target.result as string;
+          handleInputChange(activeTabId, content);
+        }
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const handleExportJson = (tab: Tab) => {
+    const content = tab.output || tab.input;
+    if (!content) return;
+
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${tab.name}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -90,16 +136,37 @@ const JsonViewer = () => {
             <FileJson className="h-8 w-8 text-blue-400" />
             <h1 className="text-2xl font-bold">Simple JSON Viewer</h1>
           </div>
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleAddTab}
-            className="gap-2"
-          >
-            <Plus className="h-4 w-4" />
-            New Json
-          </Button>
+          <div className="flex items-center gap-2">
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileSelect}
+              accept=".json,application/json"
+              className="hidden"
+            />
+            <Button
+              variant="default"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+              className="gap-2"
+            >
+              <Upload className="h-4 w-4" />
+              Import JSON
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleAddTab}
+              className="gap-2"
+            >
+              <Plus className="h-4 w-4" />
+              New Json
+            </Button>
+          </div>
         </div>
+
+        {/* Search Bar */}
+        <SearchBar />
 
         {/* Tab Bar */}
         <div className="w-full border-b border-slate-700">
@@ -128,6 +195,9 @@ const JsonViewer = () => {
             ))}
           </div>
         </div>
+
+        {/* Search Results */}
+        <SearchResults />
 
         {/* Main Content */}
         {activeTab && (
@@ -180,15 +250,26 @@ const JsonViewer = () => {
                       Minify
                     </Button>
                     {activeTab.output && (
-                      <Button
-                        variant="default"
-                        size="sm"
-                        onClick={() => handleCopyToClipboard(activeTab.output)}
-                        className="gap-2"
-                      >
-                        <Copy className="h-4 w-4" />
-                        Copy
-                      </Button>
+                      <>
+                        <Button
+                          variant="default"
+                          size="sm"
+                          onClick={() => handleCopyToClipboard(activeTab.output)}
+                          className="gap-2"
+                        >
+                          <Copy className="h-4 w-4" />
+                          Copy
+                        </Button>
+                        <Button
+                          variant="default"
+                          size="sm"
+                          onClick={() => handleExportJson(activeTab)}
+                          className="gap-2"
+                        >
+                          <Download className="h-4 w-4" />
+                          Export
+                        </Button>
+                      </>
                     )}
                     <Button
                       variant="default"
@@ -203,15 +284,18 @@ const JsonViewer = () => {
                 </div>
 
                 <TabsContent value="input" className="m-0">
-                  <div className="relative h-[calc(100vh-300px)] min-h-[600px] bg-slate-900 rounded-b-lg overflow-hidden">
+                  <FileDropzone
+                    onFileContent={(content) => handleInputChange(activeTab.id, content)}
+                    className="h-[calc(100vh-300px)] min-h-[600px]"
+                  >
                     <textarea
                       value={activeTab.input}
                       onChange={(e) => handleInputChange(activeTab.id, e.target.value)}
                       className="w-full h-full bg-slate-900 text-slate-50 p-4 font-mono text-sm resize-none focus:outline-none"
-                      placeholder="Paste your JSON here..."
+                      placeholder="Paste your JSON here or drop a JSON file..."
                       spellCheck="false"
                     />
-                  </div>
+                  </FileDropzone>
                 </TabsContent>
 
                 <TabsContent value="output" className="m-0">
@@ -241,4 +325,4 @@ const JsonViewer = () => {
   );
 };
 
-export default JsonViewer;
+export default JSONViewer;
