@@ -1,15 +1,14 @@
-import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit';
-import { openDB } from 'idb';
+import {createAsyncThunk, createSlice, PayloadAction} from '@reduxjs/toolkit';
+import {openDB} from 'idb';
 
 // Initialize IndexedDB
 const initDB = async () => {
-  const db = await openDB('jsonViewerDB', 1, {
+  return await openDB('jsonViewerDB', 1, {
     upgrade(db) {
       db.createObjectStore('tabs');
       db.createObjectStore('files');
     },
   });
-  return db;
 };
 
 export interface Tab {
@@ -52,7 +51,7 @@ const initialState: TabsState = {
 // Worker instance
 const jsonWorker = new Worker(
   new URL('../workers/jsonWorker.ts', import.meta.url),
-  { type: 'module' }
+  {type: 'module'}
 );
 
 // Async thunks
@@ -60,8 +59,7 @@ export const loadTabsFromDB = createAsyncThunk(
   'tabs/loadFromDB',
   async () => {
     const db = await initDB();
-    const tabs = await db.getAll('tabs');
-    return tabs;
+    return await db.getAll('tabs');
   }
 );
 
@@ -76,38 +74,38 @@ export const saveTabToDB = createAsyncThunk(
 
 export const processJsonContent = createAsyncThunk(
   'tabs/processContent',
-  async ({ tabId, input, action }: { tabId: string; input: string; action: 'format' | 'minify' }) => {
+  async ({input, action}: { tabId: string; input: string; action: 'format' | 'minify' }) => {
     return new Promise<{ output: string }>((resolve, reject) => {
       const messageHandler = (event: MessageEvent) => {
         if (event.data.error) {
           reject(event.data.error);
         } else {
-          resolve({ output: event.data.result });
+          resolve({output: event.data.result});
         }
         jsonWorker.removeEventListener('message', messageHandler);
       };
 
       jsonWorker.addEventListener('message', messageHandler);
-      jsonWorker.postMessage({ type: 'process', input, action });
+      jsonWorker.postMessage({type: 'process', input, action});
     });
   }
 );
 
 export const searchInJson = createAsyncThunk(
   'tabs/search',
-  async ({ tabId, input, query }: { tabId: string; input: string; query: string }) => {
+  async ({input, query}: { tabId: string; input: string; query: string }) => {
     return new Promise<{ results: Array<{ path: string[]; value: any }> }>((resolve, reject) => {
       const messageHandler = (event: MessageEvent) => {
         if (event.data.error) {
           reject(event.data.error);
         } else {
-          resolve({ results: event.data.results });
+          resolve({results: event.data.results});
         }
         jsonWorker.removeEventListener('message', messageHandler);
       };
 
       jsonWorker.addEventListener('message', messageHandler);
-      jsonWorker.postMessage({ type: 'search', input, searchQuery: query });
+      jsonWorker.postMessage({type: 'search', input, searchQuery: query});
     });
   }
 );
@@ -182,20 +180,20 @@ const tabsSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(loadTabsFromDB.fulfilled, (state, action) => {
-              if (action.payload?.length > 0) {
-                state.tabs = action.payload;
-                state.activeTabId = action.payload[0].id;
-                state.tabCounter = Math.max(...action.payload.map(tab =>
-                  parseInt(tab.id.split('-')[1] || '0')
-                ));
-              }
-            })
+        if (action.payload?.length > 0) {
+          state.tabs = action.payload;
+          state.activeTabId = action.payload[0].id;
+          state.tabCounter = Math.max(...action.payload.map(tab =>
+            parseInt(tab.id.split('-')[1] || '0')
+          ));
+        }
+      })
       .addCase(searchInJson.pending, (state, action) => {
-          const tab = state.tabs.find(t => t.id === action.meta.arg.tabId);
-          if (tab) {
-            tab.isProcessing = true;
-          }
-        })
+        const tab = state.tabs.find(t => t.id === action.meta.arg.tabId);
+        if (tab) {
+          tab.isProcessing = true;
+        }
+      })
       .addCase(searchInJson.fulfilled, (state, action) => {
         const tab = state.tabs.find(t => t.id === action.meta.arg.tabId);
         if (tab) {

@@ -20,14 +20,14 @@ function searchInObject(obj: any, query: string, path: string[] = []): SearchRes
 
     // Search in key names
     if (key.toLowerCase().includes(lowerQuery)) {
-      results.push({ path: currentPath, value });
+      results.push({path: currentPath, value});
     }
 
     // Search in values
     if (typeof value === 'string' && value.toLowerCase().includes(lowerQuery)) {
-      results.push({ path: currentPath, value });
+      results.push({path: currentPath, value});
     } else if (typeof value === 'number' && value.toString().includes(query)) {
-      results.push({ path: currentPath, value });
+      results.push({path: currentPath, value});
     } else if (typeof value === 'object' && value !== null) {
       results = results.concat(searchInObject(value, query, currentPath));
     }
@@ -37,7 +37,7 @@ function searchInObject(obj: any, query: string, path: string[] = []): SearchRes
 }
 
 self.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
-  const { type, input, action, searchQuery, schema } = event.data;
+  const {type, input, action, searchQuery} = event.data;
 
   try {
     switch (type) {
@@ -51,32 +51,32 @@ self.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
           result = JSON.stringify(jsonObj);
         }
 
-        self.postMessage({ type: 'process', result });
+        self.postMessage({type: 'process', result});
         break;
       }
 
       case 'validate': {
-        const jsonObj = JSON.parse(input);
-        // Here you could add schema validation logic
+        // const jsonObj = JSON.parse(input);
+        // TODO: add schema validation logic
         // For example, using Ajv or another JSON schema validator
-        self.postMessage({ type: 'validate', isValid: true });
+        self.postMessage({type: 'validate', isValid: true});
         break;
       }
 
       case 'search': {
         if (!searchQuery) {
-          self.postMessage({ type: 'search', results: [] });
+          self.postMessage({type: 'search', results: []});
           return;
         }
 
         const jsonObj = JSON.parse(input);
         const results = searchInObject(jsonObj, searchQuery);
-        self.postMessage({ type: 'search', results });
+        self.postMessage({type: 'search', results});
         break;
       }
 
       default:
-        throw new Error('Unknown action type');
+        console.error('Unknown message type:', type);
     }
   } catch (error) {
     self.postMessage({

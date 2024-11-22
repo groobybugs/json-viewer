@@ -1,8 +1,8 @@
-import { useCallback, useRef } from 'react';
-import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Button } from '@/components/ui/button';
-import { Card } from '@/components/ui/card';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import {useCallback, useRef} from 'react';
+import {Alert, AlertDescription} from '@/components/ui/alert';
+import {Button} from '@/components/ui/button';
+import {Card} from '@/components/ui/card';
+import {Tabs, TabsContent, TabsList, TabsTrigger} from '@/components/ui/tabs';
 import {
   Copy,
   Files,
@@ -15,7 +15,7 @@ import {
   Download,
   Upload
 } from 'lucide-react';
-import { useAppDispatch, useAppSelector } from '../store';
+import {useAppDispatch, useAppSelector} from '@/store';
 import {
   addTab,
   removeTab,
@@ -24,10 +24,24 @@ import {
   setActiveTabContent,
   clearTab,
   processJsonContent,
-  saveTabToDB
+  saveTabToDB,
+  Tab
 } from '../store/tabsSlice';
-import { FileDropzone } from './FileDropzone';
-import { SearchBar, SearchResults } from './SearchBar';
+import {FileDropzone} from './FileDropzone';
+import {SearchBar, SearchResults} from './SearchBar';
+import {Prism as SyntaxHighlighter} from 'react-syntax-highlighter';
+import {vscDarkPlus} from 'react-syntax-highlighter/dist/esm/styles/prism';
+
+const customStyle = {
+  backgroundColor: '#1a1b26',
+  margin: 0,
+  padding: '1.5rem',
+  fontSize: '0.875rem',
+  borderRadius: '0 0 0.5rem 0.5rem',
+  height: 'calc(100vh - 300px)',
+  minHeight: '600px',
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+};
 
 const JSONViewer = () => {
   const dispatch = useAppDispatch();
@@ -48,7 +62,7 @@ const JSONViewer = () => {
   };
 
   const handleInputChange = useCallback((tabId: string, value: string) => {
-    dispatch(updateTabInput({ tabId, input: value }));
+    dispatch(updateTabInput({tabId, input: value}));
   }, [dispatch]);
 
   const handleFormatJson = async (tabId: string) => {
@@ -115,7 +129,7 @@ const JSONViewer = () => {
     const content = tab.output || tab.input;
     if (!content) return;
 
-    const blob = new Blob([content], { type: 'application/json' });
+    const blob = new Blob([content], {type: 'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -132,7 +146,7 @@ const JSONViewer = () => {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <FileJson className="h-8 w-8 text-blue-400" />
+            <FileJson className="h-8 w-8 text-blue-400"/>
             <h1 className="text-2xl font-bold">Simple JSON Viewer</h1>
           </div>
           <div className="flex items-center gap-2">
@@ -149,7 +163,7 @@ const JSONViewer = () => {
               onClick={() => fileInputRef.current?.click()}
               className="gap-2"
             >
-              <Upload className="h-4 w-4" />
+              <Upload className="h-4 w-4"/>
               Import JSON
             </Button>
             <Button
@@ -158,14 +172,14 @@ const JSONViewer = () => {
               onClick={handleAddTab}
               className="gap-2"
             >
-              <Plus className="h-4 w-4" />
+              <Plus className="h-4 w-4"/>
               New Json
             </Button>
           </div>
         </div>
 
         {/* Search Bar */}
-        <SearchBar />
+        <SearchBar/>
 
         {/* Tab Bar */}
         <div className="w-full border-b border-slate-700">
@@ -196,7 +210,7 @@ const JSONViewer = () => {
         </div>
 
         {/* Search Results */}
-        <SearchResults />
+        <SearchResults/>
 
         {/* Main Content */}
         {activeTab && (
@@ -228,9 +242,9 @@ const JSONViewer = () => {
                       className="gap-2"
                     >
                       {activeTab.isProcessing ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <Loader2 className="h-4 w-4 animate-spin"/>
                       ) : (
-                        <PlusSquare className="h-4 w-4" />
+                        <PlusSquare className="h-4 w-4"/>
                       )}
                       Format
                     </Button>
@@ -242,9 +256,9 @@ const JSONViewer = () => {
                       className="gap-2"
                     >
                       {activeTab.isProcessing ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <Loader2 className="h-4 w-4 animate-spin"/>
                       ) : (
-                        <MinusSquare className="h-4 w-4" />
+                        <MinusSquare className="h-4 w-4"/>
                       )}
                       Minify
                     </Button>
@@ -256,7 +270,7 @@ const JSONViewer = () => {
                           onClick={() => handleCopyToClipboard(activeTab.output)}
                           className="gap-2"
                         >
-                          <Copy className="h-4 w-4" />
+                          <Copy className="h-4 w-4"/>
                           Copy
                         </Button>
                         <Button
@@ -265,7 +279,7 @@ const JSONViewer = () => {
                           onClick={() => handleExportJson(activeTab)}
                           className="gap-2"
                         >
-                          <Download className="h-4 w-4" />
+                          <Download className="h-4 w-4"/>
                           Export
                         </Button>
                       </>
@@ -276,7 +290,7 @@ const JSONViewer = () => {
                       onClick={() => handleClearTab(activeTab.id)}
                       className="gap-2"
                     >
-                      <Files className="h-4 w-4" />
+                      <Files className="h-4 w-4"/>
                       Clear
                     </Button>
                   </div>
@@ -298,13 +312,18 @@ const JSONViewer = () => {
                 </TabsContent>
 
                 <TabsContent value="output" className="m-0">
-                  <pre className="w-full h-[calc(100vh-300px)] min-h-[600px] bg-slate-900 rounded-b-lg p-4 font-mono text-sm overflow-auto">
-                    {activeTab.output && (
-                      <code className="text-green-400">
+                  {activeTab.output && (
+                    <div className="w-full h-[calc(100vh-300px)] min-h-[600px] bg-slate-900 rounded-b-lg">
+                      <SyntaxHighlighter
+                        language="json"
+                        style={vscDarkPlus}
+                        customStyle={customStyle}
+                        wrapLines={true}
+                      >
                         {activeTab.output}
-                      </code>
-                    )}
-                  </pre>
+                      </SyntaxHighlighter>
+                    </div>
+                  )}
                 </TabsContent>
               </Tabs>
             </Card>

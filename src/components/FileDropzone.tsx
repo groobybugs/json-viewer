@@ -1,6 +1,6 @@
-import { useCallback, useState, useRef } from 'react';
-import { FileJson, Upload } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import React, {useCallback, useState, useRef} from 'react';
+import {Upload} from 'lucide-react';
+import {cn} from '@/lib/utils';
 
 interface FileDropzoneProps {
   onFileContent: (content: string) => void;
@@ -8,7 +8,7 @@ interface FileDropzoneProps {
   children?: React.ReactNode;
 }
 
-export const FileDropzone = ({ onFileContent, className, children }: FileDropzoneProps) => {
+export const FileDropzone = ({onFileContent, className, children}: FileDropzoneProps) => {
   const [isDragging, setIsDragging] = useState(false);
   const dragCounter = useRef(0);
 
@@ -73,7 +73,7 @@ export const FileDropzone = ({ onFileContent, className, children }: FileDropzon
       {isDragging && (
         <div className="absolute inset-0 bg-slate-800/90 backdrop-blur-sm flex items-center justify-center z-50">
           <div className="text-center space-y-4 p-8 rounded-lg border-2 border-dashed border-blue-500">
-            <Upload className="w-12 h-12 text-blue-400 mx-auto" />
+            <Upload className="w-12 h-12 text-blue-400 mx-auto"/>
             <p className="text-lg font-medium text-slate-200">Drop your JSON file here</p>
           </div>
         </div>

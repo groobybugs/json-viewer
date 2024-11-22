@@ -1,8 +1,7 @@
-import { useEffect, useState, useCallback } from 'react';
-import { Search, X, Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { useAppDispatch, useAppSelector } from '../store';
-import { searchInJson, setSearchQuery } from '../store/tabsSlice';
+import {useEffect, useState, useCallback} from 'react';
+import {Search, X, Loader2} from 'lucide-react';
+import {useAppDispatch, useAppSelector} from '@/store';
+import {searchInJson, setSearchQuery} from '../store/tabsSlice';
 import debounce from 'lodash/debounce';
 
 export const SearchBar = () => {
@@ -50,7 +49,7 @@ export const SearchBar = () => {
   return (
     <div className="relative flex items-center">
       <div className="relative flex-1">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400"/>
         <input
           type="text"
           value={localQuery}
@@ -67,9 +66,9 @@ export const SearchBar = () => {
                      hover:bg-slate-700 text-slate-400 hover:text-slate-200"
           >
             {isSearching ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Loader2 className="h-4 w-4 animate-spin"/>
             ) : (
-              <X className="h-4 w-4" />
+              <X className="h-4 w-4"/>
             )}
           </button>
         )}

@@ -109,7 +109,7 @@
 }
 
 /* For the main content area */
-.min-h-[600px] {
+.min-h-600px {
   scrollbar-width: thin;
   scrollbar-color: #475569 #1e293b;
 }
@@ -173,4 +173,30 @@ pre {
   &:hover {
     overflow: auto;
   }
+}
+
+/* Custom scrollbar for syntax highlighter */
+pre::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+pre::-webkit-scrollbar-track {
+  background: #1a1b26;
+  border-radius: 4px;
+}
+
+pre::-webkit-scrollbar-thumb {
+  background: #434461;
+  border-radius: 4px;
+}
+
+pre::-webkit-scrollbar-thumb:hover {
+  background: #565a7d;
+}
+
+/* For Firefox */
+pre {
+  scrollbar-width: thin;
+  scrollbar-color: #434461 #1a1b26;
 }
