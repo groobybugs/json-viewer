@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hasher;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -278,17 +278,44 @@ fn unique_temp(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.{}.{}.tmp", std::process::id(), seq))
 }
 
-/// Writes `bytes` to `path` atomically: a unique sibling temp file is renamed
-/// over the destination. On any failure the temp file is removed and the
-/// destination is left exactly as it was.
+/// Writes `bytes` to `path` durably and atomically: a unique sibling temp file
+/// is created, fully written, and `sync_all`'d to disk before being renamed
+/// over the destination, so a power loss cannot leave a renamed-but-empty or
+/// truncated file. On unix the parent directory is also fsync'd after the
+/// rename (best effort) so the rename itself survives a crash. On any failure
+/// the temp file is removed and the destination is left exactly as it was.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp = unique_temp(path);
-    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, path));
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        sync_parent_dir(path);
+        Ok(())
+    })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
 }
+
+/// Best-effort fsync of the directory containing `path` so a rename is durable
+/// across power loss. Errors are ignored: the file data is already synced and
+/// the rename succeeded, so failing here must not fail the save.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// Loads tabs from [`data_path`].
 pub fn load_tabs() -> Result<Vec<Tab>, PersistError> {
