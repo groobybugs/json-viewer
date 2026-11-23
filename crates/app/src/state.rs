@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rune::TextEdit;
 use serde::{Deserialize, Serialize};
 
-use crate::json_ops::{JsonAction, JsonError};
+use crate::json_ops::{JsonAction, JsonError, ValidationInfo};
 use crate::search::SearchHit;
 
 /// Stable identifier for a tab. Ids are never reused within a session.
@@ -28,6 +28,15 @@ pub enum TabView {
     Input,
     /// The formatted/minified result.
     Output,
+}
+
+/// Result of the latest explicit validation or failed JSON action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationResult {
+    /// The input is valid; these statistics came from the streaming parser.
+    Valid(ValidationInfo),
+    /// The input is invalid at the contained source location.
+    Invalid(JsonError),
 }
 
 /// One JSON document.
@@ -66,6 +75,9 @@ pub struct Tab {
     /// Revision of `output`, assigned by the JSON worker on every success.
     #[serde(default)]
     pub output_revision: u64,
+    /// Latest validation display. Transient because an edit invalidates it.
+    #[serde(skip)]
+    pub validation: Option<ValidationResult>,
 }
 
 impl Tab {
@@ -83,6 +95,15 @@ impl Tab {
             search_results: Vec::new(),
             input_revision: 0,
             output_revision: 0,
+            validation: None,
+        }
+    }
+
+    /// Returns the structured validation failure, if the latest result failed.
+    pub fn validation_error(&self) -> Option<&JsonError> {
+        match &self.validation {
+            Some(ValidationResult::Invalid(error)) => Some(error),
+            _ => None,
         }
     }
 }
@@ -191,6 +212,7 @@ impl AppState {
                 tab.input = text;
                 tab.input_revision = crate::line_index::next_revision();
                 tab.error = None;
+                tab.validation = None;
             }
         }
     }
@@ -243,6 +265,7 @@ impl AppState {
         tab.input = input.clone();
         tab.input_revision = crate::line_index::next_revision();
         tab.error = None;
+        tab.validation = None;
         if let Some(edit) = self.editors.get_mut(&id) {
             if edit.text != input {
                 edit.replace_text(input);
@@ -261,6 +284,7 @@ impl AppState {
         tab.input_revision = crate::line_index::next_revision();
         tab.output_revision = crate::line_index::next_revision();
         tab.error = None;
+        tab.validation = None;
         tab.is_processing = false;
         tab.view = TabView::Input;
         tab.search_query.clear();
@@ -295,6 +319,7 @@ impl AppState {
                 tab.output = output;
                 tab.output_revision = revision;
                 tab.error = None;
+                tab.validation = None;
                 // The original `processJsonContent.fulfilled` reducer switched
                 // the active content to Output, so Format/Minify visibly
                 // produced a result instead of leaving the user on Input.
@@ -303,9 +328,41 @@ impl AppState {
             }
             Err(err) => {
                 tab.error = Some(err.to_string());
+                tab.validation = Some(ValidationResult::Invalid(err));
                 false
             }
         }
+    }
+
+    /// Applies validation if the tab still contains the revision that was
+    /// checked. Returns `false` for a closed tab or a stale worker result.
+    pub fn apply_validation_result(
+        &mut self,
+        id: TabId,
+        input_revision: u64,
+        result: Result<ValidationInfo, JsonError>,
+    ) -> bool {
+        let Some(tab) = self.tab_mut(id) else {
+            return false;
+        };
+        if tab.input_revision != input_revision {
+            // The edited document no longer has a useful validation job to
+            // wait for; never leave its toolbar stuck in the busy state.
+            tab.is_processing = false;
+            return false;
+        }
+        tab.is_processing = false;
+        match result {
+            Ok(info) => {
+                tab.error = None;
+                tab.validation = Some(ValidationResult::Valid(info));
+            }
+            Err(error) => {
+                tab.error = Some(error.to_string());
+                tab.validation = Some(ValidationResult::Invalid(error));
+            }
+        }
+        true
     }
 
     /// Marks a tab as running (or no longer running) background work.
@@ -398,6 +455,7 @@ impl AppState {
             }
             Msg::Format => self.start_json(JsonAction::Format),
             Msg::Minify => self.start_json(JsonAction::Minify),
+            Msg::Validate => self.start_validation(),
             Msg::Copy => {
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
@@ -469,6 +527,14 @@ impl AppState {
                     Vec::new()
                 }
             }
+            Msg::ValidationDone {
+                tab,
+                input_revision,
+                result,
+            } => {
+                self.apply_validation_result(tab, input_revision, result);
+                Vec::new()
+            }
             Msg::SearchDone { tab, hits } => {
                 self.apply_search_results(tab, hits);
                 Vec::new()
@@ -484,6 +550,7 @@ impl AppState {
             Msg::Error(text) => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.error = Some(text);
+                    tab.validation = None;
                     tab.is_processing = false;
                 }
                 Vec::new()
@@ -502,11 +569,32 @@ impl AppState {
         }
         tab.is_processing = true;
         tab.error = None;
+        tab.validation = None;
         let input: Arc<str> = Arc::from(tab.input.as_str());
         vec![Effect::SpawnJson {
             tab: id,
             input,
             action,
+        }]
+    }
+
+    fn start_validation(&mut self) -> Vec<Effect> {
+        let id = self.active;
+        let Some(tab) = self.tab_mut(id) else {
+            return Vec::new();
+        };
+        if tab.input.trim().is_empty() {
+            self.status = Some("Nothing to validate".into());
+            return Vec::new();
+        }
+        tab.is_processing = true;
+        tab.error = None;
+        tab.validation = None;
+        let input: Arc<str> = Arc::from(tab.input.as_str());
+        vec![Effect::SpawnValidation {
+            tab: id,
+            input,
+            input_revision: tab.input_revision,
         }]
     }
 }
@@ -529,6 +617,8 @@ pub enum Msg {
     Format,
     /// Minify the active tab.
     Minify,
+    /// Validate the active tab without changing its output.
+    Validate,
     /// Copy output (or input when there is no output).
     Copy,
     /// Export output (or input) through a save dialog.
@@ -550,6 +640,12 @@ pub enum Msg {
         revision: u64,
         result: Result<String, JsonError>,
     },
+    /// Background validation finished for a specific input revision.
+    ValidationDone {
+        tab: TabId,
+        input_revision: u64,
+        result: Result<ValidationInfo, JsonError>,
+    },
     /// Background search finished.
     SearchDone { tab: TabId, hits: Vec<SearchHit> },
     /// Persisted tabs were loaded at startup.
@@ -569,6 +665,12 @@ pub enum Effect {
         tab: TabId,
         input: Arc<str>,
         action: JsonAction,
+    },
+    /// Run [`crate::json_ops::validate`] on a background thread.
+    SpawnValidation {
+        tab: TabId,
+        input: Arc<str>,
+        input_revision: u64,
     },
     /// Run [`crate::search::search`] on a background thread.
     Search {

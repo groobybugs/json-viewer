@@ -10,6 +10,7 @@ pub mod shell;
 pub mod tabs;
 pub mod text_view;
 pub mod toolbar;
+pub mod validation_panel;
 
 use rune::{col, Color, Cx, El, KeyEvent, Tx};
 use rune_kit::{Kit, PaletteSeed};
@@ -132,6 +133,8 @@ fn handle_shortcut(state: &mut AppState, event: &KeyEvent, tx: &mut Tx) -> bool 
         Some(Msg::OpenFile)
     } else if event.is_command('f') && event.mods.shift {
         Some(Msg::Format)
+    } else if event.is_command('v') && event.mods.shift {
+        Some(Msg::Validate)
     } else {
         None
     };
