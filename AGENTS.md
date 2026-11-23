@@ -117,10 +117,86 @@ frozen API or a PR comment.
 | `crates/app/src/ui/toolbar.rs` | action toolbar |
 | `crates/app/src/ui/search_bar.rs` | search field/results |
 | `crates/app/src/ui/text_view.rs` | text input/output virtualization |
+| `crates/app/src/tree_index.rs` | tree explorer: node index, row jobs |
+| `crates/app/src/ui/tree_view.rs` | tree explorer: toolbar, rows, footer |
+| `crates/app/tests/tree_view.rs` | tree explorer evidence + timings |
 | `crates/app/src/headless.rs` | headless render/tree helpers |
 | `crates/app/src/main.rs` | binary, window wiring, `--headless` |
 | `crates/app/tests/smoke.rs` | headless smoke test |
 | `crates/app/Cargo.toml`, `Cargo.toml` | dependencies/workspace (ask first) |
+
+## Tree explorer (rp-tree)
+
+A classic JSON-editor tree view, per tab: the document-card header's
+`Input | Output | Tree` switch (the "View" switch) enters it, and its own
+toolbar offers **Expand all**, **Collapse all**, **Sort A→Z** (view order
+only — data is never touched; case-insensitive *natural* order, digit runs
+compared numerically so `alpha_2` sorts before `alpha_10`, ties stable by
+document order) and a **Filter** box (keys and scalar values match
+case-insensitively, `search.rs` rules; matched nodes keep their ancestors
+and auto-expand; expansion is blocked while a filter is active). The filter
+field is one shared `TextEdit` (`AppState::tree_filter_edit`) that always
+displays the active tab's filter — the reducer re-syncs it on
+`TreeOpen`, `SelectTab` and every filter change, including queries that
+arrive without typing (scripts, restored runs). Rows show expand arrows,
+indentation guides, keys (or `[index]` for array elements), type-coloured
+values and `{n}`/`[n]` child counts; selecting a row shows its
+` → `-joined path in a footer with **Copy path** / **Copy value** (the
+whole subtree text for containers). Clicking a search hit while the tree
+is open reveals and selects that node in place (`Msg::TreeRevealPath`
+expands the path's containers; the hook is the one `select_hit` branch in
+`ui/search_bar.rs`); with the tree closed, hit clicks jump to the code
+output view as before.
+
+New state (small frozen-API extension, documented here): `AppState` gains
+`tree: HashMap<TabId, TreeUi>` and `tree_filter_edit: TextEdit`;
+`TreeUi`/`TreeRow`/`TreeSelection`/`TreeJob` live in `tree_index.rs`.
+`TabView` stays a two-variant enum **on purpose**: `persist.rs` has an
+exhaustive `match tab.view` this branch does not own, so a tab "is in tree
+mode" iff `state.tree.get(&id)` exists with `open` set (runtime-only, never
+persisted). `Msg` gains `TreeOpen/TreeClose/TreeExpand/TreeCollapse/
+TreeSelect/TreeRevealPath/TreeExpandAll/TreeCollapseAll/TreeSortToggled/
+TreeFilterChanged/TreeCopyPath/TreeCopyValue/TreeIndexDone/TreeRowsReady`;
+copy actions reuse the existing `Effect::Copy`, and choosing a code view
+(`Msg::SwitchView`) leaves tree mode, so search-result jumps in code views
+behave as before.
+
+Performance design (evidence: `cargo test --release -p json-viewer --test
+tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
+
+- **Index.** `tree_index::TreeIndex` is a struct-of-arrays, **24 bytes per
+  node** (six `u32`: key offset, value start, value end, packed kind+child
+  count, first child, next sibling), built by one streaming pass of a
+  hand-rolled tokenizer — never a `serde_json::Value` DOM. Depth/parent are
+  *not* stored; the flattened rows carry them. Measured: 6.9 MB single-line
+  api.json-shaped doc → 7 ms / 323k nodes; 100 MB → 94 ms / 5.18M nodes
+  (124 MB index).
+- **Rows.** The flattened visible list lives in `TreeUi.rows` and is
+  maintained incrementally (expand splices children, collapse drains the
+  subtree); it renders through `El::virtual_rows` keyed by *node id* with
+  `virtual_rows_version((index_revision, rows_gen))`, so commits are
+  O(visible) at any size: fully expanded 100 MB (5.18M rows) scrolls at
+  p95 ≈ 12 ms/frame.
+- **Off-thread delivery without touching `runner.rs`** (which this branch
+  does not own): `main.rs` registers the live `rune::AppHandle` with
+  `tree_index::set_app_handle` before `run()`; index builds and big row jobs
+  (expand-all, sort re-flatten, filter) run on `json-viewer-tree*` threads
+  and deliver their `Msg` through `AppHandle::update`, which wakes the loop
+  for `runner::poll` to drain — the same message flow as the JSON/search
+  workers. Without a handle (tests, `--headless`) every job runs inline, so
+  reducers stay deterministic.
+- **Expand-all strategy:** at or below `tree_index::SYNC_ROW_LIMIT`
+  (200k) nodes it re-flattens inline; above that it runs off-thread with a
+  status spinner and a per-tab cancel flag (a newer job cancels the old).
+  Measured: 100 MB expand-all 181 ms off the UI thread, no cap needed.
+- **Filter** runs off-thread with the same cancel machinery; measured
+  201 ms on 100 MB (259k matches). **Sort** is a per-object natural-order
+  permutation (`tree_index::natural_cmp`: case-insensitive, digit runs
+  numeric, ties stable by document order) computed lazily at enumeration
+  time (cached doc-order children per expanded container), never mutating
+  the index; big docs re-flatten
+  off-thread when it toggles.
+
 
 ## Build, test, run
 

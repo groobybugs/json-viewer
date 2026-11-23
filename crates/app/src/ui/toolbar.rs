@@ -33,8 +33,9 @@ static OPEN_ICON: Icon = Icon {
     body: r#"<path d="M8 10V2.5M5 5.5L8 2.5L11 5.5M3 10.5V13.5H13V10.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// Input/output switch and action row for the active tab. Actions that would
-/// race a worker or have no content are disabled; busy state stays visible.
+/// View switch (Input | Output | Tree) and action row for the active tab.
+/// Actions that would race a worker or have no content are disabled; busy
+/// state stays visible.
 pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let kit = kit();
     let tab = state.active_tab();
@@ -43,6 +44,15 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let has_content = tab
         .is_some_and(|tab| !tab.input.is_empty() || !tab.output.is_empty() || tab.error.is_some());
     let processing = tab.is_some_and(|tab| tab.is_processing);
+    // The tree is a third per-tab display mode, next to Input/Output (see
+    // AGENTS.md): the tree's open flag lives in `AppState::tree`, not `Tab`,
+    // so `TabView` (persisted) stays a two-variant enum.
+    let tree_open = tab.is_some_and(|tab| {
+        state
+            .tree
+            .get(&tab.id)
+            .is_some_and(|tree| tree.open)
+    });
 
     let input_view = Button::new("Input")
         .variant(if tab.is_some_and(|tab| tab.view == TabView::Input) {
@@ -65,7 +75,20 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .on_press(|state: &mut AppState| state.dispatch(Msg::SwitchView(TabView::Output)))
         .build(&kit)
         .key("output-view")
+        .role("tab")
         .focus_selected(tab.is_some_and(|tab| tab.view == TabView::Output));
+    let tree_view = Button::new("Tree")
+        .variant(if tree_open {
+            ButtonVariant::Neutral
+        } else {
+            ButtonVariant::Ghost
+        })
+        .control_size(ControlSize::Regular)
+        .on_press(|state: &mut AppState| state.dispatch(Msg::TreeOpen))
+        .build(&kit)
+        .key("tree-view")
+        .role("tab")
+        .focus_selected(tree_open);
     let switcher = row()
         .role("tablist")
         .focus_group()
@@ -74,7 +97,8 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .radius(6.0)
         .fill(WINDOW_BG)
         .child(input_view.role("tab"))
-        .child(output_view.role("tab"));
+        .child(output_view.role("tab"))
+        .child(tree_view.role("tab"));
 
     let format = Button::new("Format")
         .variant(ButtonVariant::Submit)

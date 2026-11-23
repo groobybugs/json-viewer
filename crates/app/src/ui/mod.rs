@@ -10,6 +10,7 @@ pub mod shell;
 pub mod tabs;
 pub mod text_view;
 pub mod toolbar;
+pub mod tree_view;
 pub mod validation_panel;
 
 use rune::{col, Color, Cx, El, KeyEvent, Tx};

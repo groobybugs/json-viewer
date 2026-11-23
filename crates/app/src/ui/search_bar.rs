@@ -190,6 +190,26 @@ pub fn search_results(state: &AppState, _cx: &mut Cx<AppState>) -> El {
 }
 
 fn select_hit(state: &mut AppState, tx: &mut Tx, line: Option<usize>, path: String) {
+    // Tree mode: reveal and select the node the hit's path points at,
+    // staying in the tree (the reducer expands the path's containers).
+    {
+        let tab = state.active;
+        let index = state.tree.get(&tab).and_then(|tree| tree.index.clone());
+        let input = state.tab(tab).map(|tab| tab.input.clone());
+        if state.tree.get(&tab).is_some_and(|tree| tree.open) {
+            if let (Some(index), Some(input)) = (index, input) {
+                if let Some(node) = index.node_for_path(&input, &path) {
+                    state.dispatch(Msg::TreeRevealPath {
+                        tab,
+                        path: path.clone(),
+                    });
+                    crate::runner::queue_reveal(format!("tree-row-{node}"));
+                    state.dispatch(Msg::Status(format!("{path} · tree node")));
+                    return;
+                }
+            }
+        }
+    }
     state.dispatch(Msg::SwitchView(TabView::Output));
     if let Some(line) = line {
         // `hit.line` is 1-based in the formatted document; TextView rows are
