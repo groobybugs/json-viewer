@@ -24,20 +24,13 @@ pub const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
 /// Default device scale (Rune's headless default is 2.0).
 pub const DEFAULT_SCALE: f32 = 2.0;
 
-// Font registration (see NOTES-rp-view.md). `AppSpec::new` and
-// `TextSystem::default()` both put "Inter" behind BOTH the sans and mono slots,
-// so `TextStyle::mono()` resolves to a proportional face. Rune ships these OFL
-// faces at the pinned rev; bundling them keeps headless and the real window
-// deterministic on machines without Inter or a configured monospace font.
-/// The three Inter weights Rune bundles plus a real fixed-pitch face.
-pub static APP_FONTS: &[&[u8]] = &[
-    include_bytes!("../assets/Inter-Regular.ttf"),
-    include_bytes!("../assets/Inter-Medium.ttf"),
-    include_bytes!("../assets/Inter-SemiBold.ttf"),
-    include_bytes!("../assets/IBMPlexMono-Regular.ttf"),
-];
-/// Sans slot stays Inter; the mono slot is a real monospaced family.
-pub const APP_FAMILIES: (&str, &str) = ("Inter", "IBM Plex Mono");
+// `AppSpec::fonts` / `TextSystem::new` is all-or-nothing on native: a non-empty
+// `fonts` REPLACES Rune's embedded Inter faces. Keep it empty so Rune's own
+// Inter (the `embedded-fonts` default feature) is used.
+/// No bundled faces; `TextSystem::new(&[], ..)` registers Rune's embedded Inter.
+pub static APP_FONTS: &[&[u8]] = &[];
+/// IBM Plex Mono (fontconfig) primary, `ui-monospace` as fixed-pitch fallback.
+pub const APP_FAMILIES: (&str, &str) = ("Inter", "IBM Plex Mono, ui-monospace");
 
 /// A text system with the app's registered faces, for `Runtime::with_text`.
 pub fn text_system() -> TextSystem {

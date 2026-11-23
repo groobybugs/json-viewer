@@ -15,7 +15,6 @@ Cargo.toml                     workspace (edition 2021, stable)
 rust-toolchain.toml            Rust 1.99.1 (stable; Rune's pinned toolchain)
 crates/app/
   Cargo.toml                   json-viewer package, dependencies frozen
-  assets/                      Inter + IBM Plex Mono faces (SIL OFL)
   src/
     lib.rs                     modules + re-exports
     main.rs                    window/App hooks, --headless mode, boot/persistence
@@ -231,13 +230,16 @@ elements by key.
 
 ### Wave-1 integration (wave-1 branches)
 
-- **Fonts.** `main.rs` sets `spec.fonts = headless::APP_FONTS` and
-  `spec.families = headless::APP_FAMILIES`. `AppSpec::new` defaults *both*
-  slots to `"Inter"`, so `TextStyle::mono()` resolves to a proportional face
-  unless the mono slot names the registered `"IBM Plex Mono"`.
-  `headless::text_system()`/`runtime()` use the same faces;
-  `TextSystem::new` replaces Rune's built-in Inter faces when `fonts` is
-  non-empty, so all four assets are needed.
+- **Fonts (zero bundle).** `headless::APP_FONTS` is empty, so Rune's embedded
+  Inter stays in use; `crates/app/assets/` is gone. `APP_FAMILIES` is
+  `("Inter", "IBM Plex Mono, ui-monospace")`: `main.rs` sets `spec.families`
+  and `headless::text_system()` uses the same tuple. `TextStyle::mono()` is
+  `Family::Mono` (the mono *slot*), which the default `("Inter","Inter")`
+  leaves proportional. A non-empty `fonts` list is all-or-nothing and replaces
+  the embedded Inter faces, so do not bundle a single mono TTF through it.
+  IBM Plex Mono comes from fontconfig when installed; `ui-monospace` is the
+  fixed-pitch fallback. Tests assert equal `i`/`W` advances, never exact font
+  metrics.
 - **Lifecycle.** `main.rs` runs
   `rune::App::new(spec).on_close(runner::on_close).on_quit(runner::on_quit).run()`.
   Both hooks call `runner::flush_persist`, which synchronously drains the

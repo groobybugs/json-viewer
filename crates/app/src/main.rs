@@ -64,8 +64,8 @@ fn main() {
     }
 
     let mut spec = AppSpec::new("JSON Viewer", headless::DEFAULT_SIZE, boot, ui::view);
-    // Font registration (see AGENTS.md): AppSpec::new defaults BOTH slots to
-    // "Inter", which makes TextStyle::mono() proportional.
+    // Keep `spec.fonts` empty: Rune already embeds Inter. Only the mono slot
+    // name is overridden; the sans slot stays "Inter".
     spec.fonts = headless::APP_FONTS;
     spec.families = headless::APP_FAMILIES;
     spec.poll = Some(runner::poll);
