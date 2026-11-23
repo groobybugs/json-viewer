@@ -239,7 +239,8 @@ fn six_shell_states_render_with_controls_and_layout() {
     assert_eq!(a11y(&error, "error-alert")["role"], "alert");
     assert!(element(&error, "error-message")["text"]
         .as_str()
-        .is_some_and(|text| text.contains("Invalid JSON: expected value at line 3, column 14")));
+        .is_some_and(|text| text == "Invalid JSON: expected value"));
+    assert_eq!(element(&error, "error-location")["text"], "Line 3, column 14");
 
     let mut processing_state = output_state();
     let id = processing_state.active;

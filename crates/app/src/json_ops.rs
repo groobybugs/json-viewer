@@ -1,4 +1,4 @@
-//! JSON formatting and minification, on the caller's thread or a worker.
+//! JSON formatting, minification and validation, on the caller's thread or a worker.
 //!
 //! The old Web Worker parsed with `JSON.parse` and re-serialized with
 //! `JSON.stringify(value, null, 2)` (pretty) or `JSON.stringify(value)`
@@ -39,6 +39,19 @@ pub enum JsonAction {
     Format,
     /// Remove all insignificant whitespace.
     Minify,
+}
+
+/// Statistics collected while validating a JSON document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationInfo {
+    /// Source size in bytes.
+    pub bytes: usize,
+    /// Number of source lines, including a final empty line after a newline.
+    pub lines: usize,
+    /// Deepest array/object nesting level. A top-level scalar has depth zero.
+    pub max_depth: usize,
+    /// Number of JSON values, including containers but excluding object keys.
+    pub value_count: usize,
 }
 
 /// A JSON parse or serialization failure.
@@ -88,6 +101,21 @@ pub fn process(input: &str, action: JsonAction) -> Result<String, JsonError> {
     process_with_cancel(input, action, &NEVER_CANCEL)
 }
 
+/// Validates `input` without building an output string.
+///
+/// This uses the same streaming parser as [`process`], with its output sink
+/// disabled. The explicit container stack remains safe for deeply nested input.
+pub fn validate(input: &str) -> Result<ValidationInfo, JsonError> {
+    static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+    validate_with_cancel(input, &NEVER_CANCEL)
+}
+
+fn validate_with_cancel(input: &str, cancel: &AtomicBool) -> Result<ValidationInfo, JsonError> {
+    let mut validator = Formatter::validating(input, cancel);
+    validator.run()?;
+    Ok(validator.finish_validation())
+}
+
 /// Async-free core shared by [`process`] and [`spawn_process`]. Returns a
 /// `line == 0` error when `cancel` becomes set mid-run.
 fn process_with_cancel(
@@ -123,14 +151,51 @@ enum ValueKind {
     ContainerOpened,
 }
 
+/// A string sink that can be disabled for validation-only parsing.
+struct Output {
+    text: String,
+    enabled: bool,
+}
+
+impl Output {
+    fn writing(capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            enabled: true,
+        }
+    }
+
+    fn discarded() -> Self {
+        Self {
+            text: String::new(),
+            enabled: false,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, ch: char) {
+        if self.enabled {
+            self.text.push(ch);
+        }
+    }
+
+    #[inline]
+    fn push_str(&mut self, text: &str) {
+        if self.enabled {
+            self.text.push_str(text);
+        }
+    }
+}
+
 struct Formatter<'a> {
     input: &'a str,
     bytes: &'a [u8],
     pos: usize,
-    out: String,
+    out: Output,
     pretty: bool,
     cancel: &'a AtomicBool,
     cancel_at: usize,
+    stats: Option<ValidationInfo>,
 }
 
 impl<'a> Formatter<'a> {
@@ -148,15 +213,52 @@ impl<'a> Formatter<'a> {
             input,
             bytes: input.as_bytes(),
             pos: 0,
-            out: String::with_capacity(capacity),
+            out: Output::writing(capacity),
             pretty,
             cancel,
             cancel_at: 0,
+            stats: None,
+        }
+    }
+
+    fn validating(input: &'a str, cancel: &'a AtomicBool) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
+            out: Output::discarded(),
+            pretty: false,
+            cancel,
+            cancel_at: 0,
+            stats: Some(ValidationInfo {
+                bytes: input.len(),
+                lines: 1,
+                max_depth: 0,
+                value_count: 0,
+            }),
         }
     }
 
     fn finish(self) -> String {
-        self.out
+        self.out.text
+    }
+
+    fn finish_validation(self) -> ValidationInfo {
+        self.stats.expect("validation parser has statistics")
+    }
+
+    #[inline]
+    fn note_value(&mut self) {
+        if let Some(stats) = &mut self.stats {
+            stats.value_count += 1;
+        }
+    }
+
+    #[inline]
+    fn note_container(&mut self, depth: usize) {
+        if let Some(stats) = &mut self.stats {
+            stats.max_depth = stats.max_depth.max(depth);
+        }
     }
 
     /// Validates and re-emits the whole document.
@@ -222,11 +324,13 @@ impl<'a> Formatter<'a> {
     /// started, but their contents are consumed by the caller's loop so the
     /// call stack never grows with nesting depth.
     fn parse_value(&mut self, stack: &mut Vec<Frame>) -> Result<ValueKind, JsonError> {
+        self.note_value();
         self.skip_ws()?;
         let byte = self.peek().ok_or_else(|| self.error_eof())?;
         match byte {
             b'{' => {
                 self.pos += 1;
+                self.note_container(stack.len() + 1);
                 self.skip_ws()?;
                 if self.peek() == Some(b'}') {
                     self.pos += 1;
@@ -241,6 +345,7 @@ impl<'a> Formatter<'a> {
             }
             b'[' => {
                 self.pos += 1;
+                self.note_container(stack.len() + 1);
                 self.skip_ws()?;
                 if self.peek() == Some(b']') {
                     self.pos += 1;
@@ -483,8 +588,25 @@ impl<'a> Formatter<'a> {
         if self.bytes[self.pos..].starts_with(literal.as_bytes()) {
             self.pos += literal.len();
             self.out.push_str(literal);
-            Ok(())
-        } else if self.bytes.len() - self.pos < literal.len() {
+            return Ok(());
+        }
+        if self.stats.is_some() {
+            // Validation can be more precise without changing the established
+            // Format/Minify errors: point at the first mismatching literal byte.
+            for (offset, expected) in literal.bytes().enumerate() {
+                match self.bytes.get(self.pos + offset) {
+                    Some(&actual) if actual == expected => {}
+                    Some(_) => {
+                        return Err(self.error_at(
+                            self.pos + offset,
+                            format!("Invalid literal, expected '{literal}'"),
+                        ));
+                    }
+                    None => return Err(self.error_eof()),
+                }
+            }
+        }
+        if self.bytes.len() - self.pos < literal.len() {
             Err(self.error_eof())
         } else {
             Err(self.unexpected_token())
@@ -495,7 +617,13 @@ impl<'a> Formatter<'a> {
     fn skip_ws(&mut self) -> Result<(), JsonError> {
         while let Some(byte) = self.bytes.get(self.pos) {
             match byte {
-                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
+                b'\n' => {
+                    self.pos += 1;
+                    if let Some(stats) = &mut self.stats {
+                        stats.lines += 1;
+                    }
+                }
+                b' ' | b'\t' | b'\r' => self.pos += 1,
                 _ => break,
             }
         }
@@ -637,6 +765,33 @@ where
             on_done(result);
         })
         .expect("spawn JSON worker thread");
+    JobHandle {
+        cancel,
+        join: Some(join),
+    }
+}
+
+/// Runs [`validate`] on a named worker thread and calls `on_done` with the
+/// result unless the job was cancelled first.
+pub fn spawn_validate<F>(input: Arc<str>, on_done: F) -> JobHandle
+where
+    F: FnOnce(Result<ValidationInfo, JsonError>) + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let join = thread::Builder::new()
+        .name("json-viewer-validate".into())
+        .spawn(move || {
+            if worker_cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let result = validate_with_cancel(&input, &worker_cancel);
+            if worker_cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            on_done(result);
+        })
+        .expect("spawn JSON validation worker thread");
     JobHandle {
         cancel,
         join: Some(join),

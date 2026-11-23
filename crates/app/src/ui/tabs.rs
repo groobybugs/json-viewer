@@ -1,9 +1,9 @@
 //! Tab strip and the active document.
 
-use rune::{col, el, icon, row, text, tok, Color, Cx, El, TextStyle};
-use rune_kit::{glyphs, ControlSize, IconButton, IconButtonVariant};
+use rune::{col, el, row, text, Color, Cx, El, TextStyle};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant};
 
-use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, PANEL_BG, TEXT};
+use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
 use crate::ui::text_view::TextView;
 
@@ -112,15 +112,18 @@ pub fn tab_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .child(row().h(38.0).center().child(add))
 }
 
-/// Input or output for the active tab, plus a prominent parse-error alert.
-pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
+/// Input or output for the active tab, plus its validation alert/panel.
+pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let Some(tab) = state.active_tab() else {
         return col().w_full().grow(1.0).fill(EDITOR_BG);
     };
     let body = match tab.view {
         TabView::Input => {
             let edit = state.editor(tab.id).expect("every tab has an editor");
-            TextView::editable(&tab.input, edit)
+            let _error_position = tab
+                .validation_error()
+                .map(|error| (error.line, error.column));
+            let input = TextView::editable(&tab.input, edit)
                 .revision(tab.input_revision)
                 .line_numbers(true)
                 .build(&format!("editor-{}", tab.id))
@@ -138,7 +141,13 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
                         .expect("active tab has an editor")
                 })
                 .on_input_change(|state: &mut AppState, _| state.sync_active_editor())
-                .on_input_key(super::handle_shortcut)
+                .on_input_key(super::handle_shortcut);
+            // INTEGRATE: TextView::error_marker
+            // let input = match _error_position {
+            //     Some((line, column)) => input.error_marker(line, column),
+            //     None => input,
+            // };
+            input
         }
         TabView::Output => TextView::read_only(&tab.output)
             .revision(tab.output_revision)
@@ -159,35 +168,11 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .scroll_xy()
         .child(body);
 
-    let mut content = col().w_full().grow(1.0).min_h(0.0).fill(EDITOR_BG);
-    if let Some(error) = &tab.error {
-        content = content.child(
-            row()
-                .key("error-alert")
-                .role("alert")
-                .w_full()
-                .gap(10.0)
-                .padding(12.0)
-                .center_y()
-                .fill(DANGER_BG)
-                .border_sides([0.0, 0.0, 1.0, 0.0], DANGER.alpha(0.6))
-                .child(icon(&glyphs::CIRCLE_X, 18.0).color(DANGER).a11y_hidden())
-                .child(
-                    col()
-                        .gap(2.0)
-                        .child(
-                            text("Parse error")
-                                .font(TextStyle::new(12.0, 600.0))
-                                .color(DANGER),
-                        )
-                        .child(
-                            text(format!("Invalid JSON: {error}"))
-                                .key("error-message")
-                                .font(tok::type_::BODY)
-                                .color(TEXT),
-                        ),
-                ),
-        );
-    }
-    content.child(scroller)
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(EDITOR_BG)
+        .child(super::validation_panel::validation_panel(state, cx))
+        .child(scroller)
 }

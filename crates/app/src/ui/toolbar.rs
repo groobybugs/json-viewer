@@ -1,10 +1,16 @@
-//! Document actions: format, minify, copy, export, open, clear.
+//! Document actions: validate, format, minify, copy, export, open, clear.
 
 use rune::{row, spacer, text, tok, Cx, El, Icon};
 use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 
 use super::{kit, BORDER, MUTED, TEXT, WINDOW_BG};
 use crate::state::{AppState, Msg, TabView};
+
+static VALIDATE_ICON: Icon = Icon {
+    name: "json-viewer-validate",
+    view: 16.0,
+    body: r#"<path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 
 static FORMAT_ICON: Icon = Icon {
     name: "json-viewer-format",
@@ -86,6 +92,14 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .on_press(|state: &mut AppState| state.dispatch(Msg::Minify))
         .build(&kit)
         .key("minify");
+    let validate = Button::new("Validate")
+        .control_size(ControlSize::Regular)
+        .icon(&VALIDATE_ICON)
+        .shortcut("ctrl+shift+v")
+        .disabled(processing || !has_input)
+        .on_press(|state: &mut AppState| state.dispatch(Msg::Validate))
+        .build(&kit)
+        .key("validate");
     let copy = Button::new("Copy")
         .control_size(ControlSize::Regular)
         .icon(kit.glyph.copy)
@@ -119,6 +133,7 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let actions = row()
         .gap(6.0)
         .center_y()
+        .child(validate)
         .child(format)
         .child(minify)
         .child(copy)

@@ -662,9 +662,9 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
 
 /// Executes effects returned by [`AppState::update`].
 ///
-/// Background JSON jobs post [`Msg::JsonDone`] to the inbox. Search runs on a
-/// detached thread. Open, export, copy and dropped-file reads return before
-/// any dialog or disk I/O finishes.
+/// Background JSON jobs post [`Msg::JsonDone`] or [`Msg::ValidationDone`] to
+/// the inbox. Search runs on a detached thread. Open, export, copy and
+/// dropped-file reads return before any dialog or disk I/O finishes.
 pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
@@ -675,14 +675,32 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     // Build the full line index off the UI thread from the
                     // worker-owned output before the reducer publishes it.
                     if let Ok(output) = &result {
-                        crate::line_index::prewarm_off_thread(
-                            Arc::from(output.as_str()),
-                            revision,
-                        );
+                        crate::line_index::prewarm_off_thread(Arc::from(output.as_str()), revision);
                     }
                     let _ = tx.send(Msg::JsonDone {
                         tab,
                         revision,
+                        result,
+                    });
+                });
+                JOBS.with(|jobs| {
+                    let mut jobs = jobs.borrow_mut();
+                    if let Some(mut previous) = jobs.remove(&tab) {
+                        previous.cancel();
+                    }
+                    jobs.insert(tab, handle);
+                });
+            }
+            Effect::SpawnValidation {
+                tab,
+                input,
+                input_revision,
+            } => {
+                let tx = sender();
+                let handle = json_ops::spawn_validate(input, move |result| {
+                    let _ = tx.send(Msg::ValidationDone {
+                        tab,
+                        input_revision,
                         result,
                     });
                 });
