@@ -3,7 +3,7 @@
 use rune::{col, icon, row, spacer, text, tok, Cx, El, ScrollSpec, TextStyle, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Spinner};
 
-use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT, WINDOW_BG};
+use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
 
 /// Search box. Typing emits [`Msg::SearchChanged`]; the reducer decides when a
@@ -14,8 +14,9 @@ pub fn search_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .key("search")
         .label("Search in JSON")
         .single_line()
-        .w_full()
-        .fill(WINDOW_BG)
+        .grow(1.0)
+        .min_w(0.0)
+        .fill(EDITOR_BG)
         .color(TEXT)
         .placeholder("Search keys and values…", MUTED)
         .caret(ACCENT, ACCENT)
