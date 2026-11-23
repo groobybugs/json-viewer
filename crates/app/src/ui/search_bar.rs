@@ -212,9 +212,16 @@ fn select_hit(state: &mut AppState, tx: &mut Tx, line: Option<usize>, path: Stri
     }
     state.dispatch(Msg::SwitchView(TabView::Output));
     if let Some(line) = line {
-        // `hit.line` is 1-based in the formatted document; TextView rows are
-        // 0-based. The reveal waits for the Output view to mount, then
-        // `Tx::scroll_into_view` finds the virtual row by key.
+        // `hit.line` is 1-based in the formatted document. Minified output
+        // has exactly one row, so its format-independent target is row zero
+        // rather than a pretty-printed row key that can never mount.
+        let line = if state.tab(state.active).is_some_and(|tab| {
+            !tab.output.is_empty() && !tab.output.contains('\n')
+        }) {
+            1
+        } else {
+            line
+        };
         let row = TextView::row_key("output-text", line.saturating_sub(1));
         crate::runner::queue_reveal(row);
         state.dispatch(Msg::Status(format!("{path} · line {line}")));

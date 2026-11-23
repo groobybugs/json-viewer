@@ -921,6 +921,7 @@ fn reveal_editor_line(state: &mut AppState, tx: &mut Tx, id: u64, line: Option<u
         let row_h = crate::ui::text_view::ROW_HEIGHT;
         let y = target_line as f32 * row_h;
         let centered = if viewport_h > 0.0 { y - viewport_h * 0.5 } else { y };
+        tx.instant();
         tx.scroll_to_y(format!("document-scroll-{id}-input"), centered.max(0.0));
     } else {
         tx.scroll_into_view(format!("editor-{id}"));
@@ -1087,6 +1088,18 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn centered_editor_reveal_marks_the_commit_instant() {
+        let mut state = AppState::default();
+        let id = state.active;
+        let mut tx = Tx::default();
+        reveal_editor_line(&mut state, &mut tx, id, Some(500));
+        assert!(
+            format!("{tx:?}").contains("commit: Instant"),
+            "centered go-to-error reveal left an animated commit: {tx:?}"
+        );
+    }
 
     fn io_view(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         let status = state.status.clone().unwrap_or_else(|| "ready".into());

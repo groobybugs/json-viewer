@@ -16,9 +16,11 @@
 //! are indexed synchronously (the cost is bounded by [`LARGE_DOCUMENT_BYTES`]).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -319,6 +321,8 @@ struct Cache {
     entries: HashMap<TextKey, Arc<Snapshot>>,
     order: VecDeque<TextKey>,
     bytes: usize,
+    /// Restored buffer keys with a full build currently off-thread.
+    warming: HashSet<TextKey>,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -328,8 +332,30 @@ fn cache() -> &'static Mutex<Cache> {
             entries: HashMap::new(),
             order: VecDeque::new(),
             bytes: 0,
+            warming: HashSet::new(),
         })
     })
+}
+
+#[cfg(test)]
+static RESTORED_PREWARM_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+type Redraw = Arc<dyn Fn() + Send + Sync>;
+
+static REDRAW: OnceLock<Mutex<Option<Redraw>>> = OnceLock::new();
+
+/// Registers the window redraw callback through `tree_index::set_app_handle`.
+/// Type erasure keeps this module usable in the binary's standalone index
+/// harness as well as the library.
+pub(crate) fn set_redraw_callback(callback: impl Fn() + Send + Sync + 'static) {
+    let slot = REDRAW.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(callback));
+}
+
+fn redraw_callback() -> Option<Redraw> {
+    let slot = REDRAW.get()?;
+    let guard = slot.lock().ok()?;
+    guard.clone()
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Cache> {
@@ -370,6 +396,39 @@ fn insert(snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
 /// [`LARGE_DOCUMENT_BYTES`]).
 pub fn snapshot(text: &str) -> Arc<Snapshot> {
     snapshot_keyed(text, TextKey::of(text))
+}
+
+/// Starts the complete buffer-keyed index for a restored Output tab. Unlike
+/// worker-owned revisions, a persisted revision of zero has no JSON job that
+/// could replace the provisional prefix. Calls deduplicate by [`TextKey`]; the
+/// view keeps using that prefix until the worker publishes and wakes Rune for
+/// a redraw.
+pub fn prewarm_restored_output(text: &str) {
+    let key = TextKey::of(text);
+    {
+        let mut guard = lock();
+        if guard.entries.get(&key).is_some_and(|hit| !hit.is_partial())
+            || !guard.warming.insert(key)
+        {
+            return;
+        }
+    }
+
+    // The restored Tab owns a String, so make the worker its own immutable
+    // copy. Only this copy happens before detaching; the O(document) line scan
+    // and index allocation run off the UI thread.
+    let text: Arc<str> = Arc::from(text);
+    #[cfg(test)]
+    RESTORED_PREWARM_SPAWNS.fetch_add(1, Ordering::Relaxed);
+    drop(std::thread::spawn(move || {
+        insert(Arc::new(Snapshot::full_with_key(text, key)));
+        lock().warming.remove(&key);
+        if let Some(redraw) = redraw_callback() {
+            // No model message is needed: the cache is shared. Force one view
+            // rebuild after publication so virtual_rows sees the full count.
+            redraw();
+        }
+    }));
 }
 
 /// Returns the shared snapshot for a reducer-assigned document revision.
@@ -426,6 +485,7 @@ pub fn clear_cache() {
     guard.entries.clear();
     guard.order.clear();
     guard.bytes = 0;
+    guard.warming.clear();
 }
 
 #[cfg(test)]
@@ -536,6 +596,42 @@ mod tests {
             &warmed,
             &snapshot_for_revision(&text, revision)
         ));
+    }
+
+    #[test]
+    fn restored_prewarm_deduplicates_by_text_key() {
+        let text = Box::leak(
+            "restored-dedupe\nunique-text"
+                .to_string()
+                .into_boxed_str(),
+        );
+        let key = TextKey::of(text);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wakes);
+        set_redraw_callback(move || {
+            wake.fetch_add(1, Ordering::Relaxed);
+        });
+        let before = RESTORED_PREWARM_SPAWNS.load(Ordering::Relaxed);
+        for _ in 0..8 {
+            prewarm_restored_output(text);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let complete = lock()
+                .entries
+                .get(&key)
+                .is_some_and(|snapshot| !snapshot.is_partial());
+            if complete && wakes.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "prewarm timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            RESTORED_PREWARM_SPAWNS.load(Ordering::Relaxed),
+            before + 1,
+            "one buffer key spawned more than one worker"
+        );
     }
 
     #[test]

@@ -31,6 +31,17 @@ fn boot() -> AppState {
     let mut state = AppState::default();
     match persist::load_tabs() {
         Ok(tabs) if !tabs.is_empty() => {
+            // Start restored Output indexes while boot still owns the tabs,
+            // before the first window frame. The view deduplicates this job
+            // and shows the provisional prefix until publication.
+            for tab in &tabs {
+                if tab.view == json_viewer::TabView::Output
+                    && tab.output_revision == 0
+                    && tab.output.len() >= json_viewer::line_index::LARGE_DOCUMENT_BYTES
+                {
+                    json_viewer::line_index::prewarm_restored_output(&tab.output);
+                }
+            }
             state.update(Msg::TabsLoaded(tabs));
         }
         Ok(_) => {}
