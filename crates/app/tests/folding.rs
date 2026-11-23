@@ -14,9 +14,10 @@ use std::time::Instant;
 use json_viewer::fold_index::{self, FoldIndex};
 use json_viewer::headless::{self, element_tree, text_system};
 use json_viewer::line_index;
+use json_viewer::runner;
+use json_viewer::search::SearchHit;
 use json_viewer::state::{AppState, TabView};
 use json_viewer::ui::text_view::{apply_fold_action, FoldAction, TextView};
-use json_viewer::runner;
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::{col, Cx, El, Env, KeyEvent, Runtime, ScrollSpec};
 use serde_json::Value;
@@ -48,7 +49,9 @@ fn scroller(state: &AppState, base: &str) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
         .child(body)
 }
 
@@ -75,37 +78,45 @@ fn view_png(state: &AppState, _cx: &mut Cx<AppState>) -> El {
 fn view_error(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let body = TextView::read_only(&state.tabs[0].output)
         .revision(state.tabs[0].output_revision)
-        .line_numbers(true)
-        .error_marker(5, 7)
-        .build("fold-error");
+        .line_numbers(true);
+    let body = match state.tabs[0].validation_error() {
+        Some(error) => body.error_marker(error.line, error.column),
+        None => body,
+    };
+    let body = body.build("fold-error");
     col()
         .w_full()
         .h_full()
         .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
         .child(body)
 }
 fn view_error_editable(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let edit = state.editor(state.active).expect("active editor");
-    let body = TextView::editable(&state.tabs[0].input, edit)
-        .error_marker(3, 5)
-        .build("fold-error-input");
+    let body =
+        TextView::editable(&state.tabs[0].input, edit).revision(state.tabs[0].input_revision);
+    let body = match state.tabs[0].validation_error() {
+        Some(error) => body.error_marker(error.line, error.column),
+        None => body,
+    };
+    let body = body.build("fold-error-input");
     col()
         .w_full()
         .h_full()
         .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
         .child(body)
 }
 
-fn fresh_runtime(state: AppState, view: fn(&AppState, &mut Cx<AppState>) -> El) -> Runtime<AppState> {
-    let mut rt = Runtime::with_text(
-        state,
-        view,
-        SIZE,
-        Env::new(true, SCALE),
-        text_system(),
-    );
+fn fresh_runtime(
+    state: AppState,
+    view: fn(&AppState, &mut Cx<AppState>) -> El,
+) -> Runtime<AppState> {
+    let mut rt = Runtime::with_text(state, view, SIZE, Env::new(true, SCALE), text_system());
     rt.set_srgb_blend(true);
     rt.frame(0.0);
     rt.settle_all();
@@ -119,10 +130,7 @@ fn find_center(rt: &Runtime<AppState>, key: &str) -> Option<(f32, f32)> {
             continue;
         }
         if el.key.as_deref() == Some(key) {
-            return Some((
-                el.rect[0] + el.rect[2] * 0.5,
-                el.rect[1] + el.rect[3] * 0.5,
-            ));
+            return Some((el.rect[0] + el.rect[2] * 0.5, el.rect[1] + el.rect[3] * 0.5));
         }
     }
     None
@@ -261,7 +269,10 @@ fn fold_all_and_fold_level_pngs() {
     let mut rt = fresh_runtime(state, view_all);
     let tree = render_to(&mut rt, "fold-all.png");
     let text = tree.to_string();
-    assert!(text.contains("{…}") || text.contains("[…]"), "no placeholder: {text}");
+    assert!(
+        text.contains("{…}") || text.contains("[…]"),
+        "no placeholder: {text}"
+    );
     // Every container is folded, so almost every document line is hidden.
     assert!(
         find_center(&rt, "fold-all-row-5").is_none(),
@@ -297,7 +308,10 @@ fn toolbar_fold_buttons_collapse_and_restore_the_output() {
 
     let mut rt = headless::runtime(state, headless::DEFAULT_SIZE, 1.0);
     rt.frame(0.0);
-    assert!(find_center(&rt, "fold-all").is_some(), "fold-all button missing");
+    assert!(
+        find_center(&rt, "fold-all").is_some(),
+        "fold-all button missing"
+    );
 
     click(&mut rt, "fold-all");
     for _ in 0..4 {
@@ -404,30 +418,83 @@ fn line_numbers_stay_document_numbers_when_folded() {
 #[test]
 fn error_marker_pngs_read_only_and_editable() {
     let revision = 7_100_007;
-    let doc = "{\n  \"name\": \"json-viewer\",\n  \"version\": 3,\n  \"items\": [\n    1,\n    2\n  ],\n  \"tail\": null\n}\n";
-    let mut rt = fresh_runtime(doc_state(doc, revision), view_error);
+    let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}\n";
+    let error = json_viewer::json_ops::validate(input).expect_err("invalid fixture");
+    assert_eq!((error.line, error.column), (3, 8));
+    assert_eq!(input.lines().nth(2).unwrap().as_bytes()[7], b'o');
+
+    let mut read_only = doc_state(input, revision);
+    read_only.tabs[0].validation =
+        Some(json_viewer::state::ValidationResult::Invalid(error.clone()));
+    let mut rt = fresh_runtime(read_only, view_error);
     let tree = render_to(&mut rt, "fold-error-read-only.png");
     assert!(
-        element_keys(&tree).iter().any(|key| key == "fold-error-error-dot-4"),
+        element_keys(&tree)
+            .iter()
+            .any(|key| key == "fold-error-error-dot-2"),
         "error gutter dot missing: {tree}"
     );
 
-    let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}\n";
     let mut state = AppState::default();
-    state.tabs[0].input = input.to_owned();
-    state.tabs[0].view = TabView::Input;
     let active = state.active;
-    *state.editors.get_mut(&active).expect("editor exists") = rune::TextEdit::new(input);
+    state.update_input(active, input.to_owned());
+    state.tabs[0].view = TabView::Input;
+    state.tabs[0].validation = Some(json_viewer::state::ValidationResult::Invalid(error));
     let mut rt = fresh_runtime(state, view_error_editable);
     let tree = render_to(&mut rt, "fold-error-editable.png");
     let text = tree.to_string();
-    assert!(text.contains("line 3, column 5"), "error label missing: {text}");
+    assert!(
+        text.contains("line 3, column 8"),
+        "error label missing: {text}"
+    );
     assert!(
         element_keys(&tree)
             .iter()
             .any(|key| key == "fold-error-input-error-dot"),
         "editable gutter dot missing"
     );
+}
+
+#[test]
+fn output_search_hit_click_unfolds_and_reveals_the_row() {
+    let revision = 7_100_009;
+    let doc = api_doc();
+    let target = doc
+        .lines()
+        .position(|line| line.contains("\"rust\""))
+        .unwrap();
+    let mut state = doc_state(&doc, revision);
+    let key = fold_index::key(revision, &state.tabs[0].output);
+    apply_fold_action(&mut state, FoldAction::FoldAll);
+    let folded = fold_index::folded_count(key);
+    assert!(folded > 0);
+    state.apply_search_results(
+        state.active,
+        vec![SearchHit {
+            path: "tags → [1]".into(),
+            key: None,
+            value_preview: "rust".into(),
+            line: Some(target + 1),
+        }],
+    );
+
+    let mut rt = headless::runtime(state, SIZE, 1.0);
+    let row = format!("output-text-row-{target}");
+    assert!(find_center(&rt, &row).is_none(), "target starts folded");
+    click(&mut rt, "search-hit-0");
+    for _ in 0..20 {
+        rt.update_if(|state, tx| runner::poll(state, 0.0, tx));
+        rt.settle_all();
+        rt.frame(1.0 / 60.0);
+        if find_center(&rt, &row).is_some() {
+            break;
+        }
+    }
+    assert_eq!(rt.state.active_tab().unwrap().view, TabView::Output);
+    assert!(fold_index::folded_count(key) < folded, "reveal kept folds");
+    assert!(find_center(&rt, &row).is_some(), "hit row not mounted");
+    let tree = render_to(&mut rt, "fold-search-hit.png");
+    assert!(tree.to_string().contains("rust"));
 }
 
 /// Format the keyboard chord exactly as the window receives it, so the
@@ -476,7 +543,10 @@ fn keyboard_fold_chords_apply_to_the_output() {
     rt.frame(1.0 / 60.0);
     rt.settle_all();
     rt.frame(0.0);
-    assert!(fold_index::folded_count(key) > 0, "Ctrl+K Ctrl+0 should fold all");
+    assert!(
+        fold_index::folded_count(key) > 0,
+        "Ctrl+K Ctrl+0 should fold all"
+    );
     let mut status = None;
     rt.update_if(|state, tx| {
         runner::poll(state, 0.0, tx);
@@ -530,7 +600,11 @@ fn doc_100mb() -> String {
     doc.push_str("{\n  \"items\": [\n");
     for i in 0..2_000_000usize {
         // 50 bytes per line, the same shape the text_view perf harness uses.
-        writeln!(doc, "     \"k{i:07}\": {{\"v\":{i:07},\"b\":true,\"n\":null}},").unwrap();
+        writeln!(
+            doc,
+            "     \"k{i:07}\": {{\"v\":{i:07},\"b\":true,\"n\":null}},"
+        )
+        .unwrap();
     }
     doc.push_str("  ]\n}\n");
     doc
@@ -627,7 +701,10 @@ fn release_fold_all_and_frame_time_on_2m_lines() {
          WORST_FRAME_MS={worst:.3}",
         frame_total / 60.0
     );
-    assert!(fold_all_ms < 250.0, "fold all blocked the UI: {fold_all_ms:.1} ms");
+    assert!(
+        fold_all_ms < 250.0,
+        "fold all blocked the UI: {fold_all_ms:.1} ms"
+    );
 
     // Unfolding restores 2M rows: measure that commit too.
     let t = Instant::now();

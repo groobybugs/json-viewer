@@ -6,7 +6,7 @@ use rune_kit::{glyphs, Button, ButtonVariant, ControlSize};
 use super::{kit, DANGER, DANGER_BG, EDITOR_BG, MUTED, SUCCESS, TEXT};
 use crate::json_ops::{JsonError, ValidationInfo};
 use crate::state::{AppState, Msg, TabView, ValidationResult};
-use crate::ui::text_view::{TextView, EDITABLE_LIMIT_BYTES};
+use crate::ui::text_view::TextView;
 
 const CONTEXT_BYTES: usize = 40;
 
@@ -219,15 +219,19 @@ fn reveal_error(state: &mut AppState, tx: &mut Tx, line: usize, column: usize) {
     let Some(tab) = state.active_tab() else {
         return;
     };
-    let large = tab.input.len() > EDITABLE_LIMIT_BYTES;
+    let read_only = state.editor(id).is_some_and(|edit| {
+        TextView::editable(&tab.input, edit)
+            .revision(tab.input_revision)
+            .editing_disabled()
+    });
     let offset = error_offset(&tab.input, line, column);
     if let Some(edit) = state.editors.get_mut(&id) {
         edit.set_caret(offset);
     }
     state.dispatch(Msg::SwitchView(TabView::Input));
     let editor_key = format!("editor-{id}");
-    if large {
-        // Large inputs use TextView's read-only virtual rows with this base key.
+    if read_only {
+        // Read-only fallback uses TextView's virtual rows with this base key.
         crate::runner::queue_reveal(TextView::row_key(&editor_key, line.saturating_sub(1)));
     } else {
         // Native TextEdit reveals its caret when focused; this also scrolls the

@@ -6,7 +6,7 @@
 //! 100 MB / 2M-line document costs O(visible rows) per frame instead of
 //! shaping the whole file.
 //!
-//! ```ignore
+//! ```text
 //! TextView::read_only(&tab.output)
 //!     .line_numbers(true)
 //!     .first_column(0)
@@ -658,10 +658,13 @@ fn editable_error_view(input: El, key: &str, source: &str, line: usize, column: 
         .gap(6.0)
         .center_y()
         .child(
-            text("●")
+            el()
                 .key(format!("{key}-error-dot"))
-                .font(mono())
-                .color(ERROR_INK),
+                .w(6.0)
+                .h(6.0)
+                .radius(3.0)
+                .fill(ERROR_INK)
+                .a11y_hidden(),
         )
         .child(
             text(format!("line {line}, column {column}"))
@@ -751,10 +754,13 @@ fn error_gutter(opts: &RowOpts, doc_line: usize, is_error: bool) -> El {
         return slot;
     }
     slot.child(
-        text("●")
+        el()
             .key(format!("{}-error-dot-{doc_line}", opts.base))
-            .font(mono())
-            .color(ERROR_INK),
+            .w(6.0)
+            .h(6.0)
+            .radius(3.0)
+            .fill(ERROR_INK)
+            .a11y_hidden(),
     )
 }
 
@@ -864,7 +870,7 @@ fn render_row(snapshot: &Snapshot, opts: &RowOpts, visual_row: usize) -> El {
                 text(format!("· {} {}", r.child_count, noun))
                     .key(format!("{}-fold-badge-{index}", opts.base))
                     .font(mono())
-                    .color(theme.text_secondary)
+                    .color(super::MUTED)
                     .label("Unfold region")
                     .on_press(move |state: &mut AppState| {
                         // The placeholder summary is the unfold target.
@@ -1186,6 +1192,16 @@ mod tests {
             Some("abcdefghij")
         );
         assert_eq!(copy_lines(&snapshot, 0, 4, &[]), None);
+    }
+
+    #[test]
+    fn error_column_underlines_the_identifier_start() {
+        let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";
+        let error = crate::json_ops::validate(input).expect_err("invalid fixture");
+        assert_eq!((error.line, error.column), (3, 8));
+        let window = column_window(input.lines().nth(2).unwrap(), 0, 240);
+        let (start, end) = error_column_range(&window, error.column).expect("visible error");
+        assert_eq!(&window.display[start..end], "o");
     }
 
     #[test]

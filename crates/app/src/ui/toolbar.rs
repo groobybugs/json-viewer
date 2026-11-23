@@ -1,6 +1,6 @@
 //! Document actions: validate, format, minify, copy, export, open, clear.
 
-use rune::{row, spacer, text, tok, Cx, El, Icon};
+use rune::{col, row, spacer, text, tok, Cx, El, Icon};
 use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 
 use super::{kit, BORDER, MUTED, TEXT, WINDOW_BG};
@@ -48,36 +48,35 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     // The tree is a third per-tab display mode, next to Input/Output (see
     // AGENTS.md): the tree's open flag lives in `AppState::tree`, not `Tab`,
     // so `TabView` (persisted) stays a two-variant enum.
-    let tree_open = tab.is_some_and(|tab| {
-        state
-            .tree
-            .get(&tab.id)
-            .is_some_and(|tree| tree.open)
-    });
+    let tree_open = tab.is_some_and(|tab| state.tree.get(&tab.id).is_some_and(|tree| tree.open));
 
     let input_view = Button::new("Input")
-        .variant(if tab.is_some_and(|tab| tab.view == TabView::Input) {
-            ButtonVariant::Neutral
-        } else {
-            ButtonVariant::Ghost
-        })
+        .variant(
+            if !tree_open && tab.is_some_and(|tab| tab.view == TabView::Input) {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            },
+        )
         .control_size(ControlSize::Regular)
         .on_press(|state: &mut AppState| state.dispatch(Msg::SwitchView(TabView::Input)))
         .build(&kit)
         .key("input-view")
-        .focus_selected(tab.is_some_and(|tab| tab.view == TabView::Input));
+        .focus_selected(!tree_open && tab.is_some_and(|tab| tab.view == TabView::Input));
     let output_view = Button::new("Output")
-        .variant(if tab.is_some_and(|tab| tab.view == TabView::Output) {
-            ButtonVariant::Neutral
-        } else {
-            ButtonVariant::Ghost
-        })
+        .variant(
+            if !tree_open && tab.is_some_and(|tab| tab.view == TabView::Output) {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            },
+        )
         .control_size(ControlSize::Regular)
         .on_press(|state: &mut AppState| state.dispatch(Msg::SwitchView(TabView::Output)))
         .build(&kit)
         .key("output-view")
         .role("tab")
-        .focus_selected(tab.is_some_and(|tab| tab.view == TabView::Output));
+        .focus_selected(!tree_open && tab.is_some_and(|tab| tab.view == TabView::Output));
     let tree_view = Button::new("Tree")
         .variant(if tree_open {
             ButtonVariant::Neutral
@@ -172,16 +171,36 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let fold_actions = row()
         .gap(2.0)
         .center_y()
-        .child(fold_button("Fold all", "fold-all", FoldAction::FoldAll, foldable))
+        .child(fold_button(
+            "Fold all",
+            "fold-all",
+            FoldAction::FoldAll,
+            foldable,
+        ))
         .child(fold_button(
             "Unfold all",
             "unfold-all",
             FoldAction::UnfoldAll,
             foldable,
         ))
-        .child(fold_button("L1", "fold-level-1", FoldAction::Level(1), foldable))
-        .child(fold_button("L2", "fold-level-2", FoldAction::Level(2), foldable))
-        .child(fold_button("L3", "fold-level-3", FoldAction::Level(3), foldable));
+        .child(fold_button(
+            "L1",
+            "fold-level-1",
+            FoldAction::Level(1),
+            foldable,
+        ))
+        .child(fold_button(
+            "L2",
+            "fold-level-2",
+            FoldAction::Level(2),
+            foldable,
+        ))
+        .child(fold_button(
+            "L3",
+            "fold-level-3",
+            FoldAction::Level(3),
+            foldable,
+        ));
     let mut bar = row()
         .w_full()
         .h(52.0)
@@ -189,8 +208,7 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .gap(10.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], BORDER)
-        .child(switcher)
-        .child(fold_actions);
+        .child(switcher);
     if processing {
         bar = bar.child(
             row()
@@ -211,7 +229,23 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
                 ),
         );
     }
-    bar.child(spacer()).child(actions)
+    let bar = bar.child(spacer()).child(actions);
+    if !tree_open && tab.is_some_and(|tab| tab.view == TabView::Output) {
+        // A separate Output sub-bar keeps the seven actions and view switch
+        // within the window at narrow widths; Tree has its own sub-bar too.
+        col().w_full().child(bar).child(
+            row()
+                .key("fold-toolbar")
+                .w_full()
+                .h(38.0)
+                .px(12.0)
+                .center_y()
+                .border_sides([0.0, 0.0, 1.0, 0.0], BORDER)
+                .child(fold_actions),
+        )
+    } else {
+        bar
+    }
 }
 
 /// One small folding button. `action` runs against the active tab's Output;

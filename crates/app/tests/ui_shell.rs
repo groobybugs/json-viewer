@@ -37,10 +37,15 @@ fn target_dir() -> PathBuf {
 }
 
 fn render(state: AppState, name: &str) -> Value {
+    render_at(state, SIZE, name)
+}
+
+fn render_at(state: AppState, size: (f32, f32), name: &str) -> Value {
     let directory = target_dir().join("headless/ui-shell");
+    std::fs::create_dir_all(&directory).expect("create evidence directory");
     let png = directory.join(format!("{name}.png"));
     let tree_path = directory.join(format!("{name}-tree.json"));
-    let tree = headless::render_and_dump(state, SIZE, 1.0, &png, &tree_path)
+    let tree = headless::render_and_dump(state, size, 1.0, &png, &tree_path)
         .unwrap_or_else(|error| panic!("render {name} failed: {error:#}"));
     assert!(png.metadata().expect("PNG metadata").len() > 0);
     assert!(tree_path.exists());
@@ -122,6 +127,12 @@ fn element<'a>(tree: &'a Value, key: &str) -> &'a Value {
         .as_array()
         .and_then(|elements| elements.iter().find(|element| element["key"] == key))
         .unwrap_or_else(|| panic!("missing element {key}: {tree}"))
+}
+
+fn has_element(tree: &Value, key: &str) -> bool {
+    tree["elements"]
+        .as_array()
+        .is_some_and(|elements| elements.iter().any(|element| element["key"] == key))
 }
 
 fn tab_count(tree: &Value) -> usize {
@@ -240,7 +251,10 @@ fn six_shell_states_render_with_controls_and_layout() {
     assert!(element(&error, "error-message")["text"]
         .as_str()
         .is_some_and(|text| text == "Invalid JSON: expected value"));
-    assert_eq!(element(&error, "error-location")["text"], "Line 3, column 14");
+    assert_eq!(
+        element(&error, "error-location")["text"],
+        "Line 3, column 14"
+    );
 
     let mut processing_state = output_state();
     let id = processing_state.active;
@@ -269,6 +283,71 @@ fn six_shell_states_render_with_controls_and_layout() {
     assert_eq!(a11y(&search, "search-hit-0")["role"], "button");
     assert_eq!(a11y(&search, "search-hit-1")["role"], "button");
     assert!(search.to_string().contains("address → city"));
+}
+
+#[test]
+fn toolbar_groups_fit_wide_and_narrow_windows() {
+    let actions = [
+        "validate", "format", "minify", "copy", "export", "open", "clear",
+    ];
+    for (size, name) in [
+        ((1280.0, 800.0), "toolbar-output-1280"),
+        ((1024.0, 700.0), "toolbar-output-1024"),
+    ] {
+        let tree = render_at(output_state(), size, name);
+        for key in ["input-view", "output-view", "tree-view"]
+            .into_iter()
+            .chain(actions)
+            .chain([
+                "fold-all",
+                "unfold-all",
+                "fold-level-1",
+                "fold-level-2",
+                "fold-level-3",
+            ])
+        {
+            let rect = &element(&tree, key)["rect"];
+            let x = rect[0].as_f64().unwrap();
+            let y = rect[1].as_f64().unwrap();
+            let right = x + rect[2].as_f64().unwrap();
+            let bottom = y + rect[3].as_f64().unwrap();
+            assert!(x >= 0.0 && y >= 0.0, "{name}: {key} starts outside: {rect}");
+            assert!(
+                right <= size.0 as f64 && bottom <= size.1 as f64,
+                "{name}: {key} clipped: {rect}"
+            );
+        }
+        for pair in actions.windows(2) {
+            let left = &element(&tree, pair[0])["rect"];
+            let right = &element(&tree, pair[1])["rect"];
+            assert!(
+                left[0].as_f64().unwrap() + left[2].as_f64().unwrap() <= right[0].as_f64().unwrap(),
+                "{name}: {} overlaps {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let switch = &element(&tree, "tree-view")["rect"];
+        let first_action = &element(&tree, "validate")["rect"];
+        assert!(
+            switch[0].as_f64().unwrap() + switch[2].as_f64().unwrap()
+                <= first_action[0].as_f64().unwrap(),
+            "{name}: view switch and actions overlap"
+        );
+        assert!(!has_element(&tree, "tree-toolbar"));
+    }
+
+    let input = render_at(document_state(), (1024.0, 700.0), "toolbar-input-1024");
+    assert!(!has_element(&input, "fold-toolbar"));
+    assert!(!has_element(&input, "tree-toolbar"));
+
+    let mut tree_state = output_state();
+    tree_state.update(Msg::TreeOpen);
+    let tree = render_at(tree_state, (1024.0, 700.0), "toolbar-tree-1024");
+    assert!(!has_element(&tree, "fold-toolbar"));
+    assert!(has_element(&tree, "tree-toolbar"));
+    assert!(states(a11y(&tree, "tree-view")).contains(&"selected"));
+    assert!(!states(a11y(&tree, "output-view")).contains(&"selected"));
 }
 
 #[test]

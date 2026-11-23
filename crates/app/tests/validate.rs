@@ -67,6 +67,14 @@ fn invalid_literal_points_at_first_mismatch() {
 }
 
 #[test]
+fn unexpected_identifier_points_at_identifier_start() {
+    let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";
+    let error = assert_error(input, 3, 8, "Unexpected token 'o'");
+    let source_line = input.lines().nth(error.line - 1).unwrap();
+    assert_eq!(&source_line[error.column - 1..], "oops,");
+}
+
+#[test]
 fn garbage_after_document_has_exact_line_and_column() {
     assert_error(
         "{\"a\":1}\n true",
@@ -264,6 +272,77 @@ fn headless_format_error_panel_png_and_go_to_error() {
     assert_eq!(runtime.state.active_tab().unwrap().view, TabView::Input);
     let expected = input.find("\"b\"").unwrap();
     assert_eq!(runtime.state.editor(id).unwrap().focus, expected);
+}
+
+#[test]
+fn validate_error_marker_and_go_to_error_use_the_real_position() {
+    let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";
+    let error = json_ops::validate(input).expect_err("invalid fixture");
+    assert_eq!((error.line, error.column), (3, 8));
+
+    let mut state = AppState::default();
+    let id = state.active;
+    state.update_input(id, input.into());
+    let revision = state.tab(id).unwrap().input_revision;
+    state.update(Msg::ValidationDone {
+        tab: id,
+        input_revision: revision,
+        result: Err(error),
+    });
+
+    let tree = render(state.clone(), "error-marker-panel");
+    assert_eq!(element(&tree, "error-location")["text"], "Line 3, column 8");
+    assert_eq!(
+        element(&tree, "editor-1-error-label")["text"],
+        "line 3, column 8"
+    );
+    assert!(element(&tree, "editor-1-error-dot")["key"] == "editor-1-error-dot");
+
+    let mut runtime = headless::runtime(state, SIZE, 1.0);
+    click(&mut runtime, "go-to-error");
+    for _ in 0..4 {
+        runtime.update_if(|state, tx| runner::poll(state, 0.0, tx));
+        runtime.frame(1.0 / 60.0);
+    }
+    assert_eq!(runtime.state.active_tab().unwrap().view, TabView::Input);
+    assert_eq!(
+        runtime.state.editor(id).unwrap().focus,
+        input.find("oops").unwrap()
+    );
+    assert!(runtime.find("editor-1-error-dot").is_some());
+}
+
+#[test]
+fn go_to_error_reveals_the_read_only_input_fallback() {
+    let mut input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3,\n  \"pad\": \"".to_owned();
+    input.push_str(&"x".repeat(6 * MIB));
+    input.push_str("\"\n}\n");
+    let error = json_ops::validate(&input).expect_err("invalid fixture");
+    assert_eq!((error.line, error.column), (3, 8));
+
+    let mut state = AppState::default();
+    let id = state.active;
+    state.update_input(id, input);
+    let revision = state.tab(id).unwrap().input_revision;
+    state.update(Msg::ValidationDone {
+        tab: id,
+        input_revision: revision,
+        result: Err(error),
+    });
+    let mut runtime = headless::runtime(state, SIZE, 1.0);
+    assert!(headless::element_tree(&runtime)
+        .to_string()
+        .contains("Very long line"));
+
+    click(&mut runtime, "go-to-error");
+    for _ in 0..8 {
+        runtime.update_if(|state, tx| runner::poll(state, 0.0, tx));
+        runtime.settle_all();
+        runtime.frame(1.0 / 60.0);
+    }
+    assert_eq!(runtime.state.active_tab().unwrap().view, TabView::Input);
+    assert!(runtime.find("editor-1-row-2").is_some());
+    assert!(runtime.find("editor-1-error-dot-2").is_some());
 }
 
 #[test]

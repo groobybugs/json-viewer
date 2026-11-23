@@ -25,6 +25,7 @@ crates/app/
     io.rs                      dialogs, file read/write, clipboard, drop
     runner.rs                  drains Msg queue, executes Effect values
     line_index.rs              revision-keyed line index + snapshot cache
+    tree_index.rs              streaming JSON node index + tree row jobs
     fold_index.rs              fold index + fold set + visual-row map
     headless.rs                offscreen PNG + element-tree dump
     bin/gen_fixtures.rs        QA fixture generator
@@ -33,14 +34,20 @@ crates/app/
       mod.rs                   fn view + composition
       shell.rs                 page frame, header, status line
       tabs.rs                  tab strip + active document
-      toolbar.rs               Format/Minify/Copy/Export/Open/Clear
+      toolbar.rs               view switch, Validate/actions, Output fold controls
       search_bar.rs            search field + results panel
       text_view.rs             TextView: editable or virtualized read-only
+      tree_view.rs             tree explorer toolbar, rows and footer
+      validation_panel.rs      validation result and source-error panel
   tests/
     smoke.rs                   PNG smoke test + title assertion
     headless.rs                scripted input QA suite
     perf.rs                    ignored 100 MB perf harness
+    edit_threshold.rs          ignored native-editor threshold measurements
     text_view.rs               TextView + line index rendering tests
+    validate.rs                validation parser/worker/panel/marker tests
+    tree_view.rs               tree explorer evidence + release timings
+    folding.rs                 folding + error-marker evidence
     ui_shell.rs                shell layout, shortcuts, accessibility
   benches/json_ops.rs          format/minify throughput
 ```
@@ -56,7 +63,7 @@ runner::poll (AppSpec::poll)
     drain AppState::pending + background inbox
     AppState::update(msg) -> Vec<Effect>
     runner::execute(effects)
-        SpawnJson/Search -> worker threads -> Msg back into the inbox
+        SpawnJson/SpawnValidation/Search -> worker threads -> Msg back into the inbox
         Persist/Copy/Export/Open/ReadDroppedFile -> platform I/O
 ```
 
@@ -76,7 +83,8 @@ sites and this document in one commit.
   `Msg::JsonDone.revision` were added by the integration round so the line
   index can be keyed by a document generation instead of sampling content.
 - `json_ops.rs`: `JsonAction`, `JsonError`, `process`, `JsonJob`,
-  `spawn_process`, `JobHandle`.
+  `spawn_process`, `JobHandle`. Additive since rp-validate: `ValidationInfo`,
+  `validate`.
 - `search.rs`: `SearchHit`, `SearchOptions`, `search`.
 - `persist.rs`: `PersistError`, `data_path`, `TabsStore`, `load_tabs`,
   `save_tabs`.
@@ -115,6 +123,7 @@ frozen API or a PR comment.
 | `crates/app/src/json_ops.rs` | JSON parse/format/minify worker |
 | `crates/app/src/search.rs` | search traversal and hit model |
 | `crates/app/src/line_index.rs` | revision-keyed line index + snapshot cache |
+| `crates/app/src/tree_index.rs` | tree explorer: node index, row jobs |
 | `crates/app/src/fold_index.rs` | fold index, fold set, visual-row map |
 | `crates/app/src/persist.rs` | tab persistence |
 | `crates/app/src/io.rs` | dialogs, files, clipboard, drop |
@@ -125,14 +134,26 @@ frozen API or a PR comment.
 | `crates/app/src/ui/toolbar.rs` | action toolbar |
 | `crates/app/src/ui/search_bar.rs` | search field/results |
 | `crates/app/src/ui/text_view.rs` | text input/output virtualization |
-| `crates/app/src/tree_index.rs` | tree explorer: node index, row jobs |
 | `crates/app/src/ui/tree_view.rs` | tree explorer: toolbar, rows, footer |
+| `crates/app/src/ui/validation_panel.rs` | validation alerts, source context, error reveal |
 | `crates/app/tests/tree_view.rs` | tree explorer evidence + timings |
 | `crates/app/src/headless.rs` | headless render/tree helpers |
 | `crates/app/src/main.rs` | binary, window wiring, `--headless` |
 | `crates/app/tests/smoke.rs` | headless smoke test |
 | `crates/app/tests/folding.rs` | folding + error-marker evidence |
 | `crates/app/Cargo.toml`, `Cargo.toml` | dependencies/workspace (ask first) |
+
+## Validation (rp-validate)
+
+**Validate** (`Ctrl+Shift+V`) runs the same streaming parser as Format/Minify
+without building an output string, and reports byte/line/depth/value counts
+for valid input. Errors carry a 1-based line and UTF-8 byte column, a bounded
+source excerpt and a **Go to error** action. The Input `TextView` receives
+`.error_marker(line, column)` in both native-editable and read-only fallback
+modes; Go to error sets the native caret, or reveals the virtual row (opening
+any folded ancestors) in the fallback. Editing or a newer input revision
+invalidates stale validation results. The tree view retains the validation
+panel above its own toolbar.
 
 ## Tree explorer (rp-tree)
 
@@ -169,6 +190,13 @@ TreeFilterChanged/TreeCopyPath/TreeCopyValue/TreeIndexDone/TreeRowsReady`;
 copy actions reuse the existing `Effect::Copy`, and choosing a code view
 (`Msg::SwitchView`) leaves tree mode, so search-result jumps in code views
 behave as before.
+
+Other semantics: `TreeUi` retains its index while its tab is in a code view
+and drops it on input change, clear or close; duplicate object keys remain
+duplicate rows, matching `search.rs`; row depth saturates at `u16`
+(`MAX_ROW_DEPTH`), with indentation guides drawn through 48 levels; values
+show the raw JSON token elided at 160 bytes, and object keys are unescaped
+(including surrogate-pair decoding).
 
 Performance design (evidence: `cargo test --release -p json-viewer --test
 tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
@@ -496,9 +524,12 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
   `build` clears every folded ancestor of the target line. Search hits,
   `build_revealing` and `error_marker` callers all go through that path.
 - UI: `▾`/`▸` arrows on foldable rows, a folded row renders
-  `"key": {…}` / `[…]` plus a muted `· N keys|items` badge; clicking the
-  arrow, the badge or the placeholder line toggles. `ui/toolbar.rs` adds
-  Fold all / Unfold all / L1–L3 (`ui::text_view::apply_fold_action`).
+  `"key": {…}` / `[…]` plus a status-line-`MUTED` `· N keys|items` badge;
+  clicking the arrow, the badge or the placeholder line toggles.
+  `ui/toolbar.rs` keeps the view switch left and the seven actions right;
+  Fold all / Unfold all / L1–L3 (`ui::text_view::apply_fold_action`) live in
+  an Output-only sub-bar, so 1024 px layouts do not clip. Tree controls have
+  their own Tree-only sub-bar.
   Shortcuts: `Ctrl+Shift+[` / `Ctrl+Shift+]` toggle/unfold at the hovered
   line (the read-only view has no caret), and `Ctrl+K` then
   `Ctrl+0` / `Ctrl+J` / `Ctrl+1..3` fold all / unfold all / fold to level.
@@ -517,13 +548,14 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
 `TextView::error_marker(line, column)` (both 1-based) is additive and works
 in both modes:
 
-- Read-only/virtualized: red row tint, a red `●` in a dedicated gutter cell
-  (reserved on every row so text columns stay aligned), and an underlined
-  caret span at the column inside the shaped window.
+- Read-only/virtualized: red row tint, a small filled circular element in a
+  dedicated gutter cell (reserved on every row so text columns stay aligned),
+  and an underlined caret span at the column inside the shaped window.
 - Editable: `TextEdit` decorations (`Span::bg` on the line, `Span::underline`
   at the column) so Rune maps them through wrapping and IME preedit, plus a
-  `● line N, column C` strip above the field. A text field is one scroll
-  target; the keyed strip is `row_key(base, line - 1)` so
+  circular-dot `line N, column C` strip above the field. Both dots are drawn
+  shapes, not font glyphs, so missing fonts cannot turn them into tofu. A
+  text field is one scroll target; the keyed strip is `row_key(base, line - 1)` so
   `Tx::scroll_into_view` still works, but the precise position is the
   underline.
 
@@ -537,6 +569,108 @@ Both are O(1) from the cached line index
 index has no exact maximum, so a cold ≥8 MiB document is reported as a large
 file. Banners: `Large file (6.9 MB) — editing disabled …` and
 `Very long line (6.9 MB on one line) — Format to edit`.
+
+### Edit-threshold evidence (rp-editbench)
+
+The measurement branch changed no source or frozen API; it added
+`tests/edit_threshold.rs`. rp-fold then applied the thresholds above. The
+integrated harness uses a test-local copy of the native `rune::text_input`
+branch to bypass both read-only gates: `editable_limit` alone cannot lift the
+new long-line gate, and the historical minified measurements must remain
+reproducible.
+Re-run the release measurements with:
+
+```sh
+cargo test --release -p json-viewer --test edit_threshold -- --ignored --nocapture
+```
+
+Method: headless 1280×800, scale 1, app fonts; generated ASCII JSON at
+0.5/1/2/5/10/25/50 MiB pretty and 2/10 MiB minified. The forced view copies
+the real composition except for the limit override; a 1 MiB control uses the
+real `ui::view`. A keystroke sample is `Runtime::key(Key::Text)` +
+`runner::poll` + one frame, with 20 characters at start/middle/end (60
+samples). Numbers are CPU commit/layout/instance time, not GPU presentation.
+Caret+scroll uses `set_caret(len/2)` and `scroll_to_y`; paste inserts 1 KiB.
+Peak RSS is process-wide and cumulative (`/proc/self/status` VmHWM); VmRSS is
+after dropping the runtime. Machine: 24 cores, 62 GiB RAM, Linux, one release
+run (no variance study), whole bench about 108 s.
+
+| Variant | View | MiB | Lines | Load ms | First frame ms | Settle ms | Key median ms | Key p95 ms | Key max ms | Caret+scroll ms | Paste 1KB ms | VmHWM MiB | VmRSS MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pretty 1 control | real | 1.00 | 38917 | 0.3 | 37.3 | 3.4 | 3.38 | 4.33 | 4.80 | 2.7 | 4.7 | 97 | 97 |
+| pretty 0.5 | forced | 0.50 | 19478 | 0.0 | 14.8 | 2.0 | 2.48 | 2.79 | 3.50 | 2.1 | 3.3 | 99 | 99 |
+| pretty 1 | forced | 1.00 | 38917 | 0.1 | 14.1 | 2.4 | 3.07 | 4.03 | 4.73 | 2.4 | 3.9 | 115 | 115 |
+| pretty 2 | forced | 2.00 | 77760 | 0.2 | 15.6 | 3.2 | 4.16 | 5.79 | 6.47 | 3.2 | 5.0 | 155 | 155 |
+| pretty 5 | forced | 5.00 | 193778 | 0.5 | 20.1 | 5.6 | 9.95 | 12.26 | 14.73 | 7.3 | 14.6 | 177 | 168 |
+| pretty 10 | forced | 10.00 | 387153 | 1.2 | 41.0 | 18.1 | 17.38 | 24.33 | 29.08 | 11.2 | 26.8 | 252 | 243 |
+| pretty 25 | forced | 25.00 | 965864 | 9.9 | 72.2 | 37.0 | 36.26 | 49.68 | 51.30 | 20.1 | 60.4 | 617 | 468 |
+| pretty 50 | forced | 50.00 | 1927664 | 19.9 | 134.6 | 72.4 | 150.97 | 163.22 | 166.30 | 70.3 | 147.4 | 653 | 554 |
+| minified 2 | forced | 2.00 | 1 | 0.2 | 258.6 | 1.5 | 244.87 | 250.11 | 251.66 | 2.1 | 241.0 | 653 | 345 |
+| minified 10 | forced | 10.00 | 1 | 2.2 | 1345.5 | 14.5 | 1208.49 | 1222.38 | 1247.98 | 8.5 | 1217.8 | 1352 | 1033 |
+
+The control pays one-time process/font warm-up (37.3 ms first frame versus
+14.1 ms forced); keystroke medians 3.38 versus 3.07 ms validate the harness.
+Position barely matters because the whole buffer is reworked per edit:
+
+| Variant | Start key median ms | Middle | End |
+| --- | ---: | ---: | ---: |
+| pretty 0.5 | 2.23 | 2.48 | 2.70 |
+| pretty 1 | 2.69 | 3.07 | 3.36 |
+| pretty 2 | 3.86 | 4.16 | 5.26 |
+| pretty 5 | 9.13 | 9.79 | 10.56 |
+| pretty 10 | 17.44 | 17.31 | 18.15 |
+| pretty 25 | 35.82 | 36.26 | 37.45 |
+| pretty 50 | 147.67 | 156.22 | 152.56 |
+| minified 2 | 244.37 | 245.06 | 245.44 |
+| minified 10 | 1206.96 | 1204.04 | 1213.71 |
+
+Per-keystroke cost breakdown (ms). “Idle frame” is a full rebuild/re-shape
+with no edit; residual = key median − (before-clone + joined insert + sync).
+`update_input` is a changed-text clone + `replace_text`, measured for
+completeness but not on the typing hot path.
+
+| Variant | Key median | text.clone (Rune before) | insert first (undo snap) | insert join | sync_active_editor | TextEdit.clone (view) | display() | Idle frame | Residual | update_input |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pretty 1 control | 3.38 | 0.05 | 0.51 | 0.05 | 0.08 | 0.07 | 0.44 | 3.97 | 3.19 | 0.13 |
+| pretty 0.5 | 2.48 | 0.24 | 0.03 | 0.02 | 0.02 | 0.03 | 0.01 | 2.86 | 2.20 | 0.03 |
+| pretty 1 | 3.07 | 0.04 | 0.43 | 0.06 | 0.07 | 0.04 | 0.43 | 3.31 | 2.90 | 0.06 |
+| pretty 2 | 4.16 | 0.09 | 0.31 | 0.12 | 0.18 | 0.14 | 0.15 | 4.23 | 3.76 | 0.18 |
+| pretty 5 | 9.95 | 0.48 | 2.68 | 0.48 | 0.57 | 0.50 | 2.27 | 7.57 | 8.41 | 0.50 |
+| pretty 10 | 17.38 | 1.08 | 5.14 | 1.03 | 1.28 | 0.95 | 1.05 | 13.34 | 13.99 | 1.38 |
+| pretty 25 | 36.26 | 8.78 | 2.67 | 2.22 | 3.18 | 9.33 | 8.85 | 29.42 | 22.09 | 5.62 |
+| pretty 50 | 150.97 | 14.92 | 6.15 | 7.12 | 18.75 | 17.34 | 17.32 | 88.34 | 110.19 | 25.43 |
+| minified 2 | 244.87 | 0.20 | 0.21 | 0.12 | 0.20 | 0.14 | 0.15 | 245.69 | 244.35 | 0.17 |
+| minified 10 | 1208.49 | 1.11 | 1.26 | 0.79 | 1.30 | 1.09 | 1.00 | 1224.81 | 1205.29 | 1.29 |
+
+Findings behind the shipped gates:
+
+1. Rune re-shapes/re-lays-out the whole buffer on every text change. The
+   residual/idle-frame term dominates: about 80–90% for pretty ≤25 MiB and
+   >99% for minified. `text_input` clones `TextEdit` and rebuilds the display
+   string on each view build; caret position is irrelevant.
+2. Wrapped minified input is catastrophic: 2 MiB costs about 245 ms/key and
+   10 MiB about 1.2 s/key plus ~1 GiB RSS for wrap layout. A no-change frame
+   is cheap because layout survives; editing invalidates all of it. The 16 ms
+   budget is reached near 0.13 MiB on one line, hence 128 KiB.
+3. App copies are secondary at the threshold: `sync_active_editor` costs
+   0.02 ms at 0.5 MiB, 1.3 ms at 10 MiB and 18.8 ms at 50 MiB. Rune's
+   pre-edit clone costs 14.9 ms at 50 MiB; with view clone/display those
+   copies are ~45% there, but only ~2–3 ms total around 5–10 MiB.
+4. Search and persistence do not run per keystroke. The editor syncs the
+   model directly; search starts on `SearchChanged`, while persist is
+   debounced and queued only by Clear/CloseTab/JsonDone.
+5. The first key in a typing run snapshots all text for undo; consecutive
+   keys coalesce. Caret moves close the run, so each position block pays one
+   snapshot.
+6. Pretty mounting stays below 250 ms even at 50 MiB (134.6 ms): the editing
+   limit comes from keystroke latency, not initial mount. Minified 2 MiB
+   fails both budgets.
+
+The 5 MiB gate is the largest tested pretty size passing p95 <16 ms and first
+frame <250 ms; interpolation passes near 6.5 MiB, while 10 MiB fails. Caveats:
+ASCII fixtures, release CPU-only timings, one run on the machine above. A
+real fix for larger editable input needs Rune-side incremental or
+viewport-bounded wrapped-text layout, not another app-side threshold.
 
 ### Monospace metrics
 

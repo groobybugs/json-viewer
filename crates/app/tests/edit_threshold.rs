@@ -2,9 +2,10 @@
 //! smooth for the JSON input editor?
 //!
 //! Builds a headless `Runtime` with the app's real view composition and one
-//! tab holding a generated ASCII JSON document, forces the editable path
-//! (`TextView::editable(..).editable_limit(usize::MAX)`, the public frozen
-//! builder — no src change), and measures in release:
+//! tab holding a generated ASCII JSON document. A test-local copy of the
+//! native `rune::text_input` branch bypasses both read-only gates, preserving
+//! the historical minified measurements after rp-fold added its line-length
+//! gate, and measures in release:
 //!
 //! - load (`AppState::update_input`) and time to first frame with the editor
 //!   mounted (`Runtime::with_text` + first `frame`),
@@ -16,7 +17,7 @@
 //! - peak RSS (`/proc/self/status` VmHWM, process-wide and cumulative).
 //!
 //! Sizes: pretty-printed 0.5/1/2/5/10/25/50 MiB plus single-line minified
-//! 2/10 MiB. A 1 MiB control run uses the real `ui::view` (below the 2 MiB
+//! 2/10 MiB. A 1 MiB control run uses the real `ui::view` (below the 5 MiB
 //! `EDITABLE_LIMIT_BYTES`, so its editable path is the shipped one) to show
 //! the forced-editable harness matches the real app.
 //!
@@ -58,9 +59,9 @@ const MUTED: Color = Color { r: 0.296138, g: 0.366253, b: 0.47932, a: 1.0 };
 const DANGER: Color = Color { r: 0.938686, g: 0.165132, b: 0.165132, a: 1.0 };
 const DANGER_BG: Color = Color { r: 0.0356013, g: 0.0109601, b: 0.0193824, a: 1.0 };
 
-/// `ui::view` with the input editor's size limit lifted. Everything else —
-/// shell, toolbar, tab strip, search, handlers, scroll viewport — is the real
-/// composition; only `tab_content`'s `TextView` gains `.editable_limit(MAX)`.
+/// `ui::view` with the input editor's read-only gates lifted. Everything else
+/// — shell, toolbar, tab strip, search, handlers, scroll viewport — is the
+/// real composition; only `tab_content` mounts Rune's native input directly.
 fn bench_view(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let document = col()
         .w_full()
@@ -85,9 +86,10 @@ fn bench_view(state: &AppState, cx: &mut Cx<AppState>) -> El {
     io::drop_zone(shell::shell(state, cx, header, body)).on_key(ui::on_key)
 }
 
-/// Copy of `tabs::tab_content` with `.editable_limit(usize::MAX)` on the
-/// editable builder (the only difference), so inputs over 2 MiB still mount
-/// Rune's native text input instead of the read-only virtual fallback.
+/// Copy of `tabs::tab_content` whose input is the same native text field used
+/// by `TextView`'s editable branch. Direct construction is intentional: the
+/// shipped long-line gate cannot be overridden by `editable_limit`, and this
+/// historical bench must still measure pathological minified input.
 fn bench_tab_content(state: &AppState) -> El {
     let Some(tab) = state.active_tab() else {
         return col().w_full().grow(1.0).fill(EDITOR_BG);
@@ -95,11 +97,16 @@ fn bench_tab_content(state: &AppState) -> El {
     let body = match tab.view {
         TabView::Input => {
             let edit = state.editor(tab.id).expect("every tab has an editor");
-            TextView::editable(&tab.input, edit)
-                .editable_limit(usize::MAX)
-                .revision(tab.input_revision)
-                .line_numbers(true)
-                .build(&format!("editor-{}", tab.id))
+            let theme = tok::theme(true);
+            rune::text_input(edit, TextStyle::new(12.0, 400.0).mono())
+                .key(format!("editor-{}", tab.id))
+                .label("JSON input")
+                .w_full()
+                .min_h(240.0)
+                .padding(12.0)
+                .fill(theme.card)
+                .color(theme.text)
+                .caret(theme.text, tok::accent(0, true))
                 .placeholder("Paste your JSON here or drop a JSON file…", MUTED)
                 .fill(EDITOR_BG)
                 .padding(16.0)
@@ -548,7 +555,7 @@ fn recommend(results: &[VariantResult], prefix: &str) -> String {
 fn edit_threshold_bench() {
     let mut results = Vec::new();
 
-    // Control: the real ui::view below the shipped 2 MiB limit.
+    // Control: the real ui::view below the shipped 5 MiB limit.
     results.push(bench_variant("pretty 1 control", pretty_fixture(MIB), false));
     for mb in [0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0] {
         let target = (mb * MIB as f64) as usize;
