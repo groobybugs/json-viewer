@@ -177,11 +177,21 @@ fn render_row(
     let is_error = error.is_some_and(|(l, _)| l == line + 1);
     if is_error {
         if let Some((_, column)) = error {
-            let c = column.saturating_sub(1);
+            // Snap the error column to a char boundary and underline the
+            // whole character: a span ending inside a multibyte char panics
+            // the text shaper (same class as the C1 chunk-boundary panic).
+            let err_off = buf.char_to_byte(
+                buf.byte_to_char((line_range.start + column.saturating_sub(1)).min(line_range.end)),
+            );
+            let c = err_off - line_range.start;
             let rel_start = col_start - line_range.start;
             if c >= rel_start && c < col_end - line_range.start {
                 let at = span_offset + (c - rel_start);
-                let end = (at + 1).min(span_offset + cached.slice_len);
+                let char_end = buf
+                    .char_to_byte(buf.byte_to_char(err_off) + 1)
+                    .min(line_range.end);
+                let end =
+                    (span_offset + (char_end - line_range.start)).min(span_offset + cached.slice_len);
                 if at < end {
                     spans.push(Span::new(at, end).underline(ERROR_INK).bg(ERROR_CARET_BG, 1.0));
                 }
@@ -189,10 +199,11 @@ fn render_row(
         }
     }
 
-    // Selection background over the visible part of the range.
+    // Selection background over the visible part of the range (boundaries
+    // snapped defensively: spans index the display string by byte).
     if let Some(sel) = ed.selection() {
-        let from = sel.start.max(col_start);
-        let to = sel.end.min(col_end);
+        let from = buf.char_to_byte(buf.byte_to_char(sel.start)).max(col_start);
+        let to = buf.char_to_byte(buf.byte_to_char(sel.end)).min(col_end);
         if from < to {
             let s = span_offset + (from - col_start);
             let e = span_offset + (to - col_start);
@@ -200,8 +211,9 @@ fn render_row(
         }
     }
 
-    let caret_here = caret_line == line && ed.caret >= col_start && ed.caret <= col_end;
-    let mut caret_disp = if caret_here { span_offset + (ed.caret - col_start) } else { 0 };
+    let caret_byte = buf.char_to_byte(buf.byte_to_char(ed.caret.min(buf.len_bytes())));
+    let caret_here = caret_line == line && caret_byte >= col_start && caret_byte <= col_end;
+    let mut caret_disp = if caret_here { span_offset + (caret_byte - col_start) } else { 0 };
 
     // IME composition: insert the preedit at the caret, underlined; the
     // caret sits after it. Tokens at/after the insertion shift with it.

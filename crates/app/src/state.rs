@@ -299,9 +299,13 @@ impl AppState {
         tab.input_revision = crate::line_index::next_revision();
         tab.error = None;
         tab.validation = None;
-        // The rope editor rebuilds lazily on its next access (revision
-        // mismatch): reducer-only callers never pay for a rope they do not
-        // use, and the first editor view build syncs from the new text.
+        // H2: drop any rope entry now. `sync()` repairs a stale buffer only
+        // on the next Input-view access; while the tab shows Output/Tree a
+        // dirty entry would keep the *old* document, and the no-sync
+        // accessors (`existing_snapshot` for jobs, `dirty_snapshot` for
+        // persist) would format/save it. The next view build recreates the
+        // entry from the new text via `with()`.
+        crate::editor::state::remove(id);
         if let Some(edit) = self.editors.get_mut(&id) {
             if edit.text != input {
                 edit.replace_text(input);
@@ -381,6 +385,9 @@ impl AppState {
         tab.view = TabView::Input;
         tab.search_query.clear();
         tab.search_results.clear();
+        // H2 (same class as update_input): Clear persists at once; a dirty
+        // stale rope must not save the previous document over the clear.
+        crate::editor::state::remove(id);
         if let Some(edit) = self.editors.get_mut(&id) {
             edit.replace_text("");
         }
@@ -397,20 +404,32 @@ impl AppState {
     /// Returns `true` on success.
     pub fn apply_json_result(&mut self, id: TabId, result: Result<String, JsonError>) -> bool {
         let revision = crate::line_index::next_revision();
-        self.apply_json_result_with_revision(id, revision, result)
+        // Synchronous callers apply to the tab's current document.
+        let input_revision = self.tab(id).map_or(0, |tab| tab.input_revision);
+        self.apply_json_result_with_revision(id, revision, input_revision, result)
     }
 
     /// Applies a finished job whose output revision was assigned by the JSON
     /// worker, so the prewarmed line index matches the one the view requests.
+    /// `input_revision` is the revision the job was started for; a result
+    /// for an edited document is dropped (H3, mirrors `apply_validation_result`).
     fn apply_json_result_with_revision(
         &mut self,
         id: TabId,
         revision: u64,
+        input_revision: u64,
         result: Result<String, JsonError>,
     ) -> bool {
         let Some(tab) = self.tab_mut(id) else {
             return false;
         };
+        if tab.input_revision != input_revision {
+            // The document moved on while the job ran; never publish output
+            // for text the tab no longer holds, and never leave the toolbar
+            // stuck in the busy state.
+            tab.is_processing = false;
+            return false;
+        }
         tab.is_processing = false;
         match result {
             Ok(output) => {
@@ -848,15 +867,39 @@ impl AppState {
                     }
                 }
             }
-            Msg::RopeMaterialized { tab, input, job } => match job {
-                RopeJob::Json(action) => vec![Effect::SpawnJson { tab, input, action }],
-                RopeJob::Validate { input_revision } => vec![Effect::SpawnValidation {
-                    tab,
-                    input,
-                    input_revision,
-                }],
-                RopeJob::Search { query } => vec![Effect::Search { tab, input, query }],
-            },
+            Msg::RopeMaterialized { tab, input, job } => {
+                // H3: the input may have changed while the rope was being
+                // converted off-thread. Starting the job anyway would cancel
+                // a newer per-tab job and publish a stale result; drop it.
+                if self
+                    .tab(tab)
+                    .is_some_and(|t| t.input_revision != job.input_revision())
+                {
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.is_processing = false;
+                    }
+                    return Vec::new();
+                }
+                match job {
+                    RopeJob::Json { action, input_revision } => vec![Effect::SpawnJson {
+                        tab,
+                        input,
+                        action,
+                        input_revision,
+                    }],
+                    RopeJob::Validate { input_revision } => vec![Effect::SpawnValidation {
+                        tab,
+                        input,
+                        input_revision,
+                    }],
+                    RopeJob::Search { query, input_revision } => vec![Effect::Search {
+                        tab,
+                        input,
+                        query,
+                        input_revision,
+                    }],
+                }
+            }
             Msg::Clear => {
                 self.clear_tab(self.active);
                 vec![Effect::Persist]
@@ -906,6 +949,12 @@ impl AppState {
                 self.update_input(self.active, content);
                 Vec::new()
             }
+            Msg::FileLoadedFor { tab, path: _, content } => {
+                // M3: land in the tab that requested the read, even if the
+                // user switched tabs while the file was being read.
+                self.update_input(tab, content);
+                Vec::new()
+            }
             Msg::SearchChanged(query) => {
                 let id = self.active;
                 let Some(tab) = self.tab_mut(id) else {
@@ -918,14 +967,17 @@ impl AppState {
                     return Vec::new();
                 }
                 tab.is_processing = true;
-                vec![self.spawn_input_job(id, RopeJob::Search { query })]
+                let input_revision = tab.input_revision;
+                vec![self.spawn_input_job(id, RopeJob::Search { query, input_revision })]
             }
             Msg::JsonDone {
                 tab,
                 revision,
+                input_revision,
                 result,
             } => {
-                let ok = self.apply_json_result_with_revision(tab, revision, result);
+                let ok =
+                    self.apply_json_result_with_revision(tab, revision, input_revision, result);
                 if ok {
                     vec![Effect::Persist]
                 } else {
@@ -945,6 +997,20 @@ impl AppState {
             }
             Msg::SearchDone { tab, hits } => {
                 self.apply_search_results(tab, hits);
+                Vec::new()
+            }
+            Msg::SearchDoneFor { tab, input_revision, query, hits } => {
+                // H3 (mirrors apply_validation_result): drop hits for a
+                // document or query that moved on while the walk ran, and
+                // never leave the toolbar stuck in the busy state.
+                let fresh = self
+                    .tab(tab)
+                    .is_some_and(|t| t.input_revision == input_revision && t.search_query == query);
+                if fresh {
+                    self.apply_search_results(tab, hits);
+                } else if let Some(t) = self.tab_mut(tab) {
+                    t.is_processing = false;
+                }
                 Vec::new()
             }
             Msg::TabsLoaded(tabs) => {
@@ -1216,7 +1282,8 @@ impl AppState {
         tab.is_processing = true;
         tab.error = None;
         tab.validation = None;
-        vec![self.spawn_input_job(id, RopeJob::Json(action))]
+        let input_revision = tab.input_revision;
+        vec![self.spawn_input_job(id, RopeJob::Json { action, input_revision })]
     }
 
     fn start_validation(&mut self) -> Vec<Effect> {
@@ -1247,13 +1314,23 @@ impl AppState {
             None => {
                 let input: Arc<str> = Arc::from(tab.input.as_str());
                 match job {
-                    RopeJob::Json(action) => Effect::SpawnJson { tab: id, input, action },
+                    RopeJob::Json { action, input_revision } => Effect::SpawnJson {
+                        tab: id,
+                        input,
+                        action,
+                        input_revision,
+                    },
                     RopeJob::Validate { input_revision } => Effect::SpawnValidation {
                         tab: id,
                         input,
                         input_revision,
                     },
-                    RopeJob::Search { query } => Effect::Search { tab: id, input, query },
+                    RopeJob::Search { query, input_revision } => Effect::Search {
+                        tab: id,
+                        input,
+                        query,
+                        input_revision,
+                    },
                 }
             }
         }
@@ -1306,8 +1383,17 @@ pub enum Msg {
     OpenFile,
     /// A file was dropped on the window.
     FileDropped(PathBuf),
-    /// A file's content is ready to be placed in the active tab.
+    /// A file's content is ready to be placed in the active tab. Legacy
+    /// shape kept for direct callers (tests/bins); the runner delivers
+    /// [`Msg::FileLoadedFor`] so the destination is the tab that requested
+    /// the read, not whichever tab is active at completion (M3).
     FileLoaded { path: PathBuf, content: String },
+    /// A file's content is ready for the tab that requested the read (M3).
+    FileLoadedFor {
+        tab: TabId,
+        path: PathBuf,
+        content: String,
+    },
     /// Clear the active tab.
     Clear,
     /// Search query changed; searches start at two characters.
@@ -1317,6 +1403,9 @@ pub enum Msg {
         tab: TabId,
         /// Revision the worker used to prewarm the line index.
         revision: u64,
+        /// Input revision the job was started for; a result whose input
+        /// revision no longer matches the tab is dropped (H3).
+        input_revision: u64,
         result: Result<String, JsonError>,
     },
     /// Background validation finished for a specific input revision.
@@ -1325,8 +1414,19 @@ pub enum Msg {
         input_revision: u64,
         result: Result<ValidationInfo, JsonError>,
     },
-    /// Background search finished.
+    /// Background search finished (legacy shape kept for direct callers in
+    /// tests/bins; applies unconditionally like [`AppState::apply_search_results`]).
+    /// The runner delivers [`Msg::SearchDoneFor`], which is revision- and
+    /// query-gated (H3).
     SearchDone { tab: TabId, hits: Vec<SearchHit> },
+    /// Background search finished for a specific input revision and query;
+    /// a result whose document or query moved on is dropped (H3).
+    SearchDoneFor {
+        tab: TabId,
+        input_revision: u64,
+        query: String,
+        hits: Vec<SearchHit>,
+    },
     /// Persisted tabs were loaded at startup.
     TabsLoaded(Vec<Tab>),
     /// Set the status line.
@@ -1382,9 +1482,28 @@ pub enum Msg {
 /// `Msg::RopeMaterialized`; the reducer then emits the classic job effect.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RopeJob {
-    Json(JsonAction),
+    Json {
+        action: JsonAction,
+        /// Input revision the job was started for (H3 staleness gate).
+        input_revision: u64,
+    },
     Validate { input_revision: u64 },
-    Search { query: String },
+    Search {
+        query: String,
+        /// Input revision the job was started for (H3 staleness gate).
+        input_revision: u64,
+    },
+}
+
+impl RopeJob {
+    /// The input revision this job was started for.
+    fn input_revision(&self) -> u64 {
+        match self {
+            RopeJob::Json { input_revision, .. }
+            | RopeJob::Validate { input_revision }
+            | RopeJob::Search { input_revision, .. } => *input_revision,
+        }
+    }
 }
 
 /// Side effects returned by [`AppState::update`]. The runner owns execution;
@@ -1396,6 +1515,9 @@ pub enum Effect {
         tab: TabId,
         input: Arc<str>,
         action: JsonAction,
+        /// Input revision the job was started for; `JsonDone` carries it
+        /// back so a result for an edited document is dropped (H3).
+        input_revision: u64,
     },
     /// Run [`crate::json_ops::validate`] on a background thread.
     SpawnValidation {
@@ -1408,6 +1530,9 @@ pub enum Effect {
         tab: TabId,
         input: Arc<str>,
         query: String,
+        /// Input revision the job was started for; `SearchDoneFor` carries
+        /// it back so a result for an edited document is dropped (H3).
+        input_revision: u64,
     },
     /// Write the tab set to disk.
     Persist,
@@ -1625,7 +1750,7 @@ mod tests {
         let effects = state.update(Msg::Format);
         assert!(matches!(
             &effects[0],
-            Effect::MaterializeRope { tab, job: RopeJob::Json(JsonAction::Format), .. } if *tab == id
+            Effect::MaterializeRope { tab, job: RopeJob::Json { action: JsonAction::Format, .. }, .. } if *tab == id
         ));
         let effects = finish_materialize(&mut state, effects);
         assert!(matches!(
@@ -1677,6 +1802,208 @@ mod tests {
         });
         assert_eq!(state.tab(first).unwrap().search_results.len(), 1);
         assert!(state.tab(second).unwrap().search_results.is_empty());
+    }
+
+    #[test]
+    fn update_input_drops_a_dirty_rope_snapshot() {
+        // H2: edit (dirty rope) → external replace while the Input view is
+        // not mounted. The no-sync accessors must never return the old text.
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, "[1]".into());
+        crate::editor::state::with(
+            id,
+            &state.tab(id).unwrap().input,
+            state.tab(id).unwrap().input_revision,
+            |ed| {
+                ed.insert(" ", crate::editor::EditKind::Typing); // dirty: " [1]"
+            },
+        );
+        assert!(crate::editor::state::dirty_snapshot(id).is_some());
+        state.update_input(id, "[2]".into());
+        assert!(
+            crate::editor::state::existing_snapshot(id).is_none(),
+            "stale rope survived update_input"
+        );
+        assert!(crate::editor::state::dirty_snapshot(id).is_none());
+        // Format takes the model text, not the previous document's rope.
+        let effects = state.update(Msg::Format);
+        assert!(matches!(&effects[0], Effect::SpawnJson { input, .. } if &**input == "[2]"));
+    }
+
+    #[test]
+    fn clear_tab_drops_a_dirty_rope_snapshot() {
+        // H2 (same class): Clear persists immediately; a dirty stale rope
+        // would save the previous document over the cleared tab.
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, "[1]".into());
+        crate::editor::state::with(
+            id,
+            &state.tab(id).unwrap().input,
+            state.tab(id).unwrap().input_revision,
+            |ed| {
+                ed.insert("!", crate::editor::EditKind::Typing);
+            },
+        );
+        state.update(Msg::Clear);
+        assert!(crate::editor::state::dirty_snapshot(id).is_none());
+        assert!(crate::editor::state::existing_snapshot(id).is_none());
+    }
+
+    fn stale_hit() -> SearchHit {
+        SearchHit {
+            path: "old".into(),
+            key: Some("old".into()),
+            value_preview: "1".into(),
+            line: Some(2),
+        }
+    }
+
+    #[test]
+    fn stale_search_results_are_dropped() {
+        // H3: a search started for an older query/document must not install
+        // its hits after the query or the input moved on.
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, r#"{"old":1}"#.into());
+        let old_revision = state.tab(id).unwrap().input_revision;
+        state.update(Msg::SearchChanged("old".into()));
+        state.update(Msg::SearchChanged("new".into()));
+        state.update_input(id, r#"{"new":2}"#.into());
+        state.update(Msg::SearchDoneFor {
+            tab: id,
+            input_revision: old_revision,
+            query: "old".into(),
+            hits: vec![stale_hit()],
+        });
+        let tab = state.tab(id).unwrap();
+        assert!(
+            tab.search_results.is_empty(),
+            "stale hits installed: {:?}",
+            tab.search_results
+        );
+        assert!(!tab.is_processing);
+    }
+
+    #[test]
+    fn stale_query_search_results_are_dropped_without_an_edit() {
+        // H3: the input revision alone is not enough — typing a new query
+        // supersedes the running walk without touching the document.
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, r#"{"old":1,"new":2}"#.into());
+        let revision = state.tab(id).unwrap().input_revision;
+        state.update(Msg::SearchChanged("old".into()));
+        state.update(Msg::SearchChanged("new".into()));
+        state.update(Msg::SearchDoneFor {
+            tab: id,
+            input_revision: revision,
+            query: "old".into(),
+            hits: vec![stale_hit()],
+        });
+        assert!(state.tab(id).unwrap().search_results.is_empty());
+        assert!(!state.tab(id).unwrap().is_processing);
+        // The current query's result still applies.
+        state.update(Msg::SearchDoneFor {
+            tab: id,
+            input_revision: revision,
+            query: "new".into(),
+            hits: vec![SearchHit {
+                path: "new".into(),
+                key: Some("new".into()),
+                value_preview: "2".into(),
+                line: Some(3),
+            }],
+        });
+        assert_eq!(state.tab(id).unwrap().search_results.len(), 1);
+    }
+
+    #[test]
+    fn stale_json_results_are_dropped() {
+        // H3: a format started for an older input revision must not publish
+        // its output after the user edited the document.
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, r#"{"old":1}"#.into());
+        state.update(Msg::Format);
+        let old_revision = state.tab(id).unwrap().input_revision;
+        state.update_input(id, r#"{"new":2}"#.into());
+        state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: old_revision,
+            result: Ok("{\n  \"old\": 1\n}".into()),
+        });
+        let tab = state.tab(id).unwrap();
+        assert!(tab.output.is_empty(), "stale output published: {:?}", tab.output);
+        assert!(!tab.is_processing);
+        assert_eq!(tab.view, TabView::Input);
+        // A result for the current revision still applies and persists.
+        let current = state.tab(id).unwrap().input_revision;
+        let effects = state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: current,
+            result: Ok("{\n  \"new\": 2\n}".into()),
+        });
+        assert_eq!(effects, vec![Effect::Persist]);
+        assert_eq!(state.tab(id).unwrap().output, "{\n  \"new\": 2\n}");
+        assert_eq!(state.tab(id).unwrap().view, TabView::Output);
+    }
+
+    #[test]
+    fn file_loaded_for_targets_the_requesting_tab() {
+        // M3: the reducer applies a read result to the tab it names, not
+        // the active tab.
+        let mut state = AppState::default();
+        let a = state.active;
+        let b = state.add_tab();
+        state.set_active(b);
+        state.update(Msg::FileLoadedFor {
+            tab: a,
+            path: PathBuf::from("/tmp/file.json"),
+            content: "[1]".into(),
+        });
+        assert_eq!(state.tab(a).unwrap().input, "[1]");
+        assert!(state.tab(b).unwrap().input.is_empty());
+        // A closed tab's late read is a no-op.
+        state.update(Msg::FileLoadedFor {
+            tab: 999,
+            path: PathBuf::from("/tmp/file.json"),
+            content: "[2]".into(),
+        });
+        assert_eq!(state.tab(a).unwrap().input, "[1]");
+    }
+
+    #[test]
+    fn rope_materialized_for_an_edited_input_is_dropped() {
+        // H3: input changed while the rope was converted off-thread; the
+        // job must not start (it would cancel a newer per-tab job).
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, "[1]".into());
+        let revision = state.tab(id).unwrap().input_revision;
+        state.tab_mut(id).unwrap().is_processing = true;
+        state.update_input(id, "[2]".into()); // edits while materializing
+        let effects = state.update(Msg::RopeMaterialized {
+            tab: id,
+            input: Arc::from("[1]"),
+            job: RopeJob::Json { action: JsonAction::Format, input_revision: revision },
+        });
+        assert!(effects.is_empty(), "stale job started: {effects:?}");
+        assert!(!state.tab(id).unwrap().is_processing);
+        // The current revision's materialization still starts the job.
+        let current = state.tab(id).unwrap().input_revision;
+        let effects = state.update(Msg::RopeMaterialized {
+            tab: id,
+            input: Arc::from("[2]"),
+            job: RopeJob::Search { query: "x".into(), input_revision: current },
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Search { input_revision, .. }] if *input_revision == current
+        ));
     }
 
     #[test]
