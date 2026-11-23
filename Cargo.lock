@@ -1518,6 +1518,7 @@ dependencies = [
  "rfd",
  "rune",
  "rune-kit",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "tempfile",
