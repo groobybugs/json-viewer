@@ -420,6 +420,10 @@ impl AppState {
         input_revision: u64,
         result: Result<String, JsonError>,
     ) -> bool {
+        // rp-format-inplace: the worker prepared the Input replacement rope
+        // off the UI thread. Take it even for stale/failed/closed-tab results
+        // so a prepared rope never leaks.
+        let prepared = crate::editor::replace::take(revision);
         let Some(tab) = self.tab_mut(id) else {
             return false;
         };
@@ -433,6 +437,13 @@ impl AppState {
         tab.is_processing = false;
         match result {
             Ok(output) => {
+                let replacement = match prepared {
+                    Some(crate::editor::replace::Prepared::Rope(rope)) => Some(rope),
+                    Some(crate::editor::replace::Prepared::Unchanged) => None,
+                    // Synchronous caller (tests, bins): no worker prepared a
+                    // rope; build one inline unless the text is unchanged.
+                    None => (tab.input != output).then(|| ropey::Rope::from_str(&output)),
+                };
                 tab.output = output;
                 tab.output_revision = revision;
                 tab.error = None;
@@ -441,6 +452,9 @@ impl AppState {
                 // the active content to Output, so Format/Minify visibly
                 // produced a result instead of leaving the user on Input.
                 tab.view = TabView::Output;
+                if let Some(rope) = replacement {
+                    self.replace_input_in_place(id, rope);
+                }
                 true
             }
             Err(err) => {
@@ -449,6 +463,42 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// rp-format-inplace: a successful Format/Minify rewrites the Input
+    /// document itself as ONE undo transaction in the rope editor (Ctrl+Z
+    /// restores the previous text and caret). The revision bump keeps
+    /// search/validate/tree staleness honest; no second job is spawned, and
+    /// Output receives the same text through the caller.
+    fn replace_input_in_place(&mut self, id: TabId, new_rope: ropey::Rope) {
+        let revision = crate::line_index::next_revision();
+        let Some(tab) = self.tab_mut(id) else {
+            return;
+        };
+        if crate::editor::state::existing_snapshot(id).is_some() {
+            // Live editor: swap the rope in place. The old rope is an O(1)
+            // clone in the undo step, and `Tab::input` stays a stale cache
+            // until an explicit consumer materializes it (the typing
+            // pattern); the dirty flag routes jobs/persist to the rope.
+            crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+                ed.replace_document(new_rope);
+                // Keep the store's sync marker ahead of the revision bump
+                // so the next access does not rebuild the rope.
+                ed.source_revision = revision;
+            });
+        } else {
+            // No live editor (a restored tab never opened): seed one. The
+            // old cache moves into the undo step (no copy, no old-rope build
+            // on the UI thread); the new cache is one copy so the toolbar
+            // and job gates keep reading a truthful `Tab::input`.
+            let previous = std::mem::take(&mut tab.input);
+            tab.input = tab.output.clone();
+            crate::editor::state::insert_replaced(id, previous, new_rope, revision);
+        }
+        tab.input_revision = revision;
+        tab.error = None;
+        tab.validation = None;
+        self.refresh_tree(id);
     }
 
     /// Applies validation if the tab still contains the revision that was
@@ -1950,6 +2000,147 @@ mod tests {
         assert_eq!(effects, vec![Effect::Persist]);
         assert_eq!(state.tab(id).unwrap().output, "{\n  \"new\": 2\n}");
         assert_eq!(state.tab(id).unwrap().view, TabView::Output);
+    }
+
+    #[test]
+    fn successful_json_result_rewrites_input_as_one_undo_step() {
+        // rp-format-inplace: Format/Minify replace the Input document itself;
+        // Ctrl+Z restores the exact previous text and caret.
+        let mut state = AppState::default();
+        let id = state.active;
+        let original = "{\"a\":1,\"b\":[1,2,3]}";
+        state.update_input(id, original.into());
+        let tab = state.tab(id).unwrap();
+        crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.set_caret(10, false);
+        });
+        let old_revision = state.tab(id).unwrap().input_revision;
+        let formatted = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
+        let effects = state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: old_revision,
+            result: Ok(formatted.into()),
+        });
+        assert_eq!(effects, vec![Effect::Persist], "no second job may spawn");
+        let tab = state.tab(id).unwrap();
+        assert_eq!(tab.output, formatted);
+        assert_eq!(tab.view, TabView::Output);
+        assert!(tab.input_revision > old_revision, "staleness keys must move");
+        assert!(tab.validation.is_none());
+        let (text, caret, can_undo) =
+            crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+                (ed.buffer.to_string(), ed.caret, ed.buffer.can_undo())
+            });
+        assert_eq!(text, formatted);
+        assert!(can_undo);
+        let expected_caret =
+            (10u128 * formatted.len() as u128 / original.len() as u128) as usize;
+        assert_eq!(caret, expected_caret);
+        // One undo step restores the minified original and the old caret.
+        state.update(Msg::EditorEdit {
+            tab: id,
+            action: crate::editor::state::EditorAction::Undo,
+        });
+        let tab = state.tab(id).unwrap();
+        let (text, caret) =
+            crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+                (ed.buffer.to_string(), ed.caret)
+            });
+        assert_eq!(text, original);
+        assert_eq!(caret, 10);
+        // Redo re-applies the result.
+        state.update(Msg::EditorEdit {
+            tab: id,
+            action: crate::editor::state::EditorAction::Redo,
+        });
+        let tab = state.tab(id).unwrap();
+        let text = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.buffer.to_string()
+        });
+        assert_eq!(text, formatted);
+    }
+
+    #[test]
+    fn unchanged_output_leaves_input_and_history_alone() {
+        let mut state = AppState::default();
+        let id = state.active;
+        let formatted = "{\n  \"a\": 1\n}";
+        state.update_input(id, formatted.into());
+        let tab = state.tab(id).unwrap();
+        crate::editor::state::with(id, &tab.input, tab.input_revision, |_| {});
+        let old_revision = state.tab(id).unwrap().input_revision;
+        state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: old_revision,
+            result: Ok(formatted.into()),
+        });
+        let tab = state.tab(id).unwrap();
+        assert_eq!(tab.input_revision, old_revision, "no-op must not bump the revision");
+        let can_undo = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.buffer.can_undo()
+        });
+        assert!(!can_undo, "no-op must not add an undo step");
+    }
+
+    #[test]
+    fn failed_json_result_leaves_input_untouched() {
+        let mut state = AppState::default();
+        let id = state.active;
+        let original = "{\"a\":1}";
+        state.update_input(id, original.into());
+        let tab = state.tab(id).unwrap();
+        crate::editor::state::with(id, &tab.input, tab.input_revision, |_| {});
+        let old_revision = state.tab(id).unwrap().input_revision;
+        state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: old_revision,
+            result: Err(JsonError::new("expected value", 1, 2)),
+        });
+        let tab = state.tab(id).unwrap();
+        assert_eq!(tab.input_revision, old_revision);
+        assert_eq!(tab.view, TabView::Input);
+        let text = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.buffer.to_string()
+        });
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn json_done_without_a_live_editor_seeds_one_undoable_entry() {
+        // A restored tab never opened has no rope entry: the old cache moves
+        // into the undo step and the new cache stays truthful for the toolbar.
+        let mut state = AppState::default();
+        let id = state.active;
+        let original = "{\"a\":1}";
+        state.update_input(id, original.into());
+        assert!(crate::editor::state::existing_snapshot(id).is_none());
+        let old_revision = state.tab(id).unwrap().input_revision;
+        let formatted = "{\n  \"a\": 1\n}";
+        state.update(Msg::JsonDone {
+            tab: id,
+            revision: crate::line_index::next_revision(),
+            input_revision: old_revision,
+            result: Ok(formatted.into()),
+        });
+        let tab = state.tab(id).unwrap();
+        assert_eq!(tab.input, formatted, "cache must stay truthful without an editor");
+        assert!(tab.input_revision > old_revision);
+        let text = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.buffer.to_string()
+        });
+        assert_eq!(text, formatted);
+        state.update(Msg::EditorEdit {
+            tab: id,
+            action: crate::editor::state::EditorAction::Undo,
+        });
+        let tab = state.tab(id).unwrap();
+        let text = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.buffer.to_string()
+        });
+        assert_eq!(text, original);
     }
 
     #[test]

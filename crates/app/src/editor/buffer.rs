@@ -33,16 +33,69 @@ pub enum EditKind {
     Replace,
 }
 
+/// Text held by one undo step. Incremental edits carry `Text`; a
+/// whole-document replacement (Format/Minify in-place, rp-format-inplace)
+/// carries `Rope` handles — an O(1) clone of the live buffer — or a moved
+/// materialized cache (`Text`), so the step never copies the document.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditText {
+    Text(String),
+    Rope(Rope),
+}
+
+impl EditText {
+    pub fn len_bytes(&self) -> usize {
+        match self {
+            EditText::Text(text) => text.len(),
+            EditText::Rope(rope) => rope.len_bytes(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len_bytes() == 0
+    }
+
+    /// The text of an incremental payload; `None` for a rope handle.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            EditText::Text(text) => Some(text),
+            EditText::Rope(_) => None,
+        }
+    }
+
+    /// A rope holding this text: O(1) for a rope handle, one O(n) build for
+    /// a moved cache string (the undo path of a tab that had no live editor).
+    fn to_rope(&self) -> Rope {
+        match self {
+            EditText::Text(text) => Rope::from_str(text),
+            EditText::Rope(rope) => rope.clone(),
+        }
+    }
+}
+
 /// One undo step. `removed`/`inserted` are the text the edit took out and put
 /// in at `offset`; coalesced typing merges into a single step. Caret positions
-/// are byte offsets the editor restores on undo/redo.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// are byte offsets the editor restores on undo/redo. A whole-document step
+/// (either payload a `Rope`) swaps the buffer instead of editing at `offset`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
     pub offset: usize,
-    pub removed: String,
-    pub inserted: String,
+    pub removed: EditText,
+    pub inserted: EditText,
     pub caret_before: usize,
     pub caret_after: usize,
+}
+
+impl Edit {
+    /// Bytes this step holds against the undo/redo history cap.
+    fn byte_cost(&self) -> usize {
+        self.removed.len_bytes() + self.inserted.len_bytes()
+    }
+
+    /// Whole-document replacement: undo/redo swap ropes in O(1).
+    fn is_whole_document(&self) -> bool {
+        matches!(self.removed, EditText::Rope(_)) || matches!(self.inserted, EditText::Rope(_))
+    }
 }
 
 /// Undo history cap (removed + inserted bytes). Large pastes stay undoable
@@ -212,8 +265,8 @@ impl Buffer {
         self.push_edit(
             Edit {
                 offset,
-                removed: String::new(),
-                inserted: text.to_owned(),
+                removed: EditText::Text(String::new()),
+                inserted: EditText::Text(text.to_owned()),
                 caret_before,
                 caret_after,
             },
@@ -240,8 +293,8 @@ impl Buffer {
         self.push_edit(
             Edit {
                 offset: range.start,
-                removed,
-                inserted: String::new(),
+                removed: EditText::Text(removed),
+                inserted: EditText::Text(String::new()),
                 caret_before,
                 caret_after,
             },
@@ -270,13 +323,64 @@ impl Buffer {
         self.push_edit(
             Edit {
                 offset: range.start,
-                removed,
-                inserted: text.to_owned(),
+                removed: EditText::Text(removed),
+                inserted: EditText::Text(text.to_owned()),
                 caret_before,
                 caret_after,
             },
             kind,
         );
+    }
+
+    /// Replaces the whole document as one undo step (Format/Minify in-place,
+    /// rp-format-inplace). The previous rope is kept as an O(1) clone and
+    /// `new_rope` is moved in, so neither side copies text; undo/redo swap
+    /// ropes in O(1). The caller decides whether a replacement is needed
+    /// (identical output is detected off the UI thread by the JSON worker).
+    pub fn replace_all(&mut self, new_rope: Rope, caret_before: usize, caret_after: usize) {
+        let old = std::mem::replace(&mut self.rope, new_rope);
+        self.revision += 1;
+        let span = self.rope.len_bytes().max(old.len_bytes());
+        self.note_edit(0..span);
+        self.push_edit(
+            Edit {
+                offset: 0,
+                removed: EditText::Rope(old),
+                inserted: EditText::Rope(self.rope.clone()),
+                caret_before,
+                caret_after,
+            },
+            EditKind::Replace,
+        );
+    }
+
+    /// A buffer already holding a Format/Minify result, with the previous
+    /// document as one undo step. `previous` is moved (a materialized cache),
+    /// never copied; used when the tab had no live editor entry, so no old
+    /// rope is built on the UI thread.
+    pub fn from_replaced(
+        previous: EditText,
+        new_rope: Rope,
+        caret_before: usize,
+        caret_after: usize,
+    ) -> Self {
+        let mut buf = Self {
+            rope: new_rope.clone(),
+            ..Self::default()
+        };
+        buf.revision = 1;
+        let len = buf.rope.len_bytes();
+        buf.note_edit(0..len);
+        let edit = Edit {
+            offset: 0,
+            removed: previous,
+            inserted: EditText::Rope(new_rope),
+            caret_before,
+            caret_after,
+        };
+        buf.undo_bytes = edit.byte_cost();
+        buf.undo.push_back(edit);
+        buf
     }
 
     /// Char-offset convenience over [`Buffer::insert`].
@@ -340,21 +444,29 @@ impl Buffer {
     /// Undoes one step; returns the caret to restore, or `None` when history
     /// is empty.
     pub fn undo(&mut self) -> Option<usize> {
-        let edit = self.undo.pop_back()?;
-        self.undo_bytes -= edit.removed.len() + edit.inserted.len();
-        if !edit.inserted.is_empty() {
-            let chars = self.rope.byte_to_char(edit.offset)
-                ..self.rope.byte_to_char(edit.offset + edit.inserted.len());
-            self.rope.remove(chars);
-        }
-        if !edit.removed.is_empty() {
-            self.rope.insert(self.rope.byte_to_char(edit.offset), &edit.removed);
+        let mut edit = self.undo.pop_back()?;
+        self.undo_bytes -= edit.byte_cost();
+        if edit.is_whole_document() {
+            self.rope = edit.removed.to_rope();
+            // Normalize the consumed side to an O(1) handle so later
+            // undo/redo cycles never rebuild a rope from the moved cache.
+            edit.removed = EditText::Rope(self.rope.clone());
+        } else {
+            if let Some(inserted) = edit.inserted.as_str().filter(|text| !text.is_empty()) {
+                let chars = self.rope.byte_to_char(edit.offset)
+                    ..self.rope.byte_to_char(edit.offset + inserted.len());
+                self.rope.remove(chars);
+            }
+            if let Some(removed) = edit.removed.as_str().filter(|text| !text.is_empty()) {
+                self.rope.insert(self.rope.byte_to_char(edit.offset), removed);
+            }
         }
         self.revision += 1;
         self.break_pending = true;
         let caret = edit.caret_before;
-        self.note_edit(edit.offset..edit.offset + edit.removed.len().max(edit.inserted.len()));
-        self.redo_bytes += edit.removed.len() + edit.inserted.len();
+        let span = edit.removed.len_bytes().max(edit.inserted.len_bytes());
+        self.note_edit(edit.offset..edit.offset + span);
+        self.redo_bytes += edit.byte_cost();
         self.redo.push_back(edit);
         cap_history(&mut self.redo, &mut self.redo_bytes);
         Some(caret)
@@ -362,21 +474,27 @@ impl Buffer {
 
     /// Redoes one step; returns the caret to restore.
     pub fn redo(&mut self) -> Option<usize> {
-        let edit = self.redo.pop_back()?;
-        self.redo_bytes -= edit.removed.len() + edit.inserted.len();
-        if !edit.removed.is_empty() {
-            let chars = self.rope.byte_to_char(edit.offset)
-                ..self.rope.byte_to_char(edit.offset + edit.removed.len());
-            self.rope.remove(chars);
-        }
-        if !edit.inserted.is_empty() {
-            self.rope.insert(self.rope.byte_to_char(edit.offset), &edit.inserted);
+        let mut edit = self.redo.pop_back()?;
+        self.redo_bytes -= edit.byte_cost();
+        if edit.is_whole_document() {
+            self.rope = edit.inserted.to_rope();
+            edit.inserted = EditText::Rope(self.rope.clone());
+        } else {
+            if let Some(removed) = edit.removed.as_str().filter(|text| !text.is_empty()) {
+                let chars = self.rope.byte_to_char(edit.offset)
+                    ..self.rope.byte_to_char(edit.offset + removed.len());
+                self.rope.remove(chars);
+            }
+            if let Some(inserted) = edit.inserted.as_str().filter(|text| !text.is_empty()) {
+                self.rope.insert(self.rope.byte_to_char(edit.offset), inserted);
+            }
         }
         self.revision += 1;
         self.break_pending = true;
         let caret = edit.caret_after;
-        self.note_edit(edit.offset..edit.offset + edit.removed.len().max(edit.inserted.len()));
-        self.undo_bytes += edit.removed.len() + edit.inserted.len();
+        let span = edit.removed.len_bytes().max(edit.inserted.len_bytes());
+        self.note_edit(edit.offset..edit.offset + span);
+        self.undo_bytes += edit.byte_cost();
         self.undo.push_back(edit);
         cap_history(&mut self.undo, &mut self.undo_bytes);
         Some(caret)
@@ -397,25 +515,33 @@ impl Buffer {
         self.redo_bytes = 0;
         let coalesce = kind == EditKind::Typing
             && !self.break_pending
+            && matches!(edit.inserted, EditText::Text(_))
             && !edit.inserted.is_empty()
             && edit.removed.is_empty()
             && self.undo.back().is_some_and(|last| {
                 last.removed.is_empty()
-                    && last.offset + last.inserted.len() == edit.offset
-                    && last.inserted.chars().next_back().is_some_and(|a| {
-                        edit.inserted.chars().next().is_some_and(|b| {
+                    && matches!(last.inserted, EditText::Text(_))
+                    && last.offset + last.inserted.len_bytes() == edit.offset
+                    && last.inserted.as_str().and_then(|text| text.chars().next_back()).is_some_and(|a| {
+                        edit.inserted.as_str().and_then(|text| text.chars().next()).is_some_and(|b| {
                             word_class(a) == word_class(b) && word_class(a) != 2
                         })
                     })
             });
         if coalesce {
             let last = self.undo.back_mut().expect("checked above");
-            self.undo_bytes -= last.inserted.len();
-            last.inserted.push_str(&edit.inserted);
+            let EditText::Text(last_text) = &mut last.inserted else {
+                unreachable!("coalescing checked for a Text payload");
+            };
+            let EditText::Text(new_text) = &edit.inserted else {
+                unreachable!("coalescing checked for a Text payload");
+            };
+            self.undo_bytes -= last_text.len();
+            last_text.push_str(new_text);
             last.caret_after = edit.caret_after;
-            self.undo_bytes += last.inserted.len();
+            self.undo_bytes += last_text.len();
         } else {
-            self.undo_bytes += edit.removed.len() + edit.inserted.len();
+            self.undo_bytes += edit.byte_cost();
             self.undo.push_back(edit);
         }
         self.break_pending = false;
@@ -427,7 +553,7 @@ impl Buffer {
 fn cap_history(queue: &mut VecDeque<Edit>, bytes: &mut usize) {
     while *bytes > UNDO_LIMIT_BYTES && queue.len() > 1 {
         if let Some(old) = queue.pop_front() {
-            *bytes -= old.removed.len() + old.inserted.len();
+            *bytes -= old.byte_cost();
         }
     }
 }
@@ -632,6 +758,102 @@ mod tests {
         assert!(buf.can_undo());
         while buf.undo().is_some() {}
         assert!(buf.is_empty() || buf.len_bytes() < 80 * chunk.len());
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_step_and_restores_text_and_caret() {
+        let mut buf = Buffer::from_text("{\"a\":1}");
+        let formatted = Rope::from_str("{\n  \"a\": 1\n}");
+        buf.replace_all(formatted, 4, 6);
+        assert_eq!(buf.to_string(), "{\n  \"a\": 1\n}");
+        assert_eq!(buf.undo.len(), 1, "format must be ONE undo step");
+        assert_eq!(buf.undo(), Some(4));
+        assert_eq!(buf.to_string(), "{\"a\":1}");
+        assert_eq!(buf.redo(), Some(6));
+        assert_eq!(buf.to_string(), "{\n  \"a\": 1\n}");
+        // A second replacement after undo clears the redo branch.
+        buf.undo();
+        buf.replace_all(Rope::from_str("[1]"), 0, 3);
+        assert!(!buf.can_redo());
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.to_string(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn replace_all_round_trips_unicode_and_keeps_the_edit_log_honest() {
+        let original = "{\"e\":\"🚀\",\"k\":\"café\"}";
+        let mut buf = Buffer::from_text(original);
+        let revision = buf.revision();
+        let formatted = Rope::from_str("{\n  \"e\": \"🚀\",\n  \"k\": \"café\"\n}");
+        buf.replace_all(formatted, 6, 10);
+        assert!(buf.revision() > revision);
+        // The whole-document edit invalidates every cached line analysis.
+        let edits = buf.edits_since(revision).expect("log covers the replace");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start, 0);
+        assert!(edits[0].end >= buf.len_bytes());
+        assert_eq!(buf.undo(), Some(6));
+        assert_eq!(buf.to_string(), original);
+        assert_eq!(buf.redo(), Some(10));
+        assert_eq!(buf.to_string(), "{\n  \"e\": \"🚀\",\n  \"k\": \"café\"\n}");
+    }
+
+    #[test]
+    fn typing_after_replace_all_starts_a_fresh_step() {
+        let mut buf = Buffer::from_text("old");
+        buf.replace_all(Rope::from_str("new text"), 0, 0);
+        buf.insert(8, "!", EditKind::Typing, 8, 9);
+        assert_eq!(buf.undo.len(), 2, "typing must not coalesce into the bulk step");
+        assert_eq!(buf.undo(), Some(8));
+        assert_eq!(buf.to_string(), "new text");
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.to_string(), "old");
+    }
+
+    #[test]
+    fn from_replaced_moves_the_previous_cache_into_one_undo_step() {
+        // The no-live-editor case: the old document arrives as a moved
+        // String, the result as a prepared rope; neither is copied.
+        let previous = "{\"a\":1}".to_owned();
+        let mut buf = Buffer::from_replaced(
+            EditText::Text(previous),
+            Rope::from_str("{\n  \"a\": 1\n}"),
+            0,
+            0,
+        );
+        assert_eq!(buf.to_string(), "{\n  \"a\": 1\n}");
+        assert_eq!(buf.undo.len(), 1);
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.to_string(), "{\"a\":1}");
+        // The consumed Text side is normalized to a rope: redo is O(1).
+        assert_eq!(buf.redo(), Some(0));
+        assert_eq!(buf.to_string(), "{\n  \"a\": 1\n}");
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.to_string(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn bulk_step_respects_the_undo_cap() {
+        let mut buf = Buffer::new();
+        let chunk = "x".repeat(1024 * 1024);
+        // 60 MB of pastes, then a 10 MB whole-document replacement: the cap
+        // drops the oldest pastes but keeps the newest step undoable.
+        for i in 0..60 {
+            buf.insert(i * chunk.len(), &chunk, EditKind::Paste, 0, 0);
+        }
+        let big = Rope::from_str(&"y".repeat(10 * 1024 * 1024));
+        buf.replace_all(big, 0, 0);
+        assert!(buf.undo_bytes <= UNDO_LIMIT_BYTES + 10 * chunk.len());
+        assert!(buf.can_undo());
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.len_bytes(), 60 * chunk.len());
+        // A bulk step alone beyond the cap is still kept (at least one step).
+        let mut buf = Buffer::from_text("small");
+        buf.replace_all(Rope::from_str(&"z".repeat(80 * 1024 * 1024)), 0, 0);
+        assert!(buf.undo_bytes > UNDO_LIMIT_BYTES);
+        assert_eq!(buf.undo.len(), 1);
+        assert_eq!(buf.undo(), Some(0));
+        assert_eq!(buf.to_string(), "small");
     }
 
     #[test]

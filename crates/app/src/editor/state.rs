@@ -22,7 +22,7 @@ use ropey::Rope;
 
 use crate::state::TabId;
 
-use super::buffer::{Buffer, EditKind};
+use super::buffer::{Buffer, EditKind, EditText};
 
 /// How a pointer drag extends the selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +201,36 @@ impl EditorState {
             return None;
         }
         Some(anchor.min(self.caret)..anchor.max(self.caret))
+    }
+
+    /// Applies a Format/Minify result as one whole-document undo step
+    /// (rp-format-inplace). The previous rope stays in the undo entry as an
+    /// O(1) clone; the caret keeps its relative byte position in the new text
+    /// (snapped to a char boundary), and undo restores the old text and caret.
+    /// The caller guarantees the text differs (the JSON worker detects
+    /// identical output off the UI thread).
+    pub fn replace_document(&mut self, new_rope: Rope) {
+        let old_len = self.buffer.len_bytes();
+        let caret_before = self.caret;
+        let new_len = new_rope.len_bytes();
+        let caret_after = if old_len == 0 {
+            0
+        } else {
+            let relative =
+                (caret_before as u128 * new_len as u128 / old_len as u128) as usize;
+            let relative = relative.min(new_len);
+            new_rope.char_to_byte(new_rope.byte_to_char(relative))
+        };
+        self.buffer.replace_all(new_rope, caret_before, caret_after);
+        self.caret = caret_after;
+        self.anchor = None;
+        self.goal_column = None;
+        self.first_column = 0;
+        self.preedit = None;
+        self.drag = None;
+        self.dirty = true;
+        self.reveal = Some(self.buffer.byte_to_line(caret_after));
+        self.scroll_caret_column();
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -645,6 +675,30 @@ pub fn dirty_snapshot(id: TabId) -> Option<Rope> {
     })
 }
 
+/// Seeds a fresh editor entry already holding a Format/Minify result
+/// (rp-format-inplace, the no-live-editor case). The previous document is
+/// moved into the undo step — no old-rope build and no text copy on the UI
+/// thread. The entry is clean: the caller refreshed `Tab::input` to the new
+/// text, and the caret starts at the document top (there was no caret). No
+/// reveal is queued: a fresh viewport mounts at the top, and a stale reveal
+/// would later override a restored scroll offset.
+pub fn insert_replaced(id: TabId, previous: String, new_rope: Rope, source_revision: u64) {
+    STORE.with(|store| {
+        let mut map = store.borrow_mut();
+        let state = map.entry(id).or_default();
+        state.buffer = Buffer::from_replaced(EditText::Text(previous), new_rope, 0, 0);
+        state.source_revision = source_revision;
+        state.dirty = false;
+        state.caret = 0;
+        state.anchor = None;
+        state.first_column = 0;
+        state.goal_column = None;
+        state.preedit = None;
+        state.reveal = None;
+        state.drag = None;
+    });
+}
+
 thread_local! {
     /// Fallback line-count memo for tabs with no editor entry, keyed by
     /// tab id and validated against (input revision, input length).
@@ -964,6 +1018,59 @@ mod tests {
         assert!(!is_dirty(1, "one!", 10));
         remove(1);
         assert_eq!(with(1, "one", 10, |s| s.buffer.to_string()), "one");
+        clear_all();
+    }
+
+    #[test]
+    fn replace_document_keeps_relative_caret_and_undo_restores_both() {
+        clear_all();
+        let original = "{\"a\":1,\"b\":[1,2,3]}";
+        with(1, original, 10, |s| {
+            s.set_caret(10, false); // inside the array
+        });
+        let formatted = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
+        with(1, original, 10, |s| {
+            s.replace_document(Rope::from_str(formatted));
+            // The reducer keeps the sync marker ahead of the revision bump.
+            s.source_revision = 11;
+            assert!(s.dirty);
+            assert_eq!(s.buffer.to_string(), formatted);
+            // Relative byte position: 10/20 of the new 30-byte document.
+            let expected = (10u128 * formatted.len() as u128 / original.len() as u128) as usize;
+            assert_eq!(s.caret, expected);
+            assert!(s.selection().is_none());
+            assert_eq!(s.reveal, Some(s.buffer.byte_to_line(expected)));
+        });
+        // The dirty rope is what persist snapshots.
+        assert!(dirty_snapshot(1).is_some());
+        // Undo restores the exact previous text and caret.
+        with(1, original, 11, |s| {
+            assert!(s.apply(EditorAction::Undo));
+            assert_eq!(s.buffer.to_string(), original);
+            assert_eq!(s.caret, 10);
+        });
+        clear_all();
+    }
+
+    #[test]
+    fn insert_replaced_seeds_a_clean_synced_entry_with_one_undo_step() {
+        clear_all();
+        let original = "{\"a\":1}".to_owned();
+        let formatted = "{\n  \"a\": 1\n}";
+        insert_replaced(7, original.clone(), Rope::from_str(formatted), 42);
+        // Clean entry synced to the new revision: `with` must not rebuild it
+        // from the (freshly refreshed) cache, and persist reads the cache.
+        assert!(dirty_snapshot(7).is_none());
+        with(7, formatted, 42, |s| {
+            assert_eq!(s.buffer.to_string(), formatted);
+            assert_eq!(s.caret, 0);
+            assert!(!s.dirty);
+            assert!(s.apply(EditorAction::Undo));
+            assert_eq!(s.buffer.to_string(), original);
+            assert!(s.dirty);
+            assert!(s.apply(EditorAction::Redo));
+            assert_eq!(s.buffer.to_string(), formatted);
+        });
         clear_all();
     }
 }
