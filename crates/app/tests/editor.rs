@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use json_viewer::editor::{state as editor_state, view};
-use json_viewer::state::{AppState, Msg};
+use json_viewer::state::{AppState, Msg, TabView};
 use json_viewer::ui::text_view::char_width;
-use json_viewer::headless;
+use json_viewer::{headless, runner};
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
-use rune::{col, Cx, El, Env, Runtime, ScrollSpec, WheelEvent};
+use rune::{col, Cx, El, Env, Ime, Key, KeyEvent, Mods, Runtime, ScrollSpec, WheelEvent};
 
 const SIZE: (f32, f32) = (1280.0, 800.0);
 const MIB: usize = 1024 * 1024;
@@ -336,4 +336,172 @@ fn error_marker_strip_and_gutter_dot_render() {
         .expect("error label");
     assert_eq!(label, "line 3, column 8");
     draw(&mut rt, "editor-error-marker.png");
+}
+
+// ── E3: editing through the real app composition ─────────────────────────
+
+fn app_runtime(state: AppState) -> Runtime<AppState> {
+    let mut rt = headless::runtime(state, SIZE, 1.0);
+    rt.update(|_, tx| tx.focus("editor-1", true));
+    rt.frame(0.0);
+    rt
+}
+
+fn press(rt: &mut Runtime<AppState>, key: Key, mods: Mods) {
+    rt.key(KeyEvent { key, mods });
+    // Handlers dispatch during the frame; the runner applies on the next
+    // poll, then the view renders the applied state.
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+}
+
+fn cmd_mods() -> Mods {
+    Mods { cmd: true, ..Mods::default() }
+}
+
+fn buffer_text(rt: &Runtime<AppState>) -> String {
+    let tab = rt.state.active_tab().unwrap();
+    editor_state::with(tab.id, &tab.input, tab.input_revision, |ed| ed.buffer.to_string())
+}
+
+#[test]
+fn app_typing_undo_redo_and_enter() {
+    let state = doc_state("{\n  \"a\": 1\n}".into());
+    let mut rt = app_runtime(state);
+    let rev0 = rt.state.active_tab().unwrap().input_revision;
+
+    // Type at the caret (offset 0): chars coalesce into one undo step.
+    for c in ["X", "Y"] {
+        press(&mut rt, Key::Text(c.into()), Mods::default());
+    }
+    assert_eq!(buffer_text(&rt), "XY{\n  \"a\": 1\n}");
+    assert!(rt.state.active_tab().unwrap().input_revision > rev0);
+    // The model cache is stale between bulk actions (no per-key copy).
+    assert_eq!(rt.state.active_tab().unwrap().input, "{\n  \"a\": 1\n}");
+
+    press(&mut rt, Key::Command('z'), cmd_mods());
+    assert_eq!(buffer_text(&rt), "{\n  \"a\": 1\n}");
+    press(&mut rt, Key::Command('y'), cmd_mods());
+    assert_eq!(buffer_text(&rt), "XY{\n  \"a\": 1\n}");
+
+    // Enter after '{' auto-indents.
+    press(&mut rt, Key::End, Mods::default()); // caret to end of line 0 ("XY{")
+    press(&mut rt, Key::Enter, Mods::default());
+    assert_eq!(buffer_text(&rt), "XY{\n  \n  \"a\": 1\n}");
+}
+
+#[test]
+fn app_paste_materializes_and_is_one_undo_step() {
+    let state = doc_state("old".into());
+    let mut rt = app_runtime(state);
+    press(&mut rt, Key::Command('a'), cmd_mods());
+    rt.paste("{\"pasted\":true}".to_string());
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(buffer_text(&rt), "{\"pasted\":true}");
+    assert_eq!(rt.state.active_tab().unwrap().input, "{\"pasted\":true}");
+    press(&mut rt, Key::Command('z'), cmd_mods());
+    assert_eq!(buffer_text(&rt), "old");
+}
+
+#[test]
+fn app_select_all_copy_cut() {
+    let state = doc_state("{\"a\":1}".into());
+    let mut rt = app_runtime(state);
+    rt.key(KeyEvent { key: Key::Command('a'), mods: cmd_mods() });
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    let sel = {
+        let tab = rt.state.active_tab().unwrap();
+        editor_state::with(tab.id, &tab.input, tab.input_revision, |ed| ed.selection())
+    };
+    assert_eq!(sel, Some(0..7));
+
+    rt.key(KeyEvent { key: Key::Command('c'), mods: cmd_mods() });
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.status.as_deref(), Some("Copied to clipboard"));
+    assert_eq!(buffer_text(&rt), "{\"a\":1}");
+
+    rt.key(KeyEvent { key: Key::Command('x'), mods: cmd_mods() });
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(buffer_text(&rt), "");
+    // Empty boundary materializes so the toolbar disables correctly.
+    assert_eq!(rt.state.active_tab().unwrap().input, "");
+}
+
+#[test]
+fn ime_preedit_and_commit() {
+    let state = doc_state("".into());
+    let mut rt = app_runtime(state);
+    let mut taken = false;
+    rt.update(|s, tx| {
+        taken = json_viewer::editor::keys::on_ime(s, &Ime::Preedit("ni".into(), None, vec![]), tx);
+    });
+    assert!(taken);
+    rt.frame(0.0);
+    let preedit = {
+        let tab = rt.state.active_tab().unwrap();
+        editor_state::with(tab.id, &tab.input, tab.input_revision, |ed| ed.preedit.clone())
+    };
+    assert_eq!(preedit.as_deref(), Some("ni"));
+    assert!(rt.elements().iter().any(|e| e.key.as_deref() == Some("editor-1-caret")));
+
+    rt.update(|s, tx| {
+        json_viewer::editor::keys::on_ime(s, &Ime::Commit("你".into()), tx);
+    });
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    assert_eq!(buffer_text(&rt), "你");
+    let tab = rt.state.active_tab().unwrap();
+    let caret = editor_state::with(tab.id, &tab.input, tab.input_revision, |ed| ed.caret);
+    assert_eq!(caret, "你".len());
+    // One undo step removes the whole composition.
+    press(&mut rt, Key::Command('z'), cmd_mods());
+    assert_eq!(buffer_text(&rt), "");
+}
+
+#[test]
+fn ten_mb_paste_lands_quickly() {
+    let state = doc_state("{}".into());
+    let mut rt = app_runtime(state);
+    press(&mut rt, Key::Command('a'), cmd_mods());
+    let payload = format!("{{\"big\":\"{}\"}}", "x".repeat(10 * MIB));
+    let t = Instant::now();
+    rt.paste(payload.clone());
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(rt.state.active_tab().unwrap().input.len(), payload.len());
+    assert_eq!(buffer_text(&rt).len(), payload.len());
+    println!("10 MB paste (debug): {ms:.1} ms");
+    assert!(ms < 5000.0, "10 MB paste guard");
+    // Undo of the large paste is one step.
+    let t = Instant::now();
+    press(&mut rt, Key::Command('z'), cmd_mods());
+    let undo_ms = t.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(buffer_text(&rt), "{}");
+    println!("10 MB paste undo (debug): {undo_ms:.1} ms");
+}
+
+#[test]
+fn app_switch_to_output_and_back_keeps_rope() {
+    let state = doc_state("{\"a\":1}".into());
+    let mut rt = app_runtime(state);
+    press(&mut rt, Key::Text("Z".into()), Mods::default());
+    rt.state.dispatch(Msg::SwitchView(TabView::Output));
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    rt.state.dispatch(Msg::SwitchView(TabView::Input));
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(buffer_text(&rt), "Z{\"a\":1}");
 }

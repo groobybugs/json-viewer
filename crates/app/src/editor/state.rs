@@ -52,6 +52,27 @@ pub enum Move {
     PageDown,
 }
 
+/// A semantic editor command, carried by `Msg::EditorEdit`. The reducer
+/// applies it through [`EditorState::apply`] and does the tab bookkeeping
+/// (revision, error/validation invalidation, tree refresh).
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditorAction {
+    /// Insert text (typing, IME commit, paste); replaces the selection.
+    Insert(String, EditKind),
+    Backspace,
+    DeleteForward,
+    Enter,
+    Tab,
+    Move(Move, bool),
+    SelectAll,
+    SelectWord(usize),
+    SelectLine(usize),
+    SetCaret(usize, bool),
+    Pan(isize),
+    Undo,
+    Redo,
+}
+
 /// Everything one tab's input editor needs beyond the document itself.
 #[derive(Clone, Debug)]
 pub struct EditorState {
@@ -127,6 +148,50 @@ impl EditorState {
             self.reveal = None;
             self.drag = None;
         }
+    }
+
+    /// Applies a semantic command; returns whether the *document* changed
+    /// (caret/selection-only commands return false).
+    pub fn apply(&mut self, action: EditorAction) -> bool {
+        let revision = self.buffer.revision();
+        match action {
+            EditorAction::Insert(text, kind) => self.insert(&text, kind),
+            EditorAction::Backspace => self.backspace(),
+            EditorAction::DeleteForward => self.delete_forward(),
+            EditorAction::Enter => self.enter(),
+            EditorAction::Tab => self.tab(),
+            EditorAction::Move(mv, extend) => {
+                let page_rows =
+                    (self.viewport_h / crate::ui::text_view::ROW_HEIGHT).ceil() as usize;
+                self.move_caret(mv, extend, page_rows.max(1));
+            }
+            EditorAction::SelectAll => self.select_all(),
+            EditorAction::SelectWord(offset) => self.select_word(offset),
+            EditorAction::SelectLine(line) => self.select_line(line),
+            EditorAction::SetCaret(offset, extend) => self.set_caret(offset, extend),
+            EditorAction::Pan(delta) => self.pan_columns(delta),
+            EditorAction::Undo => {
+                if let Some(caret) = self.buffer.undo() {
+                    self.caret = caret;
+                    self.anchor = None;
+                    self.goal_column = None;
+                    self.dirty = true;
+                    self.reveal = Some(self.buffer.byte_to_line(caret));
+                    self.scroll_caret_column();
+                }
+            }
+            EditorAction::Redo => {
+                if let Some(caret) = self.buffer.redo() {
+                    self.caret = caret;
+                    self.anchor = None;
+                    self.goal_column = None;
+                    self.dirty = true;
+                    self.reveal = Some(self.buffer.byte_to_line(caret));
+                    self.scroll_caret_column();
+                }
+            }
+        }
+        self.buffer.revision() != revision
     }
 
     /// Normalized selection range, if any.
@@ -526,6 +591,18 @@ pub fn with<R>(id: TabId, input: &str, revision: u64, f: impl FnOnce(&mut Editor
 /// O(1) rope snapshot for background jobs (after the sync check).
 pub fn snapshot(id: TabId, input: &str, revision: u64) -> Rope {
     with(id, input, revision, |state| state.buffer.snapshot())
+}
+
+/// Takes a pending caret reveal from an *existing* entry, without creating
+/// or syncing one: the runner poll must not build a rope for a tab no
+/// editor view has ever shown.
+pub fn take_reveal(id: TabId) -> Option<(usize, f32, f32)> {
+    STORE.with(|store| {
+        let mut map = store.borrow_mut();
+        let state = map.get_mut(&id)?;
+        let line = state.reveal.take()?;
+        Some((line, state.scroll_y, state.viewport_h))
+    })
 }
 
 /// Whether the buffer holds edits `Tab::input` has not seen.

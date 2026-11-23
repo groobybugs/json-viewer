@@ -115,6 +115,7 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
         .role("textbox")
         .focusable(true)
         .ime_cursor()
+        .on_key(super::keys::handle)
         .w_full()
         .padding(PAD)
         .fill(EDITOR_BG)

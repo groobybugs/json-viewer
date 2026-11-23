@@ -262,6 +262,7 @@ impl AppState {
         let tab = self.tabs.remove(index);
         self.editors.remove(&id);
         self.tree.remove(&id);
+        crate::editor::state::remove(id);
         if self.active == id {
             let next = index.min(self.tabs.len() - 1);
             self.active = self.tabs[next].id;
@@ -287,8 +288,11 @@ impl AppState {
         };
         tab.input = input.clone();
         tab.input_revision = crate::line_index::next_revision();
+        let tab_revision = tab.input_revision;
         tab.error = None;
         tab.validation = None;
+        // The rope editor rebuilds from the new text (revision mismatch).
+        crate::editor::state::with(id, &input, tab_revision, |_| {});
         if let Some(edit) = self.editors.get_mut(&id) {
             if edit.text != input {
                 edit.replace_text(input);
@@ -297,6 +301,59 @@ impl AppState {
         // New text means a new tree: the old index is dropped and rebuilt
         // only if the tab is showing the tree.
         self.refresh_tree(id);
+    }
+
+    /// Copies the rope into `Tab::input` when editor edits are pending.
+    /// Explicit consumers call this (paste, copy/export, tree builds,
+    /// validation display, persist); the keystroke path never does.
+    pub fn materialize_input(&mut self, id: TabId) {
+        let Some(tab) = self.tab_mut(id) else {
+            return;
+        };
+        let dirty = crate::editor::state::is_dirty(id, &tab.input, tab.input_revision);
+        if !dirty {
+            return;
+        }
+        let text =
+            crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| ed.buffer.to_string());
+        tab.input = text;
+        crate::editor::state::mark_clean(id, &tab.input, tab.input_revision);
+    }
+
+    /// Applies one editor command to the tab's rope and keeps the tab
+    /// bookkeeping honest: a document change bumps `input_revision` (which
+    /// keys the line index, tree and validation staleness), clears the last
+    /// error/validation, and refreshes an open tree. Caret/selection-only
+    /// commands change no revision. When the document crosses the
+    /// empty/non-empty boundary the input is materialized at once so the
+    /// toolbar's enabled state stays correct without a per-keystroke copy.
+    fn apply_editor_action(&mut self, id: TabId, action: crate::editor::state::EditorAction) {
+        let revision = crate::line_index::next_revision();
+        let Some(tab) = self.tab_mut(id) else {
+            return;
+        };
+        let (changed, empty_changed) =
+            crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+                let was_empty = ed.buffer.is_empty();
+                let changed = ed.apply(action);
+                if changed {
+                    // Keep the store's sync marker ahead of the revision
+                    // bump so the next access does not rebuild the rope.
+                    ed.source_revision = revision;
+                }
+                (changed, was_empty != ed.buffer.is_empty())
+            });
+        if changed {
+            tab.input_revision = revision;
+            tab.error = None;
+            tab.validation = None;
+        }
+        if empty_changed {
+            self.materialize_input(id);
+        }
+        if changed {
+            self.refresh_tree(id);
+        }
     }
 
     /// Clears input, output, error and search results, and switches back to
@@ -690,6 +747,7 @@ impl AppState {
             .collect();
         // Restored tabs get fresh tree state (indexes are never persisted).
         self.tree.clear();
+        crate::editor::state::clear_all();
         self.tabs = tabs;
         self.status = None;
     }
@@ -736,6 +794,46 @@ impl AppState {
             Msg::InputChanged(text) => {
                 self.update_input(self.active, text);
                 Vec::new()
+            }
+            Msg::EditorEdit { tab, action } => {
+                self.apply_editor_action(tab, action);
+                Vec::new()
+            }
+            Msg::EditorPaste { tab, text } => {
+                self.apply_editor_action(
+                    tab,
+                    crate::editor::state::EditorAction::Insert(
+                        text,
+                        crate::editor::EditKind::Paste,
+                    ),
+                );
+                // Paste is a bulk action: keep `Tab::input` fresh for the
+                // toolbar, status line and any immediate consumer.
+                self.materialize_input(tab);
+                Vec::new()
+            }
+            Msg::EditorCopy { tab, cut } => {
+                let Some(t) = self.tab(tab) else {
+                    return Vec::new();
+                };
+                let selection = crate::editor::state::with(tab, &t.input, t.input_revision, |ed| {
+                    ed.selected_text()
+                });
+                match selection {
+                    Some(text) if !text.is_empty() => {
+                        if cut {
+                            self.apply_editor_action(
+                                tab,
+                                crate::editor::state::EditorAction::Backspace,
+                            );
+                        }
+                        vec![Effect::Copy(text)]
+                    }
+                    _ => {
+                        self.status = Some("Nothing to copy".into());
+                        Vec::new()
+                    }
+                }
             }
             Msg::Clear => {
                 self.clear_tab(self.active);
@@ -820,6 +918,9 @@ impl AppState {
                 input_revision,
                 result,
             } => {
+                // The error panel and Go-to-error read `Tab::input` for
+                // source context; refresh the cache off the keystroke path.
+                self.materialize_input(tab);
                 self.apply_validation_result(tab, input_revision, result);
                 Vec::new()
             }
@@ -1139,6 +1240,18 @@ pub enum Msg {
     SwitchView(TabView),
     /// Replace the active tab's source text.
     InputChanged(String),
+    /// Apply a semantic editor command (rp-editor): typing, motion,
+    /// selection, undo/redo. The reducer applies it to the tab's rope and
+    /// does the revision/error/tree bookkeeping.
+    EditorEdit {
+        tab: TabId,
+        action: crate::editor::state::EditorAction,
+    },
+    /// Clipboard paste into the editor (root `on_paste`); one undo step,
+    /// materialized into `Tab::input` immediately (bulk action).
+    EditorPaste { tab: TabId, text: String },
+    /// Copy (or cut) the editor selection.
+    EditorCopy { tab: TabId, cut: bool },
     /// Format the active tab.
     Format,
     /// Minify the active tab.

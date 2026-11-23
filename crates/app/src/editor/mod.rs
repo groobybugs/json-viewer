@@ -12,6 +12,7 @@
 //! `ui::text_view::TextView` stays the read-only Output component.
 
 pub mod buffer;
+pub mod keys;
 pub mod state;
 pub mod view;
 

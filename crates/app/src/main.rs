@@ -72,6 +72,9 @@ fn main() {
     spec.poll = Some(runner::poll);
     spec.on_key = Some(ui::on_key);
     let app = rune::App::new(spec)
+        // The rope editor draws its own caret: IME compositions come here
+        // (preedit at the caret, commit as one undo step).
+        .on_ime(json_viewer::editor::keys::on_ime)
         .on_close(runner::on_close)
         .on_quit(runner::on_quit);
     // Give the tree explorer a way to deliver off-thread results: its

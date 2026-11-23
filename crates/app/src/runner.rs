@@ -640,10 +640,27 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    // Editor caret auto-scroll (rp-editor): the reducer marks the caret
+    // line; scroll minimally to keep it inside the viewport.
+    if reveal_editor_caret(state, tx) {
+        changed = true;
+    }
     if !applied {
         if let Some(key) = PENDING_REVEAL.with(|slot| slot.borrow_mut().take()) {
             tx.instant();
-            tx.scroll_into_view(key);
+            if let Some((id, line)) = parse_editor_row_key(&key) {
+                // A rope-editor row: it may not be mounted (far jump), so
+                // scroll by offset and put the caret on the validation
+                // error this reveal came from.
+                reveal_editor_line(state, tx, id, Some(line));
+            } else if let Some(id) = key
+                .strip_prefix("editor-")
+                .and_then(|rest| rest.parse::<u64>().ok())
+            {
+                reveal_editor_line(state, tx, id, None);
+            } else {
+                tx.scroll_into_view(key);
+            }
             changed = true;
         }
     }
@@ -658,6 +675,75 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Parses `editor-{id}-row-{line}` reveal keys (the rope editor's rows use
+/// the same key shape as `TextView::row_key`).
+fn parse_editor_row_key(key: &str) -> Option<(u64, usize)> {
+    let rest = key.strip_prefix("editor-")?;
+    let (id, line) = rest.split_once("-row-")?;
+    Some((id.parse().ok()?, line.parse().ok()?))
+}
+
+/// Scrolls the document viewport so the editor's caret line stays visible
+/// (minimal scroll; nothing when it already is). Returns whether it moved.
+fn reveal_editor_caret(state: &mut AppState, tx: &mut Tx) -> bool {
+    let id = state.active;
+    let input_view = state
+        .tab(id)
+        .is_some_and(|tab| tab.view == crate::state::TabView::Input);
+    if !input_view {
+        return false;
+    }
+    let Some((line, scroll_y, viewport_h)) = crate::editor::state::take_reveal(id) else {
+        return false;
+    };
+    let row_h = crate::ui::text_view::ROW_HEIGHT;
+    let y = line as f32 * row_h;
+    let target = if y < scroll_y {
+        Some(y)
+    } else if viewport_h > 0.0 && y + row_h > scroll_y + viewport_h {
+        Some(y + row_h - viewport_h)
+    } else {
+        None
+    };
+    match target {
+        Some(target) => {
+            tx.instant();
+            tx.scroll_to_y(format!("document-scroll-{id}"), target.max(0.0));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reveals an editor line by scroll offset (works for unmounted rows) and
+/// places the caret on the tab's validation error, if any. `line` is
+/// 0-based; `None` centers the error line (or just focuses the container).
+fn reveal_editor_line(state: &mut AppState, tx: &mut Tx, id: u64, line: Option<usize>) {
+    let Some(tab) = state.tab(id) else {
+        return;
+    };
+    let error = tab.validation_error().map(|e| (e.line, e.column));
+    let viewport_h = crate::editor::state::with(id, &tab.input, tab.input_revision, |ed| {
+        if let Some((err_line, err_col)) = error {
+            let line_range = ed.buffer.line_byte_range(err_line.saturating_sub(1));
+            let col = (err_col.saturating_sub(1)).min(line_range.end - line_range.start);
+            let offset = line_range.start + col;
+            ed.set_caret(offset, false);
+            ed.reveal = None;
+        }
+        ed.viewport_h
+    });
+    let target_line = line.or_else(|| error.map(|(l, _)| l.saturating_sub(1)));
+    if let Some(target_line) = target_line {
+        let row_h = crate::ui::text_view::ROW_HEIGHT;
+        let y = target_line as f32 * row_h;
+        let centered = if viewport_h > 0.0 { y - viewport_h * 0.5 } else { y };
+        tx.scroll_to_y(format!("document-scroll-{id}"), centered.max(0.0));
+    } else {
+        tx.scroll_into_view(format!("editor-{id}"));
+    }
 }
 
 /// Executes effects returned by [`AppState::update`].
