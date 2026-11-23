@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
+use rune::text::TextSystem;
 use rune::{Env, Runtime};
 use serde_json::{json, Value};
 
@@ -23,9 +24,29 @@ pub const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
 /// Default device scale (Rune's headless default is 2.0).
 pub const DEFAULT_SCALE: f32 = 2.0;
 
+// Font registration (see NOTES-rp-view.md). `AppSpec::new` and
+// `TextSystem::default()` both put "Inter" behind BOTH the sans and mono slots,
+// so `TextStyle::mono()` resolves to a proportional face. Rune ships these OFL
+// faces at the pinned rev; bundling them keeps headless and the real window
+// deterministic on machines without Inter or a configured monospace font.
+/// The three Inter weights Rune bundles plus a real fixed-pitch face.
+pub static APP_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/Inter-Regular.ttf"),
+    include_bytes!("../assets/Inter-Medium.ttf"),
+    include_bytes!("../assets/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/IBMPlexMono-Regular.ttf"),
+];
+/// Sans slot stays Inter; the mono slot is a real monospaced family.
+pub const APP_FAMILIES: (&str, &str) = ("Inter", "IBM Plex Mono");
+
+/// A text system with the app's registered faces, for `Runtime::with_text`.
+pub fn text_system() -> TextSystem {
+    TextSystem::new(APP_FONTS, APP_FAMILIES)
+}
+
 /// Builds a headless runtime, runs two frames and settles animations.
 pub fn runtime(state: AppState, size: (f32, f32), scale: f32) -> Runtime<AppState> {
-    let mut runtime = Runtime::new(state, ui::view, size, Env::new(true, scale));
+    let mut runtime = Runtime::with_text(state, ui::view, size, Env::new(true, scale), text_system());
     runtime.set_srgb_blend(true);
     runtime.frame(0.0);
     runtime.settle_all();

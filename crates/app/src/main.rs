@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 
+mod line_index;
 use std::path::PathBuf;
 
 use json_viewer::headless;
@@ -63,6 +64,10 @@ fn main() {
     }
 
     let mut spec = AppSpec::new("JSON Viewer", headless::DEFAULT_SIZE, boot, ui::view);
+    // Font registration (see NOTES-rp-view.md): AppSpec::new defaults BOTH
+    // slots to "Inter", which makes TextStyle::mono() proportional.
+    spec.fonts = headless::APP_FONTS;
+    spec.families = headless::APP_FAMILIES;
     spec.poll = Some(runner::poll);
     rune::run(spec);
 }
