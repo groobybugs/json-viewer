@@ -14,9 +14,10 @@ use json_viewer::headless::{element_tree, text_system};
 use json_viewer::line_index;
 use json_viewer::state::{AppState, TabView};
 use json_viewer::ui::text_view::{TextView, LARGE_FILE_BANNER};
+use json_viewer::ui::text_view::{char_width, LONG_LINE_LIMIT_BYTES};
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::text::TextSystem;
-use rune::{col, tok, Cx, El, Env, Runtime, ScrollSpec};
+use rune::{col, tok, Cx, El, Env, Runtime, ScrollSpec, TextEdit};
 use serde_json::Value;
 
 const SIZE: (f32, f32) = (960.0, 640.0);
@@ -88,6 +89,106 @@ fn view_large_editable(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: false })
         .child(body)
+}
+
+/// Editable view at its default limits; used for the long-line gate, where
+/// the input is one 6.9 MB line and the read-only virtual view takes over.
+fn view_long_one_line(state: &AppState, _cx: &mut Cx<AppState>) -> El {
+    let edit = state.editor(state.active).expect("active editor");
+    let body = TextView::editable(&state.tabs[0].input, edit).build("editor-one-line");
+    col()
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(body)
+}
+
+/// The measured advance must be Rune's actual monospace pitch, and the face it
+/// measures must be fixed pitch: no test asserts an IBM Plex specific value,
+/// only that equal-length runs of different glyphs are equally wide.
+#[test]
+fn measured_char_width_is_fixed_pitch() {
+    let mono = tok::TextStyle::new(12.0, 400.0).mono();
+    let mut app = text_system();
+    let (width, zeros, i_run, w_run) = rune::text::lend(&mut app, || {
+        (
+            char_width(),
+            rune::text::advance("0000", mono),
+            rune::text::advance("iiii", mono),
+            rune::text::advance("WWWW", mono),
+        )
+    });
+    println!(
+        "MEASURED_CHAR_WIDTH={width:.4} ZERO_RUN={zeros:.4} I_RUN={i_run:.4} W_RUN={w_run:.4}"
+    );
+    assert!(width.is_finite() && width > 0.0, "char width not measured");
+    assert!(
+        (zeros - 4.0 * width).abs() < 0.05,
+        "char_width() is not the measured advance: {width} vs {}",
+        zeros / 4.0
+    );
+    assert!(
+        (i_run - w_run).abs() < 0.01,
+        "the mono slot is not fixed pitch: i={i_run} W={w_run}"
+    );
+    assert!((zeros - i_run).abs() < 0.05, "digit and letter pitch differ");
+}
+
+/// Addendum 2: a single line longer than [`LONG_LINE_LIMIT_BYTES`] stays on
+/// the read-only virtual path even when the file is under the size limit, and
+/// the banner says why (so `Format` is the suggested fix).
+#[test]
+fn long_line_gate_reports_the_reason() {
+    let doc = format!("[{}0]", "1,".repeat(100_000)); // one ~200 KB line
+    let edit = TextEdit::default();
+    let view = TextView::editable(&doc, &edit);
+    assert!(
+        view.editing_disabled(),
+        "a 200 KB line must not enter editable mode"
+    );
+    assert!(doc.len() > LONG_LINE_LIMIT_BYTES);
+
+    let mut state = AppState::default();
+    state.tabs[0].input = doc;
+    let gpu = Gpu::headless();
+    let mut rt = fresh_runtime(state, view_long_one_line, SIZE);
+    let tree = element_tree(&rt).to_string();
+    assert!(
+        tree.contains("Very long line") && tree.contains("Format to edit"),
+        "long-line banner missing: {tree}"
+    );
+    let path = target_dir().join("text-view-long-line.png");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    draw(&mut rt, &gpu, &path, SIZE);
+}
+
+/// The benchmark fixture: 6.9 MB on one line is classified as a very long
+/// line, not just a large file, so the banner can suggest Format.
+#[test]
+fn six_point_nine_megabyte_single_line_is_a_long_line() {
+    let mut doc = String::with_capacity(7_300_000);
+    doc.push_str("[1");
+    while doc.len() < 7_236_000 {
+        doc.push_str(",1");
+    }
+    doc.push(']');
+    let edit = TextEdit::default();
+    let view = TextView::editable(&doc, &edit);
+    assert!(view.editing_disabled());
+
+    let mut state = AppState::default();
+    state.tabs[0].input = doc;
+    let gpu = Gpu::headless();
+    let mut rt = fresh_runtime(state, view_long_one_line, SIZE);
+    let tree = element_tree(&rt).to_string();
+    assert!(
+        tree.contains("Very long line (6.9 MB on one line)"),
+        "expected the long-line reason for a 6.9 MB one-liner: {tree}"
+    );
+    let path = target_dir().join("text-view-long-one-line.png");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    draw(&mut rt, &gpu, &path, SIZE);
 }
 
 type ViewFn = fn(&AppState, &mut Cx<AppState>) -> El;

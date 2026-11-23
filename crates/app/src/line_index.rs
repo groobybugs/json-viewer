@@ -136,19 +136,27 @@ impl LineIndex {
     }
 
     /// A provisional index over `text` (a bounded prefix), remembering the
-    /// whole document's length. O(prefix), never O(document). The whole
-    /// document is a conservative upper bound for its longest line.
+    /// whole document's length. O(prefix), never O(document). `max_line_len`
+    /// covers only the prefix, so [`LineIndex::max_line_len_exact`] returns
+    /// `None` until the full index lands.
     pub fn partial(text: &str, total_len: usize) -> Self {
         let mut index = Self::build(text);
         index.total_len = total_len;
         index.complete = false;
-        index.max_line_len = total_len;
         index
     }
 
-    /// Byte length of the longest line (line endings excluded). O(1).
+    /// Byte length of the longest line (line endings excluded) in the scanned
+    /// range. O(1). For a provisional index this is the prefix's maximum,
+    /// which is not the document's; use [`LineIndex::max_line_len_exact`].
     pub fn max_line_len(&self) -> usize {
         self.max_line_len
+    }
+
+    /// The document's longest line, or `None` while the index is provisional
+    /// (only a prefix was scanned).
+    pub fn max_line_len_exact(&self) -> Option<usize> {
+        self.complete.then_some(self.max_line_len)
     }
 
     /// Whether the whole document was scanned.
@@ -283,6 +291,12 @@ impl Snapshot {
 
     pub fn line_len(&self, line: usize) -> usize {
         self.line(line).map_or(0, str::len)
+    }
+
+    /// The whole document's longest line, or `None` while this snapshot holds
+    /// only a bounded prefix (see [`LineIndex::max_line_len_exact`]). O(1).
+    pub fn max_line_len_exact(&self) -> Option<usize> {
+        self.index.max_line_len_exact()
     }
 
     pub fn key(&self) -> TextKey {

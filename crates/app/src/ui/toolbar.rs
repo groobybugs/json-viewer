@@ -5,6 +5,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 
 use super::{kit, BORDER, MUTED, TEXT, WINDOW_BG};
 use crate::state::{AppState, Msg, TabView};
+use crate::ui::text_view::{apply_fold_action, FoldAction};
 
 static FORMAT_ICON: Icon = Icon {
     name: "json-viewer-format",
@@ -125,6 +126,23 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .child(export)
         .child(open)
         .child(clear);
+    // Folding controls for the formatted Output. They live in the document
+    // card header and act on the active tab's Output revision; see
+    // `text_view::apply_fold_action` and `fold_index`.
+    let foldable = has_output && !processing;
+    let fold_actions = row()
+        .gap(2.0)
+        .center_y()
+        .child(fold_button("Fold all", "fold-all", FoldAction::FoldAll, foldable))
+        .child(fold_button(
+            "Unfold all",
+            "unfold-all",
+            FoldAction::UnfoldAll,
+            foldable,
+        ))
+        .child(fold_button("L1", "fold-level-1", FoldAction::Level(1), foldable))
+        .child(fold_button("L2", "fold-level-2", FoldAction::Level(2), foldable))
+        .child(fold_button("L3", "fold-level-3", FoldAction::Level(3), foldable));
     let mut bar = row()
         .w_full()
         .h(52.0)
@@ -132,7 +150,8 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .gap(10.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], BORDER)
-        .child(switcher);
+        .child(switcher)
+        .child(fold_actions);
     if processing {
         bar = bar.child(
             row()
@@ -154,4 +173,17 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         );
     }
     bar.child(spacer()).child(actions)
+}
+
+/// One small folding button. `action` runs against the active tab's Output;
+/// disabled while there is nothing to fold or a worker is running.
+fn fold_button(label: &str, key: &str, action: FoldAction, enabled: bool) -> El {
+    let kit = kit();
+    Button::new(label)
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .disabled(!enabled)
+        .on_press(move |state: &mut AppState| apply_fold_action(state, action))
+        .build(&kit)
+        .key(key)
 }

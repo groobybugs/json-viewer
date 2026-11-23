@@ -117,6 +117,11 @@ pub struct AppState {
     /// `scroll_into_view`). Fold handlers bump this so Rune re-runs the view
     /// after a fold/unfold; the value is not otherwise read by the model.
     pub fold_epoch: u64,
+    /// First half of the `Ctrl+K` fold chord is pending. Rune key handlers
+    /// receive one `KeyEvent` at a time (no built-in two-key chords), so the
+    /// keyboard layer records the prefix here and completes it on the next
+    /// key; any other key clears it. Presentation-only, like `fold_epoch`.
+    pub fold_chord: bool,
 }
 
 impl Default for AppState {
@@ -131,6 +136,7 @@ impl Default for AppState {
             search_edit: TextEdit::default(),
             pending: Vec::new(),
             fold_epoch: 0,
+            fold_chord: false,
         };
         state.add_tab();
         state

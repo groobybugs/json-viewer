@@ -26,6 +26,7 @@ crates/app/
     io.rs                      dialogs, file read/write, clipboard, drop
     runner.rs                  drains Msg queue, executes Effect values
     line_index.rs              revision-keyed line index + snapshot cache
+    fold_index.rs              fold index + fold set + visual-row map
     headless.rs                offscreen PNG + element-tree dump
     bin/gen_fixtures.rs        QA fixture generator
     bin/screenshot.rs          renders docs/screenshot.png
@@ -89,7 +90,13 @@ sites and this document in one commit.
 - `ui/search_bar.rs`: `search_bar`, `search_results`.
 - `ui/text_view.rs`: `TextViewMode`, `TextView::{editable, read_only,
   first_line, visible_lines, line_numbers, highlight, line_count,
-  visible_range, line, build, revision, row_key, build_revealing}`.
+  visible_range, line, build, revision, row_key, build_revealing}`. Additive
+  since rp-fold: `error_marker`, `editing_disabled`, `editable_limit`,
+  `char_width`, `line_height`, `LONG_LINE_LIMIT_BYTES`, `FoldAction`,
+  `apply_fold_action`.
+- `fold_index.rs`: `Region`, `FoldIndex`, `FoldSet`, `FoldView`, `key`,
+  `view_for`, `prewarm`, `toggle`, `toggle_near`, `unfold_near`, `fold_all`,
+  `unfold_all`, `fold_level`, `note_reveal`, `note_hover`.
 - `headless.rs`: `DEFAULT_SIZE`, `DEFAULT_SCALE`, `runtime`, `render_png`,
   `element_tree`, `write_tree`, `render_and_dump`.
 
@@ -109,6 +116,7 @@ frozen API or a PR comment.
 | `crates/app/src/json_ops.rs` | JSON parse/format/minify worker |
 | `crates/app/src/search.rs` | search traversal and hit model |
 | `crates/app/src/line_index.rs` | revision-keyed line index + snapshot cache |
+| `crates/app/src/fold_index.rs` | fold index, fold set, visual-row map |
 | `crates/app/src/persist.rs` | tab persistence |
 | `crates/app/src/io.rs` | dialogs, files, clipboard, drop |
 | `crates/app/src/runner.rs` | message/effect loop |
@@ -121,6 +129,7 @@ frozen API or a PR comment.
 | `crates/app/src/headless.rs` | headless render/tree helpers |
 | `crates/app/src/main.rs` | binary, window wiring, `--headless` |
 | `crates/app/tests/smoke.rs` | headless smoke test |
+| `crates/app/tests/folding.rs` | folding + error-marker evidence |
 | `crates/app/Cargo.toml`, `Cargo.toml` | dependencies/workspace (ask first) |
 
 ## Build, test, run
@@ -369,6 +378,96 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
   non-virtualized callers. Use `TextView::row_key` for row keys.
 - `El::scroll_x()` / `scroll_xy()` for wide JSON; `Tx::scroll_into_view(key)`
   to reveal a search hit. Wheel/trackpad momentum is built in.
+- Above `PLAIN_ROWS_LIMIT` (512) visible rows `TextView` uses that virtual
+  list; at or below it, rows are plain keyed children. A fold action that
+  changes the visible count makes Rune re-materialise the whole row-key list
+  (`Vec<String>`) — the one O(visible rows) step, not ours. Folding a
+  2M-line document down to a few rows therefore lands on the plain path and
+  commits in ~0 ms; unfolding it back to 2M rows costs what the first mount
+  of that document costs (~270 ms measured).
+
+### Code folding
+
+- `fold_index.rs` builds one struct-of-arrays entry per multi-line `{`/`[`:
+  start line, matching close line, direct child count, depth, array flag.
+  One O(bytes) pass, string/escape aware. It runs off the UI thread next to
+  the line index (`line_index::prewarm_off_thread` calls
+  `fold_index::prewarm`), or lazily on the UI thread below
+  `LARGE_FOLD_BYTES` (= `line_index::LARGE_DOCUMENT_BYTES`, 8 MiB). A larger
+  cold document gets a bounded provisional index with no regions until the
+  prewarm lands; only the output path is prewarmed, so a ≥8 MiB *input* is
+  not foldable.
+- Several containers can open on one line (`{"a": [`); the index keeps the
+  outermost per start line, since the gutter arrow and the fold set are
+  line-keyed.
+- `FoldSet` is a bitset over start lines (O(1) toggle/membership).
+  `FoldView` turns it into disjoint visible runs (`Segment` prefix sums):
+  `visible_count()` is the `virtual_rows` count, `visual_to_doc` is
+  O(log runs), `doc_to_visual` returns `None` for hidden lines. Nested fold
+  marks stay in the bitset and only the outermost hidden range counts, so
+  unfolding a parent restores its children's marks.
+- Fold state is process-wide in `fold_index` (interior mutability), keyed by
+  `fold_index::key(tab.output_revision, &tab.output)`: the view only has
+  `&AppState`, but a reveal must unfold before `Tx::scroll_into_view`. Each
+  tab's output revision is its own fold set. Handlers bump
+  `AppState::fold_epoch` so Rune re-runs the view; `virtual_rows_version`
+  includes the fold epoch.
+- Rows are keyed by **document line** (`row_key(base, line)`), never by
+  visual row, so gutter numbers are document numbers and a reveal key stays
+  stable across folds. `note_reveal` is keyed by the view base: the next
+  `build` clears every folded ancestor of the target line. Search hits,
+  `build_revealing` and `error_marker` callers all go through that path.
+- UI: `▾`/`▸` arrows on foldable rows, a folded row renders
+  `"key": {…}` / `[…]` plus a muted `· N keys|items` badge; clicking the
+  arrow, the badge or the placeholder line toggles. `ui/toolbar.rs` adds
+  Fold all / Unfold all / L1–L3 (`ui::text_view::apply_fold_action`).
+  Shortcuts: `Ctrl+Shift+[` / `Ctrl+Shift+]` toggle/unfold at the hovered
+  line (the read-only view has no caret), and `Ctrl+K` then
+  `Ctrl+0` / `Ctrl+J` / `Ctrl+1..3` fold all / unfold all / fold to level.
+  Rune hands `on_key` one `KeyEvent`, so the two-key chord lives in
+  `AppState::fold_chord` (a modifier-less key after `Ctrl+K` cancels it).
+- Measured (release, 2M-line / 102 MB document, 250_002 regions; fold index
+  alone: 7 MB 5.5 ms, 100 MB flat 85 ms, this fixture 103 ms including the
+  line index): fold all 0.4 ms + 1.2 ms commit, 60 frames after fold-all
+  avg 0.110 ms / worst 0.407 ms, search jump into a folded region 106 ms
+  commit + 3.2 ms scroll, unfold all 121 ms. The first mount of the same
+  2M-row document is 302 ms, i.e. the virtual-row key list, not folding, is
+  the large one-off cost.
+
+### Error marker (Validate view half)
+
+`TextView::error_marker(line, column)` (both 1-based) is additive and works
+in both modes:
+
+- Read-only/virtualized: red row tint, a red `●` in a dedicated gutter cell
+  (reserved on every row so text columns stay aligned), and an underlined
+  caret span at the column inside the shaped window.
+- Editable: `TextEdit` decorations (`Span::bg` on the line, `Span::underline`
+  at the column) so Rune maps them through wrapping and IME preedit, plus a
+  `● line N, column C` strip above the field. A text field is one scroll
+  target; the keyed strip is `row_key(base, line - 1)` so
+  `Tx::scroll_into_view` still works, but the precise position is the
+  underline.
+
+### Editable thresholds
+
+`EDITABLE_LIMIT_BYTES` is 5 MiB (rp-editbench: pretty 5 MiB p95 12.3 ms,
+10 MiB 24.3 ms), and any line longer than `LONG_LINE_LIMIT_BYTES` (128 KiB)
+also forces the read-only view (single-line 2 MiB was 250 ms/keystroke).
+Both are O(1) from the cached line index
+(`Snapshot::max_line_len_exact`, same pass as the line starts); a provisional
+index has no exact maximum, so a cold ≥8 MiB document is reported as a large
+file. Banners: `Large file (6.9 MB) — editing disabled …` and
+`Very long line (6.9 MB on one line) — Format to edit`.
+
+### Monospace metrics
+
+`text_view::char_width()` measures one `'0'` through
+`rune::text::advance` on the active text system instead of hard-coding a
+font's advance; `line_height()` uses `rune::text::measure`. Tests assert
+fixed pitch (equal-width `i`/`W`/digit runs) and that `char_width()` is that
+measurement, never a specific IBM Plex/DejaVu/Consolas value. The editable
+error strip sizes itself from `line_height()`.
 
 ### File drop
 
