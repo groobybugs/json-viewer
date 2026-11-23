@@ -2,6 +2,7 @@
 //! `runner::poll`, render PNGs to `target/headless/qa-*.png`, and assert on
 //! the element tree and application state.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -230,6 +231,87 @@ fn scripted_clearing_search_clears_results() {
         !tree.to_string().contains("Search Results"),
         "clearing the query must clear the results panel"
     );
+}
+
+/// A ~6 MiB, single-line, valid JSON document with non-ASCII text. Generating
+/// it keeps the regression independent of any downloaded file.
+fn large_single_line_fixture() -> String {
+    let mut out = String::with_capacity(7 * 1024 * 1024);
+    out.push_str("{\"models\":[");
+    let mut index = 0usize;
+    while out.len() < 6 * 1024 * 1024 {
+        if index > 0 {
+            out.push(',');
+        }
+        write!(
+            out,
+            "{{\"id\":\"model-{index:05}\",\"name\":\"Mødel {index:05} 日本語\",\
+             \"description\":\"Ærlig beskrivelse — 中文 {index:05}\",\
+             \"tags\":[\"alpha\",\"beta\"]}}"
+        )
+        .expect("write fixture");
+        index += 1;
+    }
+    out.push_str("]}");
+    assert!(!out.contains('\n'), "fixture must be a single line");
+    out
+}
+
+#[test]
+fn scripted_large_single_line_format_from_open_and_paste() {
+    let content = large_single_line_fixture();
+    assert!(content.len() > 6 * 1024 * 1024);
+    assert!(!content.is_ascii());
+
+    for (label, paste) in [("open", false), ("paste", true)] {
+        let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
+        if paste {
+            click(&mut rt, "editor-1");
+            rt.paste(&content);
+        } else {
+            rt.update(|state, _| {
+                state.dispatch(Msg::FileLoaded {
+                    path: PathBuf::from("/tmp/models.json"),
+                    content: content.clone(),
+                })
+            });
+        }
+        pump_until(&mut rt, &format!("{label}: large input loaded"), |state| {
+            state
+                .active_tab()
+                .is_some_and(|tab| tab.input.len() == content.len())
+        });
+
+        // The large-file Input view is the read-only fallback; Format must
+        // still be enabled and must publish output and switch to Output.
+        click(&mut rt, "format");
+        pump_until(&mut rt, &format!("{label}: format finished"), |state| {
+            state
+                .active_tab()
+                .is_some_and(|tab| !tab.is_processing && tab.view == TabView::Output)
+        });
+
+        let tab = rt.state.active_tab().expect("active tab");
+        assert!(!tab.output.is_empty(), "{label}: output is empty");
+        assert!(tab.error.is_none(), "{label}: error {:?}", tab.error);
+        assert_eq!(tab.view, TabView::Output, "{label}: view did not switch");
+        assert!(
+            tab.output.lines().count() > 100_000,
+            "{label}: formatted output has only {} lines",
+            tab.output.lines().count()
+        );
+
+        let tree = render_qa_png(&mut rt, &format!("large-format-{label}"));
+        let tree_json = tree.to_string();
+        assert!(
+            tree_json.contains("output-text-row-0"),
+            "{label}: output view did not mount"
+        );
+        assert!(
+            tree_json.contains("model-00000"),
+            "{label}: formatted output content missing from the tree"
+        );
+    }
 }
 
 #[test]

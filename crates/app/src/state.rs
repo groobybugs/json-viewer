@@ -295,6 +295,10 @@ impl AppState {
                 tab.output = output;
                 tab.output_revision = revision;
                 tab.error = None;
+                // The original `processJsonContent.fulfilled` reducer switched
+                // the active content to Output, so Format/Minify visibly
+                // produced a result instead of leaving the user on Input.
+                tab.view = TabView::Output;
                 true
             }
             Err(err) => {
@@ -717,6 +721,7 @@ mod tests {
         assert_eq!(tab.output, "{\n  \"a\": 1\n}");
         assert_eq!(tab.error, None);
         assert!(!tab.is_processing);
+        assert_eq!(tab.view, TabView::Output);
     }
 
     #[test]

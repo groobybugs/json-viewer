@@ -257,6 +257,10 @@ elements by key.
   `TextView::row_key(base, line)` -> `{base}-row-{line}`; use
   `TextView::build_revealing(base, line)` or `Tx::scroll_into_view` with that
   key to jump to a line.
+- **Format result.** A successful `Msg::JsonDone` stores `output` and switches
+  that tab to `TabView::Output`, matching the original
+  `processJsonContent.fulfilled` reducer. Failures leave the current view and
+  previous output untouched.
 - **Search jump.** `search_bar::select_hit` dispatches `SwitchView(Output)` and
   queues `runner::queue_reveal(TextView::row_key("output-text", line - 1))`.
   `hit.line` is 1-based; rows are 0-based. The reveal waits for the next idle
