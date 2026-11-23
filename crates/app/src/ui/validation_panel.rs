@@ -121,6 +121,7 @@ fn error_panel(input: &str, error: &JsonError) -> El {
         })
         .build(&kit)
         .key("go-to-error");
+    let gutter_width = line.to_string().len();
     let mut source = col()
         .key("error-source")
         .w_full()
@@ -129,24 +130,25 @@ fn error_panel(input: &str, error: &JsonError) -> El {
         .radius(6.0)
         .fill(EDITOR_BG);
     if let Some(previous) = snippet.previous_line {
-        source = source
-            .child(text("Previous line").font(tok::type_::LABEL).color(MUTED))
-            .child(
-                text(previous)
-                    .key("error-previous-line")
-                    .font(TextStyle::new(12.0, 400.0).mono())
-                    .color(MUTED),
-            );
+        source = source.child(
+            text(format!(
+                "{:>gutter_width$} │ {previous}",
+                line.saturating_sub(1)
+            ))
+            .key("error-previous-line")
+            .font(TextStyle::new(12.0, 400.0).mono())
+            .color(MUTED),
+        );
     }
     source = source
         .child(
-            text(snippet.line)
+            text(format!("{line:>gutter_width$} │ {}", snippet.line))
                 .key("error-snippet")
                 .font(TextStyle::new(12.0, 400.0).mono())
                 .color(TEXT),
         )
         .child(
-            text(snippet.caret)
+            text(format!("{} │ {}", " ".repeat(gutter_width), snippet.caret))
                 .key("error-caret")
                 .font(TextStyle::new(12.0, 400.0).mono())
                 .color(DANGER),
@@ -175,7 +177,7 @@ fn error_panel(input: &str, error: &JsonError) -> El {
                                 .color(DANGER),
                         )
                         .child(
-                            text(format!("Invalid JSON: {error}"))
+                            text(format!("Invalid JSON: {}", error.message))
                                 .key("error-message")
                                 .font(tok::type_::BODY)
                                 .color(TEXT),
@@ -183,7 +185,7 @@ fn error_panel(input: &str, error: &JsonError) -> El {
                 )
                 .child(spacer())
                 .child(
-                    text(format!("line {line}, column {column}"))
+                    text(format!("Line {line}, column {column}"))
                         .key("error-location")
                         .font(tok::type_::LABEL)
                         .color(DANGER),

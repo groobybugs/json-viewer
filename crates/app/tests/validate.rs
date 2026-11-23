@@ -234,17 +234,26 @@ fn headless_format_error_panel_png_and_go_to_error() {
     state.apply_json_result(id, Err(error));
 
     let tree = render(state.clone(), "error-small");
-    assert!(element(&tree, "error-message")["text"]
+    let message = element(&tree, "error-message")["text"]
         .as_str()
-        .is_some_and(|text| text.contains("Expected ',' or '}' after property value")));
-    assert_eq!(element(&tree, "error-location")["text"], "line 3, column 3");
+        .expect("error message");
+    assert_eq!(
+        message,
+        "Invalid JSON: Expected ',' or '}' after property value"
+    );
+    assert!(
+        !message.contains("at line"),
+        "position shown twice: {message}"
+    );
+    assert_eq!(element(&tree, "error-location")["text"], "Line 3, column 3");
     assert!(element(&tree, "error-previous-line")["text"]
         .as_str()
-        .is_some_and(|text| text.contains("\"a\": 1")));
+        .is_some_and(|text| text.starts_with("2 │") && text.contains("\"a\": 1")));
     assert!(element(&tree, "error-snippet")["text"]
         .as_str()
-        .is_some_and(|text| text.contains("\"b\": 2")));
-    assert_eq!(element(&tree, "error-caret")["text"], "  ^");
+        .is_some_and(|text| text.starts_with("3 │") && text.contains("\"b\": 2")));
+    assert_eq!(element(&tree, "error-caret")["text"], "  │   ^");
+    assert!(!tree.to_string().contains("Previous line"));
 
     let mut runtime = headless::runtime(state, SIZE, 1.0);
     click(&mut runtime, "go-to-error");
@@ -279,16 +288,17 @@ fn headless_large_single_line_error_panel_png() {
     let tree = render(state, "error-large-single-line");
     assert_eq!(
         element(&tree, "error-location")["text"],
-        format!("line 1, column {}", error_offset + 1)
+        format!("Line 1, column {}", error_offset + 1)
     );
     let snippet = element(&tree, "error-snippet")["text"]
         .as_str()
         .expect("large error snippet");
-    assert!(snippet.len() < 90);
+    assert!(snippet.len() < 100);
+    assert!(snippet.starts_with("1 │"));
     assert!(snippet.contains("truX"));
     assert_eq!(
         element(&tree, "error-caret")["text"].as_str().unwrap(),
-        format!("{}^", " ".repeat(41))
+        format!("  │ {}^", " ".repeat(41))
     );
 }
 
