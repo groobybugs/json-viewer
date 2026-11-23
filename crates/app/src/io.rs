@@ -12,8 +12,10 @@
 //! drags, so the handlers only run on macOS, Windows, X11 and headless scripts.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 
 use rune::tok;
@@ -75,11 +77,44 @@ pub fn is_json_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
-/// File name used in status lines, falling back to the full path.
-pub fn display_name(path: &Path) -> String {
+/// UTF-8 BOM. `fs::read_to_string` keeps it as U+FEFF, which the JSON parser
+/// rejects as an unexpected token at column 1.
+const UTF8_BOM: char = '\u{feff}';
+
+/// Path → status fragment for a file whose leading BOM was just stripped.
+/// The read runs on a worker thread; the UI thread consumes the note from
+/// [`display_name`] when it builds `Opened {name}`.
+static BOM_NOTES: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn note_bom_stripped(path: &Path) {
+    let note = format!("{} (UTF-8 BOM stripped)", file_name(path));
+    BOM_NOTES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(path.to_path_buf(), note);
+}
+
+/// File name used in status lines, falling back to the full path.
+///
+/// If [`read_json_file`] just stripped a leading UTF-8 BOM from this path, the
+/// returned name notes that so the existing `Opened {name}` status line shows
+/// it. The note is one-shot.
+pub fn display_name(path: &Path) -> String {
+    if let Some(note) = BOM_NOTES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(path)
+    {
+        return note;
+    }
+    file_name(path)
 }
 
 /// Status line for a non-JSON path. Same text for a rejected drop and a read.
@@ -104,7 +139,14 @@ pub fn read_json_file(path: &Path) -> Result<String, IoError> {
     if !is_json_path(path) {
         return Err(IoError::NotJson(path.to_path_buf()));
     }
-    Ok(fs::read_to_string(path)?)
+    let text = fs::read_to_string(path)?;
+    Ok(match text.strip_prefix(UTF8_BOM) {
+        Some(stripped) => {
+            note_bom_stripped(path);
+            stripped.to_owned()
+        }
+        None => text,
+    })
 }
 
 /// Opens the native open dialog for a JSON file and reads it.

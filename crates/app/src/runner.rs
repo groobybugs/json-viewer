@@ -376,7 +376,67 @@ fn begin_copy(state: &AppState, gen: u64) -> CopyCursor {
     }
 }
 
+/// Byte range of one persist chunk. `end` is always a char boundary.
+///
+/// A character that straddles the budget is included (at most 3 extra bytes)
+/// so the copy cannot stall on a multibyte edge and cannot slice mid-character.
+fn align_str_chunk(text: &str, offset: usize, budget: usize) -> (usize, usize) {
+    let len = text.len();
+    let offset = offset.min(len);
+    let start = text.floor_char_boundary(offset);
+    if start >= len || budget == 0 {
+        return (start, start);
+    }
+    let desired = start.saturating_add(budget).min(len);
+    let mut end = text.ceil_char_boundary(desired);
+    if end <= start {
+        end = text.ceil_char_boundary(start.saturating_add(1)).min(len);
+    }
+    if end <= start {
+        end = len;
+    }
+    (start, end)
+}
+
+fn align_rope_chunk(rope: &ropey::Rope, offset: usize, budget: usize) -> (usize, usize) {
+    let len = rope.len_bytes();
+    let offset = offset.min(len);
+    if offset >= len || budget == 0 {
+        return (offset, offset);
+    }
+    let start_char = rope.byte_to_char(offset);
+    let start = rope.char_to_byte(start_char);
+    let desired = start.saturating_add(budget).min(len);
+    let at = rope.byte_to_char(desired);
+    let at_start = rope.char_to_byte(at);
+    let mut end = if at_start == desired {
+        desired
+    } else {
+        let next = (at + 1).min(rope.len_chars());
+        rope.char_to_byte(next)
+    };
+    if end <= start && start < len {
+        let next = (start_char + 1).min(rope.len_chars());
+        end = rope.char_to_byte(next);
+    }
+    if end <= start {
+        end = len;
+    }
+    (start, end)
+}
+
+fn push_aligned(dest: &mut String, start: usize, piece: &str) {
+    if dest.len() > start {
+        dest.truncate(start);
+    }
+    dest.push_str(piece);
+}
+
 /// Copies at most [`PERSIST_CHUNK`] bytes from `state` into `cursor`.
+///
+/// Chunk ends snap to a UTF-8 char boundary on both the `Tab::input` /
+/// `Tab::output` string paths and the rope snapshot path. A fixed 4 MiB byte
+/// offset panics when it lands inside a multibyte character.
 fn step_copy(cursor: &mut CopyCursor, state: &AppState) -> CopyStep {
     if cursor.dest.len() != state.tabs.len() {
         return CopyStep::Restart;
@@ -393,31 +453,55 @@ fn step_copy(cursor: &mut CopyCursor, state: &AppState) -> CopyStep {
         if cursor.offset > src_len {
             return CopyStep::Restart;
         }
-        let take = (src_len - cursor.offset).min(budget);
-        if take > 0 {
-            let end = cursor.offset + take;
-            match cursor.field {
-                CopyField::Input => {
+        if cursor.offset < src_len {
+            let new_offset = match cursor.field {
+                CopyField::Input => match rope {
                     // The rope snapshot is immutable: a consistent document
                     // even while the user keeps typing into the live rope.
-                    let piece = match rope {
-                        Some(r) => r
-                            .slice(r.byte_to_char(cursor.offset)..r.byte_to_char(end))
-                            .to_string(),
-                        None => state.tabs[cursor.tab].input[cursor.offset..end].to_owned(),
-                    };
-                    cursor.dest[cursor.tab].input.push_str(&piece);
-                }
+                    Some(rope) => {
+                        let (start, end) = align_rope_chunk(rope, cursor.offset, budget);
+                        if end > start {
+                            let piece = rope
+                                .slice(rope.byte_to_char(start)..rope.byte_to_char(end))
+                                .to_string();
+                            push_aligned(&mut cursor.dest[cursor.tab].input, start, &piece);
+                        }
+                        end
+                    }
+                    None => {
+                        let src = &state.tabs[cursor.tab].input;
+                        let (start, end) = align_str_chunk(src, cursor.offset, budget);
+                        if end > start {
+                            push_aligned(
+                                &mut cursor.dest[cursor.tab].input,
+                                start,
+                                &src[start..end],
+                            );
+                        }
+                        end
+                    }
+                },
                 CopyField::Output => {
-                    cursor.dest[cursor.tab].output.push_str(
-                        &state.tabs[cursor.tab].output[cursor.offset..end],
-                    );
+                    let src = &state.tabs[cursor.tab].output;
+                    let (start, end) = align_str_chunk(src, cursor.offset, budget);
+                    if end > start {
+                        push_aligned(&mut cursor.dest[cursor.tab].output, start, &src[start..end]);
+                    }
+                    end
                 }
+            };
+            if new_offset <= cursor.offset {
+                // A chunk that cannot advance would spin `flush_persist`.
+                // Skip the rest of this field rather than panic or loop.
+                cursor.offset = src_len;
+                budget = budget.saturating_sub(1);
+            } else {
+                let copied = new_offset - cursor.offset;
+                cursor.offset = new_offset;
+                budget = budget.saturating_sub(copied);
             }
-            cursor.offset = end;
-            budget -= take;
         }
-        if cursor.offset == src_len {
+        if cursor.offset >= src_len {
             cursor.offset = 0;
             match cursor.field {
                 CopyField::Input => cursor.field = CopyField::Output,
@@ -553,8 +637,45 @@ fn drive_persist(state: &mut AppState, tx: &mut Tx) -> bool {
     changed
 }
 
+/// Surfaces a partial-load warning on the status line. `main::boot` only
+/// sees `Ok`/`Err` from [`crate::persist::load_tabs`], so skipped payloads
+/// would otherwise stay silent. No-op once the warning is taken or the user
+/// already has a status.
+fn apply_boot_warning(state: &mut AppState) -> bool {
+    if state.status.is_some() {
+        return false;
+    }
+    let Some(warning) = crate::persist::take_boot_warning() else {
+        return false;
+    };
+    state.dispatch(Msg::Status(format!("Could not load some tabs: {warning}")));
+    true
+}
+
+/// In-memory persist snapshot. Does not write the store.
+///
+/// Integration tests must use this instead of [`on_close`]. Those binaries
+/// compile this crate without `cfg(test)`, so [`on_close`] would call
+/// [`crate::persist::save_tabs`] and overwrite the real profile.
+pub fn copied_tabs(state: &AppState) -> Vec<Tab> {
+    let mut cursor = begin_copy(state, 0);
+    let mut steps = 0;
+    loop {
+        match step_copy(&mut cursor, state) {
+            CopyStep::Continue => {}
+            CopyStep::Done => return cursor.dest,
+            CopyStep::Restart => cursor = begin_copy(state, 0),
+        }
+        steps += 1;
+        if steps > 10_000 {
+            return cursor.dest;
+        }
+    }
+}
+
 /// Blocks until the latest tabs are saved. Used by [`on_close`] / [`on_quit`].
 fn flush_persist(state: &mut AppState) {
+    let _ = apply_boot_warning(state);
     with_persist(|ctrl| {
         ctrl.dirty = false;
         ctrl.copy = None;
@@ -657,7 +778,7 @@ fn restore_changed_scroll(state: &AppState, previous: Option<String>, tx: &mut T
 /// completed background jobs) and returns whether state changed.
 pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
     let previous_scroll_key = crate::ui::tabs::active_scroll_key(state);
-    let mut changed = false;
+    let mut changed = apply_boot_warning(state);
     let mut applied = false;
     loop {
         let mut messages = state.take_pending();
@@ -1358,5 +1479,65 @@ mod tests {
             }
             poll(&mut state, 0.0, &mut tx);
         }
+    }
+
+    /// C1: a multibyte character straddling the 4 MiB chunk edge must not panic,
+    /// and both the string and rope copy paths must reassemble the document.
+    #[test]
+    fn step_copy_snaps_multibyte_chunk_edges() {
+        let mut state = AppState::default();
+        let input = format!("\"{}🚀\"", "a".repeat((4 << 20) - 2));
+        let output = format!("{}é", "b".repeat((4 << 20) - 1));
+        assert!(!input.is_char_boundary(4 * 1024 * 1024));
+        assert!(!output.is_char_boundary(4 * 1024 * 1024));
+        state.update(Msg::InputChanged(input.clone()));
+        state.tabs[0].output = output.clone();
+
+        let mut cursor = begin_copy(&state, 0);
+        let mut steps = 0;
+        loop {
+            match step_copy(&mut cursor, &state) {
+                CopyStep::Continue => {}
+                CopyStep::Done => break,
+                CopyStep::Restart => panic!("copy restarted on an unchanged tab set"),
+            }
+            steps += 1;
+            assert!(steps < 64, "chunked copy did not finish");
+        }
+        assert_eq!(cursor.dest[0].input, input);
+        assert_eq!(cursor.dest[0].output, output);
+    }
+
+    /// Same boundary, copied from a dirty rope snapshot rather than `Tab::input`.
+    #[test]
+    fn step_copy_rope_snapshot_snaps_multibyte_chunk_edge() {
+        let mut state = AppState::default();
+        let id = state.active;
+        let input = format!("\"{}🚀\"", "a".repeat((4 << 20) - 2));
+        assert!(!input.is_char_boundary(4 * 1024 * 1024));
+        state.update(Msg::InputChanged(input.clone()));
+        let revision = state.tab(id).unwrap().input_revision;
+        // A paste that crosses empty→non-empty materializes and clears dirty.
+        // Mark the synced rope dirty so persist takes the rope path.
+        crate::editor::state::with(id, &input, revision, |ed| {
+            ed.dirty = true;
+        });
+        assert!(
+            crate::editor::state::dirty_snapshot(id).is_some(),
+            "persist copy should see a dirty rope"
+        );
+        let mut cursor = begin_copy(&state, 0);
+        assert!(cursor.inputs[0].is_some(), "copy should snapshot the rope");
+        let mut steps = 0;
+        loop {
+            match step_copy(&mut cursor, &state) {
+                CopyStep::Continue => {}
+                CopyStep::Done => break,
+                CopyStep::Restart => panic!("copy restarted on an unchanged tab set"),
+            }
+            steps += 1;
+            assert!(steps < 64, "chunked copy did not finish");
+        }
+        assert_eq!(cursor.dest[0].input, input);
     }
 }
