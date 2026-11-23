@@ -13,6 +13,7 @@
 
 pub mod buffer;
 pub mod keys;
+pub mod lex;
 pub mod state;
 pub mod view;
 

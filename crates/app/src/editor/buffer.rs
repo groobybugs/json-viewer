@@ -63,6 +63,10 @@ pub struct Buffer {
     /// Set by [`Buffer::break_group`]; the next edit starts a fresh step even
     /// if it is contiguous with the previous typing.
     break_pending: bool,
+    /// Bounded log of (revision, touched byte range) for every mutation, in
+    /// revision order. Lets cached per-line analysis (lexer checkpoints)
+    /// prove an edit did not touch a line without rescanning it.
+    recent: VecDeque<(u64, Range<usize>)>,
 }
 
 impl Buffer {
@@ -104,6 +108,33 @@ impl Buffer {
     /// O(1) snapshot for background jobs; later edits never touch it.
     pub fn snapshot(&self) -> Rope {
         self.rope.clone()
+    }
+
+    /// Byte ranges touched by mutations newer than `revision`, or `None`
+    /// when the log cannot prove coverage back to that revision (too old,
+    /// or cleared). `Some(empty)` means nothing changed since.
+    pub fn edits_since(&self, revision: u64) -> Option<Vec<Range<usize>>> {
+        if revision == self.revision {
+            return Some(Vec::new());
+        }
+        let front = self.recent.front()?;
+        if front.0 > revision + 1 {
+            return None;
+        }
+        Some(
+            self.recent
+                .iter()
+                .filter(|(rev, _)| *rev > revision)
+                .map(|(_, range)| range.clone())
+                .collect(),
+        )
+    }
+
+    fn note_edit(&mut self, range: Range<usize>) {
+        self.recent.push_back((self.revision, range));
+        while self.recent.len() > 1024 {
+            self.recent.pop_front();
+        }
     }
 
     // ── Offset mapping ───────────────────────────────────────────────────
@@ -177,6 +208,7 @@ impl Buffer {
         }
         self.rope.insert(self.rope.byte_to_char(offset), text);
         self.revision += 1;
+        self.note_edit(offset..offset + text.len());
         self.push_edit(
             Edit {
                 offset,
@@ -204,6 +236,7 @@ impl Buffer {
         let chars = self.rope.byte_to_char(range.start)..self.rope.byte_to_char(range.end);
         self.rope.remove(chars);
         self.revision += 1;
+        self.note_edit(range.clone());
         self.push_edit(
             Edit {
                 offset: range.start,
@@ -233,6 +266,7 @@ impl Buffer {
         self.rope.remove(chars);
         self.rope.insert(self.rope.byte_to_char(range.start), text);
         self.revision += 1;
+        self.note_edit(range.start..range.start + removed.len().max(text.len()));
         self.push_edit(
             Edit {
                 offset: range.start,
@@ -287,6 +321,8 @@ impl Buffer {
     pub fn set_text(&mut self, text: &str) {
         self.rope = Rope::from_str(text);
         self.revision += 1;
+        self.recent.clear();
+        self.note_edit(0..text.len());
         self.undo.clear();
         self.redo.clear();
         self.undo_bytes = 0;
@@ -317,6 +353,7 @@ impl Buffer {
         self.revision += 1;
         self.break_pending = true;
         let caret = edit.caret_before;
+        self.note_edit(edit.offset..edit.offset + edit.removed.len().max(edit.inserted.len()));
         self.redo_bytes += edit.removed.len() + edit.inserted.len();
         self.redo.push_back(edit);
         cap_history(&mut self.redo, &mut self.redo_bytes);
@@ -338,6 +375,7 @@ impl Buffer {
         self.revision += 1;
         self.break_pending = true;
         let caret = edit.caret_after;
+        self.note_edit(edit.offset..edit.offset + edit.removed.len().max(edit.inserted.len()));
         self.undo_bytes += edit.removed.len() + edit.inserted.len();
         self.undo.push_back(edit);
         cap_history(&mut self.undo, &mut self.undo_bytes);

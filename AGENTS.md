@@ -30,6 +30,7 @@ crates/app/
     editor/                    Zed-style large-file input editor (rp-editor)
       buffer.rs                ropey buffer + grouped undo/redo + O(1) snapshots
       state.rs                 per-tab caret/selection store + semantic actions
+      lex.rs                   exact window lexer state: 64 KB checkpoints
       view.rs                  visible-line rope rendering + mouse + cache
       keys.rs                  keyboard, clipboard routing, IME
     headless.rs                offscreen PNG + element-tree dump
@@ -303,11 +304,21 @@ without a mounted row) and places the caret on the validation error.
 
 Very long lines are never materialized: each row slices only its visible
 column window (`VISIBLE_COLUMNS`, narrowed to the viewport width) straight
-from the rope and tokenizes that window; a bounded 512-byte quote-parity
-lookback decides whether the window starts inside a JSON string. A
-thread-local content-hash cache (`(tab, line, window bounds, hash)`) skips
-re-slicing/re-tokenizing unchanged windows; Rune's own shape cache keys on
-the display string, so unchanged lines are not reshaped. Caret (inline
+from the rope and tokenizes that window. The window's starting lexer state
+is **exact** (`editor/lex.rs`): per-line checkpoints every 64 KB
+(`LexState { in_string, escaped }`), built lazily off the UI thread above
+256 KB and invalidated through the buffer's bounded edit log
+(`Buffer::edits_since`); checkpoints before the first edit touching the line
+are salvaged, so an edited line lexes from the nearest valid checkpoint
+(≤64 KB scan) while a worker rebuilds. Ink decisions that need bytes past the
+window end (key `:` lookahead, literals cut by the edge, a string cut before
+its closing quote) use a bounded tail/forward scan, so windowed colors equal
+whole-line lexing — `tests/editor_lex.rs` asserts that at many columns
+(inside strings, right after `\"` and `\\`, stride and window edges) and
+after edits/undo. A thread-local content-hash cache (`(tab, line, window
+bounds, hash, lex state, tail)`) skips re-slicing/re-tokenizing unchanged
+windows; Rune's own shape cache keys on the display string, so unchanged
+lines are not reshaped. Caret (inline
 2 pt bar splitting the row text), selection (`Span::bg`), error marker
 (row tint + underline + gutter dot + `editor-{id}-error-dot`/`-error-label`
 strip, same keys as the old editable error view) and IME preedit are drawn
@@ -358,6 +369,10 @@ still a `String` (measured: the 100 MB snapshot-step test stays <30 ms).
 
 - `cargo test -p json-viewer --test editor` — render/mouse/keys/IME/cut/
   paste evidence, PNGs in `target/headless/editor-*.png`.
+- `cargo test -p json-viewer --test editor_lex` — windowed colors equal
+  whole-line lexing at many columns/widths (escaped quotes/backslashes,
+  stride and window edges), checkpoint invalidation on edits, reuse on
+  other-line edits, and off-thread publication.
 - `cargo test --release -p json-viewer --test editor -- --ignored --nocapture`
   — 100 MB windowing: load 45 ms, first frame 90 ms, scroll-to-middle
   2.8 ms, caret-move p95 0.6 ms, 59 rows mounted (3.85M lines).
@@ -368,13 +383,15 @@ still a `String` (measured: the 100 MB snapshot-step test stays <30 ms).
 
   | Variant | MiB | Lines | Load ms | First frame ms | Key p95 ms | Paste 1KB ms | Paste 10MB ms | Undo 10MB ms | SelAll+Del ms | VmHWM MiB |
   | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-  | pretty 1 | 1.00 | 38917 | 0.1 | 12.8 | 1.01 | 1.2 | 24.3 | 1.4 | 2.4 | 182 |
-  | pretty 10 | 10.00 | 387153 | 4.3 | 16.8 | 1.04 | 7.4 | 26.6 | 1.3 | 4.9 | 244 |
-  | pretty 100 | 100.00 | 3851257 | 42.9 | 74.6 | 1.04 | 45.8 | 64.2 | 1.3 | 52.5 | 619 |
-  | single-line 6.9 | 6.58 | 1 | 0.6 | 18.5 | 0.43 | 1.6 | 16.7 | 1.0 | 3.3 | 619 |
+  | pretty 1 | 1.00 | 38917 | 0.1 | 12.6 | 1.04 | 1.2 | 27.1 | 5.0 | 1.9 | 192 |
+  | pretty 10 | 10.00 | 387153 | 4.2 | 17.8 | 1.09 | 6.9 | 38.4 | 5.4 | 5.2 | 254 |
+  | pretty 100 | 100.00 | 3851257 | 41.5 | 73.0 | 1.07 | 45.6 | 64.5 | 5.2 | 49.0 | 620 |
+  | single-line 6.9 | 6.58 | 1 | 0.5 | 19.9 | 3.66 | 2.1 | 19.7 | 5.3 | 3.7 | 620 |
 
-  Keystroke cost is size-independent (~1 ms p95 everywhere, start/middle/end
-  within 0.4 ms of each other); every row passes p95 <16 ms and first frame
+  Keystroke cost is size-independent (~1 ms p95 on pretty documents;
+  start/middle/end within 0.4 ms of each other); the single-line row pays
+  ≤3.7 ms p95 for exact checkpoint maintenance while editing a 6.9 MB line.
+  Every row passes p95 <16 ms and first frame
   <250 ms. VmHWM is process-wide/cumulative across the run. PNGs:
   `target/headless/rope-100mb-middle-selection.png` (mid-file caret + word
   selection at line 1,927,667), `rope-single-line-col-3m.png` (editing at

@@ -55,16 +55,6 @@ fn mono() -> tok::TextStyle {
     tok::TextStyle::new(12.0, 400.0).mono()
 }
 
-fn palette() -> (Color, Color, Color, Color, Color) {
-    (
-        rune::oklch(0.72, 0.14, 250.0), // object keys
-        rune::oklch(0.82, 0.12, 145.0), // strings
-        rune::oklch(0.84, 0.13, 65.0),  // numbers
-        rune::oklch(0.76, 0.15, 320.0), // true / false / null
-        rune::oklch(0.66, 0.02, 260.0), // punctuation
-    )
-}
-
 /// Row key of a 0-based document line; matches `TextView::row_key(base, l)`
 /// so existing reveal callers (`validation_panel`) keep working.
 pub fn row_key(base: &str, line: usize) -> String {
@@ -399,10 +389,20 @@ fn cached_window(
     line_start: usize,
 ) -> CachedWindow {
     let slice = buf.slice_bytes(col_start..col_end);
-    let in_string = starts_inside_string(buf, line_start, col_start);
+    // Exact lexer state at the window start (checkpoints, see editor::lex).
+    let lex = super::lex::window_state(id, line, buf, col_start);
+    let line_end = buf.line_byte_range(line).end;
+    let tail = super::lex::tail_for(buf, col_end, line_end);
+    let cut_key = if lex.advance(slice.as_bytes()).in_string {
+        Some(super::lex::cut_string_is_key(buf, col_end, line_end))
+    } else {
+        None
+    };
     let mut hasher = FxHasher::default();
     slice.hash(&mut hasher);
-    in_string.hash(&mut hasher);
+    lex.hash(&mut hasher);
+    tail.hash(&mut hasher);
+    cut_key.hash(&mut hasher);
     let hash = hasher.finish();
     let key = (id, line, col_start, col_end, hash);
     CACHE.with(|cache| {
@@ -411,7 +411,7 @@ fn cached_window(
             return clone_window(hit);
         }
         let left_elided = col_start > line_start;
-        let right_elided = col_end < buf.line_byte_range(line).end;
+        let right_elided = col_end < line_end;
         let mut display = String::with_capacity(slice.len() + 6);
         if left_elided {
             display.push('…');
@@ -421,7 +421,7 @@ fn cached_window(
         if right_elided {
             display.push('…');
         }
-        let tokens = window_tokens(&slice, span_offset, in_string);
+        let tokens = super::lex::json_tokens(&slice, span_offset, lex, &tail, cut_key);
         let entry = CachedWindow {
             display,
             span_offset,
@@ -446,111 +446,6 @@ fn clone_window(w: &CachedWindow) -> CachedWindow {
     }
 }
 
-/// Bounded lookback (512 bytes): is `col_start` inside a JSON string?
-/// Unescaped-quote parity over the lookback approximates the string state
-/// (exact when the opening quote is within the window; an opener farther
-/// back reads as plain text — coloring only, never correctness).
-fn starts_inside_string(buf: &super::buffer::Buffer, line_start: usize, col_start: usize) -> bool {
-    if col_start <= line_start {
-        return false;
-    }
-    let lo = line_start.max(col_start.saturating_sub(512));
-    let lookback = buf.slice_bytes(lo..col_start);
-    let bytes = lookback.as_bytes();
-    let mut quotes = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[i] == b'"' {
-            quotes += 1;
-        }
-        i += 1;
-    }
-    quotes % 2 == 1
-}
-
-/// JSON token colors for one window. When the window starts inside a
-/// string, a synthetic opening quote is prepended for the tokenizer and
-/// clipped off the resulting spans.
-fn window_tokens(slice: &str, offset: usize, in_string: bool) -> Vec<(Range<usize>, Color)> {
-    let (key_ink, string_ink, number_ink, literal_ink, punctuation_ink) = palette();
-    let owned;
-    let text: &str = if in_string {
-        owned = format!("\"{slice}");
-        &owned
-    } else {
-        slice
-    };
-    let shift = if in_string { offset.saturating_sub(1) } else { offset };
-    let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let start = i;
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'"' {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                let mut look = i;
-                while look < bytes.len() && (bytes[look] == b' ' || bytes[look] == b'\t') {
-                    look += 1;
-                }
-                let ink = if look < bytes.len() && bytes[look] == b':' {
-                    key_ink
-                } else {
-                    string_ink
-                };
-                tokens.push((shift + start..shift + i, ink));
-            }
-            b'-' | b'0'..=b'9' => {
-                i += 1;
-                while i < bytes.len()
-                    && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                {
-                    i += 1;
-                }
-                tokens.push((shift + start..shift + i, number_ink));
-            }
-            b't' | b'f' | b'n' => {
-                let literal: &[u8] = match bytes[i] {
-                    b't' => b"true",
-                    b'f' => b"false",
-                    _ => b"null",
-                };
-                if bytes[i..].starts_with(literal) {
-                    i += literal.len();
-                    tokens.push((shift + start..shift + i, literal_ink));
-                } else {
-                    i += 1;
-                }
-            }
-            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
-                i += 1;
-                tokens.push((shift + start..shift + i, punctuation_ink));
-            }
-            _ => i += 1,
-        }
-    }
-    if in_string {
-        for (range, _) in &mut tokens {
-            range.start = range.start.max(offset);
-        }
-        tokens.retain(|(range, _)| range.start < range.end);
-    }
-    tokens
-}
 
 // ── Mouse ────────────────────────────────────────────────────────────────
 
