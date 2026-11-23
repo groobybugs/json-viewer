@@ -34,14 +34,20 @@ fn target_dir() -> PathBuf {
 }
 
 fn doc_state(doc: String) -> AppState {
+    doc_state_rev(doc, 0)
+}
+
+fn doc_state_rev(doc: String, revision: u64) -> AppState {
     let mut state = AppState::default();
     state.tabs[0].view = TabView::Output;
     state.tabs[0].output = doc;
+    state.tabs[0].output_revision = revision;
     state
 }
 
 fn scroller(state: &AppState, first_column: usize, visible_columns: usize, hscroll: bool) -> El {
     let body = TextView::read_only(&state.tabs[0].output)
+        .revision(state.tabs[0].output_revision)
         .line_numbers(true)
         .first_column(first_column)
         .visible_columns(visible_columns)
@@ -356,8 +362,9 @@ fn headless_pngs_and_frame_timings() {
     // The JSON worker owns the output String; converting it to Arc<str> and
     // building the index happens on that worker, never in the view.
     let owned: Arc<str> = Arc::from(doc.as_str());
+    let revision = line_index::next_revision();
     let started = Instant::now();
-    let snapshot = line_index::prewarm_off_thread(owned)
+    let snapshot = line_index::prewarm_off_thread(owned, revision)
         .join()
         .expect("prewarm thread panicked");
     let index_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -371,7 +378,7 @@ fn headless_pngs_and_frame_timings() {
     assert!(!snapshot.is_partial());
 
     let cached = Instant::now();
-    let again = line_index::snapshot(&doc);
+    let again = line_index::snapshot_for_revision(&doc, revision);
     println!(
         "LINE_INDEX_CACHED_LOOKUP_US={:.1}",
         cached.elapsed().as_secs_f64() * 1_000_000.0
@@ -381,7 +388,7 @@ fn headless_pngs_and_frame_timings() {
 
     // ── Frame timings at top / middle / bottom (release) ───────────────
     {
-        let mut rt = fresh_runtime(doc_state(doc.clone()), view_default, SIZE);
+        let mut rt = fresh_runtime(doc_state_rev(doc.clone(), revision), view_default, SIZE);
         let top = Instant::now();
         rt.frame(1.0 / 60.0);
         println!("FRAME_TOP_MS={:.3}", top.elapsed().as_secs_f64() * 1000.0);
@@ -431,8 +438,9 @@ fn headless_pngs_and_frame_timings() {
 
         // Full index for the column-50M window is built off the UI thread.
         let owned: Arc<str> = Arc::from(minified.as_str());
+        let revision = line_index::next_revision();
         let started = Instant::now();
-        let warmed = line_index::prewarm_off_thread(owned)
+        let warmed = line_index::prewarm_off_thread(owned, revision)
             .join()
             .expect("prewarm thread panicked");
         println!(
@@ -443,7 +451,7 @@ fn headless_pngs_and_frame_timings() {
         assert_eq!(warmed.line_count(), 1);
 
         let start_tree = render(
-            doc_state(minified.clone()),
+            doc_state_rev(minified.clone(), revision),
             view_long_start,
             &gpu,
             &directory.join("text-view-long-line-start.png"),
@@ -457,7 +465,7 @@ fn headless_pngs_and_frame_timings() {
         assert!(start_tree.to_string().contains("output-text-row-0"));
 
         let middle_tree = render(
-            doc_state(minified),
+            doc_state_rev(minified, revision),
             view_long_middle,
             &gpu,
             &directory.join("text-view-long-line-middle.png"),

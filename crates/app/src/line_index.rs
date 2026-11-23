@@ -5,18 +5,20 @@
 //! splitting or shaping the rest of the text: a 100 MB / 2M-line file costs one
 //! index build, then O(visible rows) per frame.
 //!
-//! [`snapshot`] memoizes the index by a cheap content fingerprint, so repeated
-//! `TextView::build` calls across frames never rebuild it. A cold miss on a
-//! large document does **no O(document) work on the UI thread**: it copies and
-//! scans only [`PARTIAL_SCAN_BYTES`] (enough to mount the first viewport) and
-//! returns a provisional snapshot. The caller's background job then calls
-//! [`prewarm_off_thread`] with the owned text to build the full index off the
-//! UI thread and replace the provisional entry. Small documents are indexed
-//! synchronously (the cost is bounded by [`LARGE_DOCUMENT_BYTES`]).
+//! [`snapshot_for_revision`] memoizes the index by the reducer-assigned
+//! document revision, so repeated `TextView::build` calls across frames never
+//! rebuild it and a different document can never reuse a stale index. A cold
+//! miss on a large document does **no O(document) work on the UI thread**: it
+//! copies and scans only [`PARTIAL_SCAN_BYTES`] (enough to mount the first
+//! viewport) and returns a provisional snapshot. The caller's background job
+//! then calls [`prewarm_off_thread`] with the owned text to build the full
+//! index off the UI thread and replace the provisional entry. Small documents
+//! are indexed synchronously (the cost is bounded by [`LARGE_DOCUMENT_BYTES`]).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -30,34 +32,43 @@ pub const PARTIAL_SCAN_BYTES: usize = 64 * 1024;
 const MAX_CACHED_DOCS: usize = 8;
 const MAX_CACHED_BYTES: usize = 256 * 1024 * 1024;
 
-/// O(1) content identity. Two clones of the same document at different
-/// addresses share one index; a reused address with different content does not
-/// (the 32-byte head/tail samples catch that).
+/// O(1) cache identity for a document.
+///
+/// A reducer-assigned revision ([`TextKey::for_revision`]) is globally unique,
+/// so two documents that share a length and edge bytes can never reuse each
+/// other's line index. Paths without a revision (tests, one-off snapshots) key
+/// by the exact buffer address and length, which is stable while that buffer
+/// is alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextKey {
+    revision: u64,
+    ptr: usize,
     len: usize,
-    head: [u8; 32],
-    tail: [u8; 32],
 }
 
 impl TextKey {
     pub fn of(text: &str) -> Self {
-        let bytes = text.as_bytes();
-        let mut head = [0u8; 32];
-        let mut tail = [0u8; 32];
-        let h = bytes.len().min(32);
-        head[..h].copy_from_slice(&bytes[..h]);
-        let t = bytes.len().min(32);
-        tail[..t].copy_from_slice(&bytes[bytes.len() - t..]);
         Self {
-            len: bytes.len(),
-            head,
-            tail,
+            revision: 0,
+            ptr: text.as_ptr() as usize,
+            len: text.len(),
+        }
+    }
+
+    pub fn for_revision(revision: u64) -> Self {
+        debug_assert_ne!(revision, 0, "revision 0 is reserved for buffer keys");
+        Self {
+            revision,
+            ptr: 0,
+            len: 0,
         }
     }
 
     /// Stable version for `El::virtual_rows_version`.
     pub fn version(&self) -> u64 {
+        if self.revision != 0 {
+            return self.revision;
+        }
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish()
@@ -195,6 +206,15 @@ impl Snapshot {
     /// documents, via `prewarm_off_thread`).
     pub fn new(text: Arc<str>) -> Self {
         let key = TextKey::of(&text);
+        Self::full_with_key(text, key)
+    }
+
+    /// Full snapshot keyed by a reducer-assigned document revision.
+    pub fn new_for_revision(text: Arc<str>, revision: u64) -> Self {
+        Self::full_with_key(text, TextKey::for_revision(revision))
+    }
+
+    fn full_with_key(text: Arc<str>, key: TextKey) -> Self {
         let index = Arc::new(LineIndex::build(&text));
         Self {
             text,
@@ -207,7 +227,10 @@ impl Snapshot {
     /// Provisional snapshot: copies and scans only the first
     /// `PARTIAL_SCAN_BYTES` of `text`, so a cold first render is O(window).
     pub fn provisional(text: &str) -> Self {
-        let key = TextKey::of(text);
+        Self::provisional_with_key(text, TextKey::of(text))
+    }
+
+    fn provisional_with_key(text: &str, key: TextKey) -> Self {
         let end = floor_boundary(text, PARTIAL_SCAN_BYTES.min(text.len()));
         let prefix: Arc<str> = Arc::from(&text[..end]);
         let index = Arc::new(LineIndex::partial(&prefix, text.len()));
@@ -314,14 +337,22 @@ fn insert(snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
 /// a small document is indexed synchronously (bounded by
 /// [`LARGE_DOCUMENT_BYTES`]).
 pub fn snapshot(text: &str) -> Arc<Snapshot> {
-    let key = TextKey::of(text);
+    snapshot_keyed(text, TextKey::of(text))
+}
+
+/// Returns the shared snapshot for a reducer-assigned document revision.
+pub fn snapshot_for_revision(text: &str, revision: u64) -> Arc<Snapshot> {
+    snapshot_keyed(text, TextKey::for_revision(revision))
+}
+
+fn snapshot_keyed(text: &str, key: TextKey) -> Arc<Snapshot> {
     if let Some(hit) = lock().entries.get(&key).cloned() {
         return hit;
     }
     let built = if text.len() >= LARGE_DOCUMENT_BYTES {
-        Snapshot::provisional(text)
+        Snapshot::provisional_with_key(text, key)
     } else {
-        Snapshot::new(Arc::from(text))
+        Snapshot::full_with_key(Arc::from(text), key)
     };
     insert(Arc::new(built))
 }
@@ -335,8 +366,15 @@ pub fn cached_snapshot(text: &str) -> Option<Arc<Snapshot>> {
 /// Builds the full index and caches it on a worker thread. The caller already
 /// owns `text` (the JSON worker's result), so no copy or scan happens on the
 /// UI thread. Join the handle before rendering to keep the first frame O(1).
-pub fn prewarm_off_thread(text: Arc<str>) -> JoinHandle<Arc<Snapshot>> {
-    std::thread::spawn(move || insert(Arc::new(Snapshot::new(text))))
+pub fn prewarm_off_thread(text: Arc<str>, revision: u64) -> JoinHandle<Arc<Snapshot>> {
+    std::thread::spawn(move || insert(Arc::new(Snapshot::new_for_revision(text, revision))))
+}
+
+/// Reserves a globally unique document revision. Revisions are never reused,
+/// so a cache entry can never be mistaken for a different document.
+pub fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Test helper: number of live snapshots.
@@ -404,23 +442,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_memoized_by_content_not_address() {
-        // Distinct content keeps this test independent of the parallel cache.
+    fn snapshot_is_memoized_by_revision() {
         let owned = "memo-unique\nb\nc".to_string();
-        let first = snapshot(&owned);
+        let revision = next_revision();
+        let first = snapshot_for_revision(&owned, revision);
         let clone = owned.clone();
-        let second = snapshot(&clone);
+        let second = snapshot_for_revision(&clone, revision);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.line_count(), 3);
         assert_eq!(first.line(1), Some("b"));
+
+        // Identical text with a different revision is a different document.
+        let third = snapshot_for_revision(&owned, next_revision());
+        assert!(!Arc::ptr_eq(&first, &third));
     }
 
     #[test]
     fn prewarm_publishes_the_same_snapshot() {
         let text: Arc<str> = Arc::from("prewarm-unique\nb\nc");
-        let handle = prewarm_off_thread(Arc::clone(&text));
+        let revision = next_revision();
+        let handle = prewarm_off_thread(Arc::clone(&text), revision);
         let warmed = handle.join().expect("prewarm thread panicked");
-        assert!(Arc::ptr_eq(&warmed, &snapshot(&text)));
+        assert!(Arc::ptr_eq(
+            &warmed,
+            &snapshot_for_revision(&text, revision)
+        ));
         assert_eq!(warmed.line_count(), 3);
     }
 
@@ -439,14 +485,43 @@ mod tests {
     #[test]
     fn prewarm_replaces_the_provisional_snapshot() {
         let text: Arc<str> = Arc::from("y".repeat(LARGE_DOCUMENT_BYTES + 10));
-        let cold = snapshot(&text);
+        let revision = next_revision();
+        let cold = snapshot_for_revision(&text, revision);
         assert!(cold.is_partial());
-        let warmed = prewarm_off_thread(Arc::clone(&text))
+        let warmed = prewarm_off_thread(Arc::clone(&text), revision)
             .join()
             .expect("prewarm thread panicked");
         assert!(!warmed.is_partial());
         assert_eq!(warmed.line_count(), 1);
         assert_eq!(warmed.index().total_len(), text.len());
-        assert!(Arc::ptr_eq(&warmed, &snapshot(&text)));
+        assert!(Arc::ptr_eq(
+            &warmed,
+            &snapshot_for_revision(&text, revision)
+        ));
+    }
+
+    #[test]
+    fn revision_key_does_not_reuse_a_stale_index_for_identical_edges() {
+        let head = "H".repeat(32);
+        let tail = "T".repeat(32);
+        let with_newlines = format!("{head}{}{tail}", "a\n".repeat(68));
+        let without_newlines = format!("{head}{}{tail}", "a".repeat(136));
+
+        // The old len + head/tail key could not tell these apart.
+        assert_eq!(with_newlines.len(), without_newlines.len());
+        assert_eq!(&with_newlines[..32], &without_newlines[..32]);
+        assert_eq!(
+            &with_newlines[with_newlines.len() - 32..],
+            &without_newlines[without_newlines.len() - 32..]
+        );
+
+        clear_cache();
+        let first = snapshot_for_revision(&with_newlines, next_revision());
+        let second = snapshot_for_revision(&without_newlines, next_revision());
+        assert_eq!(first.line_count(), 69);
+        assert_eq!(second.line_count(), 1);
+        assert_eq!(first.index().line_start(1), Some(34));
+        assert_eq!(second.index().line_start(1), None);
+        assert_ne!(first.key(), second.key());
     }
 }

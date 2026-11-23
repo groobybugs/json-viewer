@@ -3,9 +3,13 @@
 //! the element tree and application state.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use json_viewer::state::{AppState, TabView};
+use json_viewer::json_ops::{self, JsonAction};
+use json_viewer::search::{self, SearchOptions};
+use json_viewer::state::{AppState, Msg, TabView};
+use json_viewer::ui::text_view::TextView;
 use json_viewer::{headless, runner};
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::Runtime;
@@ -220,15 +224,86 @@ fn scripted_invalid_json_shows_error() {
 }
 
 #[test]
-#[ignore = "needs rp-ui (on_drop_files on root)"]
 fn scripted_file_drop_loads_tab() {
-    // Once ui::view attaches `.on_drop_files(...)`, simulate dropping a JSON
-    // file onto the window root and assert the active tab loads its contents.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("dropped.json");
+    std::fs::write(&path, r#"{"dropped":true}"#).expect("write dropped fixture");
+
+    let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
+    rt.frame(0.0);
+    let (x, y) = find_center(&rt, "json-drop-zone");
+    rt.drop_files(vec![path], Some((x, y)));
+    pump_until(&mut rt, "dropped file loaded", |s| {
+        s.active_tab()
+            .is_some_and(|t| t.input.contains("\"dropped\""))
+    });
+
+    let tree = render_qa_png(&mut rt, "file-drop");
+    assert!(
+        tree.to_string().contains("dropped"),
+        "expected dropped JSON in the editor"
+    );
 }
 
 #[test]
-#[ignore = "needs rp-ui (search hit jump-to-line)"]
 fn scripted_search_hit_scrolls_output_to_line() {
-    // Once search result rows are clickable and call Tx::scroll_into_view,
-    // click a hit and assert the output viewport scrolls to that line.
+    let mut input = String::from("{\"items\":[");
+    for index in 0..120 {
+        if index > 0 {
+            input.push(',');
+        }
+        input.push_str(&format!("{{\"id\":\"item-{index:03}\"}}"));
+    }
+    input.push_str("]}");
+    let formatted = json_ops::process(&input, JsonAction::Format).expect("format fixture");
+
+    let cancel = AtomicBool::new(false);
+    let hits = search::search(
+        &formatted,
+        "item-100",
+        SearchOptions::default(),
+        &cancel,
+    );
+    let hit = hits.first().expect("fixture has one hit").clone();
+    let line = hit.line.expect("value hit has a line");
+    assert!(line > 100, "hit should be far down the document");
+
+    let mut state = AppState::default();
+    state.tabs[0].input = input;
+    state.tabs[0].search_query = "item-100".into();
+    let tab = state.active;
+    state.apply_json_result(tab, Ok(formatted));
+    state.update(Msg::SearchDone {
+        tab,
+        hits: vec![hit],
+    });
+
+    let mut rt = headless::runtime(state, headless::DEFAULT_SIZE, 1.0);
+    rt.frame(0.0);
+    click(&mut rt, "search-hit-0");
+    pump_until(&mut rt, "switched to output", |s| {
+        s.active_tab().is_some_and(|t| t.view == TabView::Output)
+    });
+
+    let row = TextView::row_key("output-text", line - 1);
+    let mut mounted = false;
+    for _ in 0..30 {
+        rt.update_if(|state, tx| runner::poll(state, 0.0, tx));
+        rt.settle_all();
+        rt.frame(1.0 / 60.0);
+        if rt.find(&row).is_some() {
+            mounted = true;
+            break;
+        }
+    }
+    assert!(
+        mounted,
+        "search hit line {line} should reveal row {row} in the output viewport"
+    );
+
+    let tree = render_qa_png(&mut rt, "search-jump");
+    assert!(
+        tree.to_string().contains("item-100"),
+        "expected the target line content after the jump"
+    );
 }

@@ -60,6 +60,12 @@ pub struct Tab {
     /// Hits from the last completed search.
     #[serde(default)]
     pub search_results: Vec<SearchHit>,
+    /// Revision of `input`, bumped whenever the source text changes.
+    #[serde(default)]
+    pub input_revision: u64,
+    /// Revision of `output`, assigned by the JSON worker on every success.
+    #[serde(default)]
+    pub output_revision: u64,
 }
 
 impl Tab {
@@ -75,6 +81,8 @@ impl Tab {
             view: TabView::Input,
             search_query: String::new(),
             search_results: Vec::new(),
+            input_revision: 0,
+            output_revision: 0,
         }
     }
 }
@@ -181,6 +189,7 @@ impl AppState {
         if let Some(tab) = self.tab_mut(id) {
             if tab.input != text {
                 tab.input = text;
+                tab.input_revision = crate::line_index::next_revision();
                 tab.error = None;
             }
         }
@@ -232,6 +241,7 @@ impl AppState {
             return;
         };
         tab.input = input.clone();
+        tab.input_revision = crate::line_index::next_revision();
         tab.error = None;
         if let Some(edit) = self.editors.get_mut(&id) {
             if edit.text != input {
@@ -248,6 +258,8 @@ impl AppState {
         };
         tab.input.clear();
         tab.output.clear();
+        tab.input_revision = crate::line_index::next_revision();
+        tab.output_revision = crate::line_index::next_revision();
         tab.error = None;
         tab.is_processing = false;
         tab.view = TabView::Input;
@@ -262,6 +274,18 @@ impl AppState {
     /// failure replaces `error` and leaves the previous output untouched.
     /// Returns `true` on success.
     pub fn apply_json_result(&mut self, id: TabId, result: Result<String, JsonError>) -> bool {
+        let revision = crate::line_index::next_revision();
+        self.apply_json_result_with_revision(id, revision, result)
+    }
+
+    /// Applies a finished job whose output revision was assigned by the JSON
+    /// worker, so the prewarmed line index matches the one the view requests.
+    fn apply_json_result_with_revision(
+        &mut self,
+        id: TabId,
+        revision: u64,
+        result: Result<String, JsonError>,
+    ) -> bool {
         let Some(tab) = self.tab_mut(id) else {
             return false;
         };
@@ -269,6 +293,7 @@ impl AppState {
         match result {
             Ok(output) => {
                 tab.output = output;
+                tab.output_revision = revision;
                 tab.error = None;
                 true
             }
@@ -428,8 +453,12 @@ impl AppState {
                     query,
                 }]
             }
-            Msg::JsonDone { tab, result } => {
-                let ok = self.apply_json_result(tab, result);
+            Msg::JsonDone {
+                tab,
+                revision,
+                result,
+            } => {
+                let ok = self.apply_json_result_with_revision(tab, revision, result);
                 if ok {
                     vec![Effect::Persist]
                 } else {
@@ -513,6 +542,8 @@ pub enum Msg {
     /// Background JSON work finished.
     JsonDone {
         tab: TabId,
+        /// Revision the worker used to prewarm the line index.
+        revision: u64,
         result: Result<String, JsonError>,
     },
     /// Background search finished.

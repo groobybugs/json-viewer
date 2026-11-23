@@ -5,6 +5,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 
 use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
+use crate::ui::text_view::TextView;
 
 /// Search box. Typing emits [`Msg::SearchChanged`]; the reducer decides when a
 /// search actually starts (two characters, matching the old debounce guard).
@@ -120,7 +121,6 @@ pub fn search_results(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         );
     let mut list = col().w_full();
     for (index, hit) in tab.search_results.iter().enumerate() {
-        let tab_id = tab.id;
         let status_path = hit.path.clone();
         let line = hit.line;
         let row_label = match line {
@@ -162,7 +162,7 @@ pub fn search_results(state: &AppState, _cx: &mut Cx<AppState>) -> El {
                     .color(TEXT),
             )
             .on_press_tx(move |state: &mut AppState, tx: &mut Tx| {
-                select_hit(state, tx, tab_id, line, status_path.clone());
+                select_hit(state, tx, line, status_path.clone());
             });
         list = list.child(kit.interactive(result));
     }
@@ -189,13 +189,14 @@ pub fn search_results(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         )
 }
 
-fn select_hit(state: &mut AppState, tx: &mut Tx, tab_id: u64, line: Option<usize>, path: String) {
+fn select_hit(state: &mut AppState, tx: &mut Tx, line: Option<usize>, path: String) {
     state.dispatch(Msg::SwitchView(TabView::Output));
     if let Some(line) = line {
-        // TextView's read-only rows use a fixed monospace rhythm. Scrolling the
-        // viewport directly also works while the selected output mounts.
-        let y = line.saturating_sub(1) as f32 * 18.0;
-        tx.scroll_to_y(format!("document-scroll-{tab_id}"), y.max(0.0));
+        // `hit.line` is 1-based in the formatted document; TextView rows are
+        // 0-based. The reveal waits for the Output view to mount, then
+        // `Tx::scroll_into_view` finds the virtual row by key.
+        let row = TextView::row_key("output-text", line.saturating_sub(1));
+        crate::runner::queue_reveal(row);
         state.dispatch(Msg::Status(format!("{path} · line {line}")));
     } else {
         tx.scroll_into_view("output-text");

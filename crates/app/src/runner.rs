@@ -46,6 +46,16 @@ thread_local! {
     static JOBS: RefCell<HashMap<TabId, JobHandle>> = RefCell::new(HashMap::new());
     /// I/O jobs spawned on this UI thread that have not yet delivered a `Msg`.
     static IO_JOBS: Cell<usize> = const { Cell::new(0) };
+    /// Key of a row to reveal on the next idle poll. The view for the
+    /// requested document must be mounted first, so the reveal waits one poll
+    /// after the message that switched views.
+    static PENDING_REVEAL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Queues a one-shot [`Tx::scroll_into_view`] for a row that is about to
+/// mount, for example a search hit in the Output view.
+pub fn queue_reveal(key: String) {
+    PENDING_REVEAL.with(|slot| *slot.borrow_mut() = Some(key));
 }
 
 fn with_inbox<R>(f: impl FnOnce(&mut Inbox) -> R) -> R {
@@ -606,6 +616,7 @@ fn set_persist_debounce(debounce: Duration) {
 /// completed background jobs) and returns whether state changed.
 pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    let mut applied = false;
     loop {
         let mut messages = state.take_pending();
         let completed: Vec<Msg> = with_inbox(|inbox| inbox.rx.try_iter().collect());
@@ -613,6 +624,7 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
         if messages.is_empty() && completed.is_empty() && io_done.is_empty() {
             break;
         }
+        applied = true;
         messages.extend(completed);
         messages.extend(io_done);
         for message in messages {
@@ -626,6 +638,13 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
             if let Some(name) = opened {
                 state.dispatch(Msg::Status(format!("Opened {name}")));
             }
+        }
+    }
+    if !applied {
+        if let Some(key) = PENDING_REVEAL.with(|slot| slot.borrow_mut().take()) {
+            tx.instant();
+            tx.scroll_into_view(key);
+            changed = true;
         }
     }
     if io_pending() {
@@ -651,13 +670,21 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
         match effect {
             Effect::SpawnJson { tab, input, action } => {
                 let tx = sender();
+                let revision = crate::line_index::next_revision();
                 let handle = json_ops::spawn_process(input, action, move |result| {
                     // Build the full line index off the UI thread from the
                     // worker-owned output before the reducer publishes it.
                     if let Ok(output) = &result {
-                        crate::line_index::prewarm_off_thread(Arc::from(output.as_str()));
+                        crate::line_index::prewarm_off_thread(
+                            Arc::from(output.as_str()),
+                            revision,
+                        );
                     }
-                    let _ = tx.send(Msg::JsonDone { tab, result });
+                    let _ = tx.send(Msg::JsonDone {
+                        tab,
+                        revision,
+                        result,
+                    });
                 });
                 JOBS.with(|jobs| {
                     let mut jobs = jobs.borrow_mut();

@@ -109,6 +109,7 @@ pub struct TextView<'a> {
     highlight_line: Option<usize>,
     editable_limit: usize,
     horizontal_scroll: bool,
+    revision: Option<u64>,
 }
 
 impl<'a> TextView<'a> {
@@ -130,6 +131,7 @@ impl<'a> TextView<'a> {
             highlight_line: None,
             editable_limit: EDITABLE_LIMIT_BYTES,
             horizontal_scroll: true,
+            revision: None,
         }
     }
 
@@ -147,6 +149,7 @@ impl<'a> TextView<'a> {
             highlight_line: None,
             editable_limit: EDITABLE_LIMIT_BYTES,
             horizontal_scroll: true,
+            revision: None,
         }
     }
 
@@ -221,6 +224,14 @@ impl<'a> TextView<'a> {
         self
     }
 
+    /// Keys the shared line index by the reducer-assigned document revision.
+    /// Without it the index is keyed by the rendered buffer's identity, which
+    /// is enough for one-off views but not for swapping documents in place.
+    pub fn revision(mut self, revision: u64) -> Self {
+        self.revision = (revision != 0).then_some(revision);
+        self
+    }
+
     /// Overrides the input size at which editing is disabled.
     pub fn editable_limit(mut self, bytes: usize) -> Self {
         self.editable_limit = bytes;
@@ -265,7 +276,10 @@ impl<'a> TextView<'a> {
                 .color(theme.text)
                 .caret(theme.text, tok::accent(0, true)),
             _ => {
-                let snapshot = line_index::snapshot(self.text);
+                let snapshot = match self.revision {
+                    Some(revision) => line_index::snapshot_for_revision(self.text, revision),
+                    None => line_index::snapshot(self.text),
+                };
                 let rows = self.virtual_rows(key, &snapshot);
                 if editing_disabled && matches!(self.mode, TextViewMode::Editable(_)) {
                     col()

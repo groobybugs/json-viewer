@@ -115,14 +115,7 @@ pub fn view(state: &AppState, cx: &mut Cx<AppState>) -> El {
         .child(search_bar::search_results(state, cx))
         .child(document);
     let header = shell::header(state, cx);
-    shell::shell(state, cx, header, body)
-        .on_key(handle_shortcut)
-        .accepts_extensions(&["json"])
-        .on_drop_files(|state: &mut AppState, files, _| {
-            if let Some(path) = files.first() {
-                state.dispatch(Msg::FileDropped(path.clone()));
-            }
-        })
+    crate::io::drop_zone(shell::shell(state, cx, header, body)).on_key(handle_shortcut)
 }
 
 /// Window-level keyboard shortcuts, including startup before any control has focus.

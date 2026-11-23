@@ -1,6 +1,6 @@
 //! Tab strip and the active document.
 
-use rune::{col, el, icon, row, text, tok, Cx, El, ScrollSpec, TextStyle};
+use rune::{col, el, icon, row, text, tok, Cx, El, TextStyle};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant};
 
 use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, TEXT};
@@ -59,6 +59,7 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         TabView::Input => {
             let edit = state.editor(tab.id).expect("every tab has an editor");
             TextView::editable(&tab.input, edit)
+                .revision(tab.input_revision)
                 .line_numbers(true)
                 .build(&format!("editor-{}", tab.id))
                 .placeholder("Paste your JSON here or drop a JSON file…", MUTED)
@@ -78,6 +79,7 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
                 .on_input_key(super::handle_shortcut)
         }
         TabView::Output => TextView::read_only(&tab.output)
+            .revision(tab.output_revision)
             .line_numbers(true)
             .visible_lines(200)
             .highlight(&tab.search_query)
@@ -92,10 +94,7 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(EDITOR_BG)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_x()
+        .scroll_xy()
         .child(body);
 
     let mut content = col().w_full().grow(1.0).min_h(0.0).fill(EDITOR_BG);
