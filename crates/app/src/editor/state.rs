@@ -625,6 +625,60 @@ pub fn dirty_snapshot(id: TabId) -> Option<Rope> {
     })
 }
 
+thread_local! {
+    /// Fallback line-count memo for tabs with no editor entry, keyed by
+    /// tab id and validated against (input revision, input length).
+    static COUNT_CACHE: RefCell<HashMap<TabId, (u64, usize, usize)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The status bar's line count with `str::lines()` semantics (a trailing
+/// line break does not start a counted line; an empty document is 0).
+/// O(1) from the rope when the editor owns the tab; otherwise the scan is
+/// memoized per (revision, length) so a never-opened 100 MB tab is scanned
+/// once, not on every view rebuild.
+pub fn display_line_count(id: TabId, input: &str, revision: u64) -> usize {
+    let from_rope = STORE.with(|store| {
+        let map = store.borrow();
+        let state = map.get(&id)?;
+        // Only trust an entry that is synced to this revision (a dirty
+        // entry is ahead of `input`, which is fine — it is the truth).
+        let fresh = state.source_revision == revision
+            && (state.dirty || state.buffer.len_bytes() == input.len());
+        fresh.then(|| rope_display_lines(&state.buffer))
+    });
+    if let Some(count) = from_rope {
+        return count;
+    }
+    COUNT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((rev, len, count)) = cache.get(&id) {
+            if *rev == revision && *len == input.len() {
+                return *count;
+            }
+        }
+        let count = input.lines().count();
+        cache.insert(id, (revision, input.len(), count));
+        count
+    })
+}
+
+/// `str::lines()` count from the rope in O(1): ropey counts a trailing
+/// break as an extra empty line (and treats a lone `\r` as a break), so
+/// drop that last line when the text ends in `\n` or `\r`.
+fn rope_display_lines(buffer: &Buffer) -> usize {
+    let len = buffer.len_bytes();
+    if len == 0 {
+        return 0;
+    }
+    let mut lines = buffer.len_lines();
+    let last = buffer.slice_bytes(len - 1..len);
+    if last == "\n" || last == "\r" {
+        lines -= 1;
+    }
+    lines
+}
+
 /// Whether the buffer holds edits `Tab::input` has not seen.
 pub fn is_dirty(id: TabId, input: &str, revision: u64) -> bool {
     with(id, input, revision, |state| state.dirty)

@@ -96,10 +96,10 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
         let text_w = vp_w - 2.0 * PAD - gutter_w as f32 * cw - cw * 1.2 - GAP - 2.0;
         let columns = ((text_w / cw).floor() as usize).max(16);
         ed.visible_columns = columns;
-        let first_visible = (scroll_y / ROW_HEIGHT).floor() as usize;
-        let visible = (vp_h / ROW_HEIGHT).ceil() as usize + 1;
+        let first_visible = ((scroll_y / ROW_HEIGHT).floor() as usize).min(lines.saturating_sub(1));
+        let visible = (vp_h.max(0.0) / ROW_HEIGHT).ceil() as usize + 1;
         let first = first_visible.saturating_sub(OVERSCAN);
-        let last = lines.min(first_visible + visible + OVERSCAN);
+        let last = lines.min(first_visible + visible + OVERSCAN).max(first);
         let caret_line = ed.buffer.byte_to_line(ed.caret);
         let mut rows = Vec::with_capacity(last - first);
         for line in first..last {

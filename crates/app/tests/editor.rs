@@ -493,6 +493,107 @@ fn ten_mb_paste_lands_quickly() {
 }
 
 #[test]
+fn line_count_matches_str_lines_semantics() {
+    let docs = [
+        "",
+        "a",
+        "a\n",
+        "a\r\n",
+        "a\r",
+        "\n",
+        "\r",
+        "a\nb",
+        "a\nb\n",
+        "a\r\nb\r\n",
+        "{\n  \"a\": 1\n}\n",
+    ];
+    for doc in docs {
+        // Fallback path (no editor entry), including the memo hit and a
+        // revision bump invalidating it.
+        editor_state::clear_all();
+        assert_eq!(
+            editor_state::display_line_count(999, doc, 1),
+            doc.lines().count(),
+            "fallback {doc:?}"
+        );
+        assert_eq!(
+            editor_state::display_line_count(999, doc, 1),
+            doc.lines().count(),
+            "memo {doc:?}"
+        );
+        assert_eq!(
+            editor_state::display_line_count(999, "x\ny\nz", 2),
+            3,
+            "revision bump {doc:?}"
+        );
+        // Rope path (editor entry exists).
+        editor_state::with(999, doc, 3, |_| {});
+        assert_eq!(
+            editor_state::display_line_count(999, doc, 3),
+            doc.lines().count(),
+            "rope {doc:?}"
+        );
+    }
+    editor_state::clear_all();
+}
+
+fn summary_text(rt: &Runtime<AppState>) -> String {
+    rt.elements()
+        .iter()
+        .find(|e| e.key.as_deref() == Some("document-summary"))
+        .and_then(|e| e.text.clone())
+        .expect("document-summary")
+}
+
+#[test]
+fn status_bar_line_count_stays_correct_after_edits() {
+    let state = doc_state("a\nb\n".into());
+    let mut rt = app_runtime(state);
+    assert!(summary_text(&rt).contains("2 lines"), "{}", summary_text(&rt));
+
+    // Enter at the end adds a line; the model cache is stale but the
+    // status bar reads the rope.
+    press(&mut rt, Key::End, Mods::default());
+    press(&mut rt, Key::Enter, Mods::default());
+    assert!(summary_text(&rt).contains("3 lines"), "{}", summary_text(&rt));
+    press(&mut rt, Key::Text("c".into()), Mods::default());
+    assert!(summary_text(&rt).contains("3 lines"), "{}", summary_text(&rt));
+
+    // Select-all + delete empties the document.
+    press(&mut rt, Key::Command('a'), cmd_mods());
+    press(&mut rt, Key::Backspace, Mods::default());
+    assert!(summary_text(&rt).contains("0 lines"), "{}", summary_text(&rt));
+}
+
+#[test]
+fn status_bar_line_count_after_external_replace_in_output_view() {
+    let state = doc_state("a\nb\n".into());
+    let mut rt = app_runtime(state);
+    assert!(summary_text(&rt).contains("2 lines"));
+    // Leave the input view, then replace the text through the reducer:
+    // the editor entry goes stale and the count must follow the new text.
+    rt.state.dispatch(Msg::SwitchView(TabView::Output));
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    let id = rt.state.active;
+    rt.update(|s, _| s.update_input(id, "one\ntwo\nthree\nfour\n".into()));
+    rt.frame(1.0 / 60.0);
+    assert!(summary_text(&rt).contains("4 lines"), "{}", summary_text(&rt));
+}
+
+#[test]
+#[ignore]
+fn probe_line_count_scan_cost() {
+    let doc = pretty_fixture(100 * MIB);
+    let t = Instant::now();
+    let n = doc.lines().count();
+    println!("100 MB lines().count() = {n} in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+    let t = Instant::now();
+    let empty = doc.trim().is_empty();
+    println!("100 MB trim().is_empty() = {empty} in {:.3} ms", t.elapsed().as_secs_f64() * 1000.0);
+}
+
+#[test]
 fn app_switch_to_output_and_back_keeps_rope() {
     let state = doc_state("{\"a\":1}".into());
     let mut rt = app_runtime(state);

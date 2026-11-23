@@ -555,8 +555,11 @@ fn recommend(results: &[VariantResult], prefix: &str) -> String {
 fn edit_threshold_bench() {
     let mut results = Vec::new();
 
-    // Control: the real ui::view below the shipped 5 MiB limit.
-    results.push(bench_variant("pretty 1 control", pretty_fixture(MIB), false));
+    // Control: the forced native path at 1 MiB. (The real `ui::view` now
+    // mounts the rope editor at every size — see `rope_editor_bench` — so
+    // the historical control uses the same forced native composition as
+    // the other rows.)
+    results.push(bench_variant("pretty 1 control", pretty_fixture(MIB), true));
     for mb in [0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0] {
         let target = (mb * MIB as f64) as usize;
         results.push(bench_variant(&format!("pretty {mb}"), pretty_fixture(target), true));
@@ -664,11 +667,336 @@ fn edit_threshold_bench() {
         .find(|r| r.label == "pretty 1")
         .expect("pretty 1 result");
     println!(
-        "\nControl check: real `ui::view` at 1 MiB — first frame {:.1} ms, key median {:.2} ms; \
-         forced harness at 1 MiB — first frame {:.1} ms, key median {:.2} ms.",
+        "\nControl check: forced native at 1 MiB (first run, warm-up) — first frame {:.1} ms, key median {:.2} ms; \
+         forced native at 1 MiB (second run) — first frame {:.1} ms, key median {:.2} ms. \
+         The shipped input editor is now the rope editor (`rope_editor_bench`).",
         control.first_frame_ms,
         control.key_median_ms,
         forced_1.first_frame_ms,
         forced_1.key_median_ms
     );
+}
+
+// ── rp-editor E5: rope-editor performance proof ──────────────────────────
+//
+// The real `ui::view` (rope editor, no gates) at 1/10/100 MB pretty and the
+// 6.9 MB single line. Keystroke sample = `Runtime::key` + frame (handler
+// dispatch) + `runner::poll` (reducer applies) + frame (render): the full
+// input-to-rendered-state CPU cost, conservative against the native
+// harness's single-frame sample. Targets: p95 keystroke < 16 ms and first
+// frame < 250 ms for every size.
+
+use json_viewer::editor::state as editor_state;
+use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
+
+struct RopeResult {
+    label: String,
+    bytes: usize,
+    lines: usize,
+    load_ms: f64,
+    first_frame_ms: f64,
+    settle_ms: f64,
+    key_median_ms: f64,
+    key_p95_ms: f64,
+    key_max_ms: f64,
+    per_pos_median: Vec<(&'static str, f64)>,
+    caret_scroll_ms: f64,
+    paste_1kb_ms: f64,
+    paste_10mb_ms: f64,
+    undo_10mb_ms: f64,
+    select_all_delete_ms: f64,
+    vmhwm_mb: Option<f64>,
+    vmrss_mb: Option<f64>,
+}
+
+impl RopeResult {
+    fn passes(&self) -> bool {
+        self.key_p95_ms < KEY_BUDGET_MS && self.first_frame_ms < FIRST_FRAME_BUDGET_MS
+    }
+}
+
+fn rope_buffer_len(rt: &Runtime<AppState>) -> usize {
+    let tab = rt.state.active_tab().expect("active tab");
+    editor_state::with(tab.id, &tab.input, tab.input_revision, |ed| ed.buffer.len_bytes())
+}
+
+fn rope_place_caret(rt: &mut Runtime<AppState>, id: u64, caret: usize) {
+    rt.update(|s, tx| {
+        let tab = s.tab(id).expect("tab");
+        let line = editor_state::with(id, &tab.input, tab.input_revision, |ed| {
+            ed.caret = caret.min(ed.buffer.len_bytes());
+            ed.anchor = None;
+            ed.reveal = None;
+            ed.set_horizontal_window(240);
+            ed.buffer.byte_to_line(ed.caret)
+        });
+        tx.instant();
+        tx.scroll_to_y(format!("document-scroll-{id}"), (line as f32 * 16.0 - 200.0).max(0.0));
+    });
+    rt.frame(0.0);
+    rt.frame(0.0);
+}
+
+fn rope_key(rt: &mut Runtime<AppState>, key: Key, mods: Mods) -> f64 {
+    let t = Instant::now();
+    rt.key(KeyEvent { key, mods });
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    ms(t)
+}
+
+fn rope_paste(rt: &mut Runtime<AppState>, text: String) -> f64 {
+    let t = Instant::now();
+    rt.paste(text);
+    rt.frame(1.0 / 60.0);
+    rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
+    rt.frame(1.0 / 60.0);
+    ms(t)
+}
+
+fn draw_rope_png(rt: &mut Runtime<AppState>, name: &str) {
+    rt.settle_all();
+    rt.frame(0.0);
+    let (w, h) = headless::DEFAULT_SIZE;
+    let gpu = Gpu::headless();
+    let format = OFFSCREEN_FORMAT.remove_srgb_suffix();
+    let mut renderer = Renderer::new(&gpu.device, format);
+    renderer.set_srgb_blend(true);
+    let target = Offscreen::with_format(&gpu.device, w as u32, h as u32, format);
+    renderer.prepare(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, (w as u32, h as u32));
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    renderer.draw(&mut encoder, &target.view, rt.clear_color());
+    target.copy(&mut encoder);
+    renderer.submit(&gpu.queue, encoder);
+    let pixels = target.read(&gpu.device);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/headless")
+        .join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write_png(&path, w as u32, h as u32, &pixels).expect("write rope PNG");
+}
+
+fn rope_bench_variant(label: &str, text: String) -> RopeResult {
+    let bytes = text.len();
+    let lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+    let single_line = lines == 1;
+
+    let mut state = AppState::default();
+    let id = state.active;
+    let t = Instant::now();
+    state.update_input(id, text);
+    let load_ms = ms(t);
+
+    let t = Instant::now();
+    let mut rt = Runtime::with_text(
+        state,
+        ui::view,
+        headless::DEFAULT_SIZE,
+        Env::new(true, SCALE),
+        headless::text_system(),
+    );
+    rt.set_srgb_blend(true);
+    rt.frame(0.0);
+    let first_frame_ms = ms(t);
+    let t = Instant::now();
+    rt.settle_all();
+    rt.frame(0.0);
+    let settle_ms = ms(t);
+
+    rt.update(|_, tx| {
+        tx.focus(format!("editor-{id}"), true);
+    });
+    rt.frame(0.0);
+    assert!(
+        rt.elements().iter().any(|e| e.key.as_deref() == Some(format!("editor-{id}").as_str()) && e.focused),
+        "{label}: rope editor did not take focus"
+    );
+
+    let mut samples: Vec<f64> = Vec::new();
+    let mut per_pos_median = Vec::new();
+    let mut expected = bytes;
+    for (pos, caret) in [("start", 0usize), ("middle", bytes / 2), ("end", bytes)] {
+        rope_place_caret(&mut rt, id, caret);
+        let mut pos_samples = Vec::new();
+        for _ in 0..20 {
+            let d = rope_key(&mut rt, Key::Text("x".into()), Mods::default());
+            pos_samples.push(d);
+            samples.push(d);
+            assert!(d < SAMPLE_WATCHDOG_MS, "{label}: keystroke watchdog at {pos}");
+        }
+        expected += pos_samples.len();
+        assert_eq!(rope_buffer_len(&rt), expected, "{label}: typed chars lost at {pos}");
+        per_pos_median.push((pos, median(&mut pos_samples)));
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let key_median_ms = percentile(&samples, 0.5);
+    let key_p95_ms = percentile(&samples, 0.95);
+    let key_max_ms = samples.last().copied().unwrap_or(f64::NAN);
+
+    // Evidence PNG: mid-file caret with a word selection (100 MB row), or
+    // editing at column 3,000,000 (single-line row).
+    if single_line {
+        rope_place_caret(&mut rt, id, 3_000_000);
+        for _ in 0..3 {
+            rope_key(&mut rt, Key::Text("x".into()), Mods::default());
+        }
+        expected += 3;
+        draw_rope_png(&mut rt, "rope-single-line-col-3m.png");
+    } else {
+        let mid = rope_buffer_len(&rt) / 2;
+        rope_place_caret(&mut rt, id, mid);
+        rt.update(|s, _| {
+            let tab = s.tab(id).expect("tab");
+            editor_state::with(id, &tab.input, tab.input_revision, |ed| ed.select_word(mid));
+        });
+        rt.frame(0.0);
+        draw_rope_png(&mut rt, "rope-100mb-middle-selection.png");
+        rt.update(|s, _| {
+            let tab = s.tab(id).expect("tab");
+            editor_state::with(id, &tab.input, tab.input_revision, |ed| ed.anchor = None);
+        });
+        rt.frame(0.0);
+    }
+
+    // Caret move + instant scroll to the middle.
+    let mid = rope_buffer_len(&rt) / 2;
+    let t = Instant::now();
+    rope_place_caret(&mut rt, id, mid);
+    let caret_scroll_ms = ms(t);
+
+    // Paste 1 KB, then 10 MB, then undo the large paste.
+    let paste_1kb_ms = rope_paste(&mut rt, "x".repeat(1024));
+    expected += 1024;
+    assert_eq!(rope_buffer_len(&rt), expected, "{label}: 1 KB paste lost");
+    let payload = "x".repeat(10 * MIB);
+    let paste_10mb_ms = rope_paste(&mut rt, payload);
+    expected += 10 * MIB;
+    assert_eq!(rope_buffer_len(&rt), expected, "{label}: 10 MB paste lost");
+    let undo_10mb_ms = rope_key(
+        &mut rt,
+        Key::Command('z'),
+        Mods { cmd: true, ..Mods::default() },
+    );
+    expected -= 10 * MIB;
+    assert_eq!(rope_buffer_len(&rt), expected, "{label}: large-paste undo wrong");
+
+    // Select-all + delete.
+    rope_key(&mut rt, Key::Command('a'), Mods { cmd: true, ..Mods::default() });
+    let select_all_delete_ms = rope_key(&mut rt, Key::Backspace, Mods::default());
+    assert_eq!(rope_buffer_len(&rt), 0, "{label}: select-all+delete wrong");
+
+    let vmhwm_mb = proc_status_mb("VmHWM:");
+    let vmrss_mb = proc_status_mb("VmRSS:");
+    drop(rt);
+
+    RopeResult {
+        label: label.to_string(),
+        bytes,
+        lines,
+        load_ms,
+        first_frame_ms,
+        settle_ms,
+        key_median_ms,
+        key_p95_ms,
+        key_max_ms,
+        per_pos_median,
+        caret_scroll_ms,
+        paste_1kb_ms,
+        paste_10mb_ms,
+        undo_10mb_ms,
+        select_all_delete_ms,
+        vmhwm_mb,
+        vmrss_mb,
+    }
+}
+
+#[test]
+#[ignore]
+fn rope_editor_bench() {
+    // Error-marker evidence through the real app view.
+    {
+        let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, input.into());
+        let revision = state.tab(id).unwrap().input_revision;
+        let error = json_viewer::json_ops::validate(input).expect_err("invalid fixture");
+        state.update(json_viewer::state::Msg::ValidationDone {
+            tab: id,
+            input_revision: revision,
+            result: Err(error),
+        });
+        let mut rt = Runtime::with_text(
+            state,
+            ui::view,
+            headless::DEFAULT_SIZE,
+            Env::new(true, SCALE),
+            headless::text_system(),
+        );
+        rt.set_srgb_blend(true);
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+        draw_rope_png(&mut rt, "rope-error-marker.png");
+    }
+
+    let mut results = Vec::new();
+    for mb in [1.0, 10.0, 100.0] {
+        let target = (mb * MIB as f64) as usize;
+        results.push(rope_bench_variant(&format!("pretty {mb}"), pretty_fixture(target)));
+    }
+    results.push(rope_bench_variant("single-line 6.9", minified_fixture(6_900_000)));
+
+    println!("\n## Rope editor (rp-editor E5) — release, scale 1, 1280x800, real ui::view\n");
+    println!(
+        "Keystroke = `Runtime::key` + frame (dispatch) + `runner::poll` (apply) + frame (render), \
+         20 chars per position. Targets: p95 < {KEY_BUDGET_MS} ms, first frame < {FIRST_FRAME_BUDGET_MS} ms. \
+         VmHWM is process-wide/cumulative.\n"
+    );
+    println!("| Variant | MiB | Lines | Load ms | First frame ms | Settle ms | Key median ms | Key p95 ms | Key max ms | Caret+scroll ms | Paste 1KB ms | Paste 10MB ms | Undo 10MB ms | SelAll+Del ms | VmHWM MiB | VmRSS MiB | Pass |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
+    for r in &results {
+        println!(
+            "| {} | {:.2} | {} | {:.1} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |",
+            r.label,
+            r.bytes as f64 / MIB as f64,
+            r.lines,
+            r.load_ms,
+            r.first_frame_ms,
+            r.settle_ms,
+            r.key_median_ms,
+            r.key_p95_ms,
+            r.key_max_ms,
+            r.caret_scroll_ms,
+            r.paste_1kb_ms,
+            r.paste_10mb_ms,
+            r.undo_10mb_ms,
+            r.select_all_delete_ms,
+            r.vmhwm_mb.map(|v| format!("{v:.0}")).unwrap_or_else(|| "n/a".into()),
+            r.vmrss_mb.map(|v| format!("{v:.0}")).unwrap_or_else(|| "n/a".into()),
+            if r.passes() { "YES" } else { "NO" },
+        );
+    }
+    println!("\n### Per-position keystroke medians (ms)\n");
+    println!("| Variant | Start | Middle | End |");
+    println!("| --- | ---: | ---: | ---: |");
+    for r in &results {
+        let get = |pos: &str| {
+            r.per_pos_median
+                .iter()
+                .find(|(p, _)| *p == pos)
+                .map(|(_, v)| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".into())
+        };
+        println!("| {} | {} | {} | {} |", r.label, get("start"), get("middle"), get("end"));
+    }
+
+    for r in &results {
+        assert!(
+            r.passes(),
+            "{}: p95 {:.2} ms (budget {KEY_BUDGET_MS}), first frame {:.1} ms (budget {FIRST_FRAME_BUDGET_MS})",
+            r.label, r.key_p95_ms, r.first_frame_ms
+        );
+    }
 }

@@ -361,11 +361,36 @@ still a `String` (measured: the 100 MB snapshot-step test stays <30 ms).
 - `cargo test --release -p json-viewer --test editor -- --ignored --nocapture`
   — 100 MB windowing: load 45 ms, first frame 90 ms, scroll-to-middle
   2.8 ms, caret-move p95 0.6 ms, 59 rows mounted (3.85M lines).
-- `cargo test --release -p json-viewer --test edit_threshold -- --ignored
-  --nocapture` — the historical native-`TextEdit` threshold table **and**
-  the rope-editor performance proof (E5): typing p95 at start/middle/end,
-  1 KB/10 MB paste, undo of a large paste, select-all+delete, first frame
-  and peak RSS for 1/10/100 MB pretty and the 6.9 MB single line.
+- `cargo test --release -p json-viewer --test edit_threshold rope_editor_bench
+  -- --ignored --nocapture` — the E5 proof through the real `ui::view`
+  (keystroke = key + dispatch frame + poll + render frame, 20 chars per
+  position; release, scale 1, 1280×800):
+
+  | Variant | MiB | Lines | Load ms | First frame ms | Key p95 ms | Paste 1KB ms | Paste 10MB ms | Undo 10MB ms | SelAll+Del ms | VmHWM MiB |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | pretty 1 | 1.00 | 38917 | 0.1 | 12.8 | 1.01 | 1.2 | 24.3 | 1.4 | 2.4 | 182 |
+  | pretty 10 | 10.00 | 387153 | 4.3 | 16.8 | 1.04 | 7.4 | 26.6 | 1.3 | 4.9 | 244 |
+  | pretty 100 | 100.00 | 3851257 | 42.9 | 74.6 | 1.04 | 45.8 | 64.2 | 1.3 | 52.5 | 619 |
+  | single-line 6.9 | 6.58 | 1 | 0.6 | 18.5 | 0.43 | 1.6 | 16.7 | 1.0 | 3.3 | 619 |
+
+  Keystroke cost is size-independent (~1 ms p95 everywhere, start/middle/end
+  within 0.4 ms of each other); every row passes p95 <16 ms and first frame
+  <250 ms. VmHWM is process-wide/cumulative across the run. PNGs:
+  `target/headless/rope-100mb-middle-selection.png` (mid-file caret + word
+  selection at line 1,927,667), `rope-single-line-col-3m.png` (editing at
+  column 3,000,000 with elided column window), `rope-error-marker.png`
+  (row tint, gutter dot, underline, error strip). The historical
+  native-`TextEdit` threshold table still runs as `edit_threshold_bench`.
+- The status bar's line count is `editor::state::display_line_count`
+  (coordinator-approved one-line `ui/shell.rs` change): O(1) rope
+  `len_lines` with `str::lines()` semantics when the editor owns the tab,
+  else a scan memoized per (revision, length). The old
+  `tab.input.lines().count()` cost 24.6 ms per view rebuild at 100 MB and
+  was the only thing keeping 100 MB typing above the 16 ms budget
+  (52.9 ms p95 before, 1.04 ms after). Tests:
+  `line_count_matches_str_lines_semantics` (trailing `\n`/`\r\n`/`\r`,
+  empty, memo invalidation, both paths) and
+  `status_bar_line_count_stays_correct_after_edits`.
 - `tests/validate.rs::go_to_error_reveals_the_error_line_in_the_rope_editor`
   replaces the old read-only-fallback banner test (coordinator-approved):
   the 6 MB single-line input is editable, Go to error reveals and marks
