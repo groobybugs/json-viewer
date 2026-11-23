@@ -13,6 +13,7 @@
 pub mod headless;
 pub mod io;
 pub mod json_ops;
+pub mod line_index;
 pub mod persist;
 pub mod runner;
 pub mod search;

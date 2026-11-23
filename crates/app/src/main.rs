@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 
+mod line_index;
 use std::path::PathBuf;
 
 use json_viewer::headless;
