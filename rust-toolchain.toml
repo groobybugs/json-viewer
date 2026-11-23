@@ -1,0 +1,5 @@
+# Rune's pinned revision builds with Rust 1.99.1 (its own rust-toolchain).
+# This is a stable release; `cargo` selects it automatically through rustup.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

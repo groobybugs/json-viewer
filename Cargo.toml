@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/app"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+
+# Rune's workspace patches crates.io packages; a dependency's `[patch]` does
+# not apply to the workspace that depends on it, so apps must repeat the ones
+# they need. `parley_engine` 0.12.0 on crates.io lacks the `line-dictionaries`
+# feature Rune enables (and the vendored bidi/shaping fixes), so build fails
+# without this patch. See `vendor/parley_engine` and Rune's `vendor/` README.
+[patch.crates-io]
+parley_engine = { path = "vendor/parley_engine" }
+# Rune calls Win32/Wayland additions that live in its patched winit:
+# `WindowExtWayland::{content_corner_radius,has_client_side_frame}` (and the
+# sctk-adwaita methods behind them). Apps that build Rune must repeat these
+# patches because a dependency's `[patch]` does not apply to its consumers.
+winit = { path = "vendor/winit" }
+sctk-adwaita = { path = "vendor/sctk-adwaita" }
