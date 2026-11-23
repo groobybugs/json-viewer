@@ -85,6 +85,10 @@ pub struct LineIndex {
     /// Length of the whole document (may exceed `len` while provisional).
     total_len: usize,
     complete: bool,
+    /// Byte length of the longest line (line endings excluded), computed in
+    /// the same pass as the starts. Lets the editable gate reject very-long-line
+    /// (e.g. minified) documents without a second scan.
+    max_line_len: usize,
 }
 
 /// Snaps `index` down to a UTF-8 boundary without scanning the text.
@@ -107,30 +111,44 @@ impl LineIndex {
         let mut starts = Vec::with_capacity(64);
         starts.push(0);
         let mut i = 0;
+        let mut line_start = 0usize;
+        let mut max_line_len = 0usize;
         while i < bytes.len() {
             match bytes[i..].iter().position(|&b| b == b'\n') {
                 Some(offset) => {
                     i += offset + 1;
                     starts.push(i);
+                    // `i - 1` is the '\n' byte; the line is [line_start, i-1).
+                    max_line_len = max_line_len.max(i.saturating_sub(1).saturating_sub(line_start));
+                    line_start = i;
                 }
                 None => break,
             }
         }
+        max_line_len = max_line_len.max(bytes.len().saturating_sub(line_start));
         Self {
             starts,
             len: bytes.len(),
             total_len: bytes.len(),
             complete: true,
+            max_line_len,
         }
     }
 
     /// A provisional index over `text` (a bounded prefix), remembering the
-    /// whole document's length. O(prefix), never O(document).
+    /// whole document's length. O(prefix), never O(document). The whole
+    /// document is a conservative upper bound for its longest line.
     pub fn partial(text: &str, total_len: usize) -> Self {
         let mut index = Self::build(text);
         index.total_len = total_len;
         index.complete = false;
+        index.max_line_len = total_len;
         index
+    }
+
+    /// Byte length of the longest line (line endings excluded). O(1).
+    pub fn max_line_len(&self) -> usize {
+        self.max_line_len
     }
 
     /// Whether the whole document was scanned.
@@ -367,7 +385,13 @@ pub fn cached_snapshot(text: &str) -> Option<Arc<Snapshot>> {
 /// owns `text` (the JSON worker's result), so no copy or scan happens on the
 /// UI thread. Join the handle before rendering to keep the first frame O(1).
 pub fn prewarm_off_thread(text: Arc<str>, revision: u64) -> JoinHandle<Arc<Snapshot>> {
-    std::thread::spawn(move || insert(Arc::new(Snapshot::new_for_revision(text, revision))))
+    std::thread::spawn(move || {
+        // Build the fold index in the same off-thread pass, next to the line
+        // index (see fold_index::prewarm). Both are keyed by this revision, so
+        // the Output view finds them already warmed.
+        crate::fold_index::prewarm(Arc::clone(&text), revision);
+        insert(Arc::new(Snapshot::new_for_revision(text, revision)))
+    })
 }
 
 /// Reserves a globally unique document revision. Revisions are never reused,

@@ -67,25 +67,56 @@ use std::sync::Arc;
 
 use rune::{col, el, oklch, oklcha, row, text, tok, Align, Color, El, GrowthSpec, Span, TextEdit, TextSelection};
 
+use crate::fold_index::{self, FoldView};
 use crate::line_index::{self, Snapshot};
 use crate::state::AppState;
 
 /// Estimated height of one monospace row; unvisited virtual rows use this.
 pub const ROW_HEIGHT: f32 = 16.0;
-/// Advance width of one 12pt monospace character, for horizontal spacers.
+/// Nominal 12pt monospace advance, used only as a last-resort fallback. The
+/// value actually used at render time is [`char_width`], measured from Rune's
+/// active text system, so it is correct whether the mono slot resolves to IBM
+/// Plex Mono (7.2pt at 12pt), a DejaVu fallback (~7.2245), Consolas, Menlo,
+/// etc. No code path assumes a particular face.
 pub const CHAR_WIDTH: f32 = 7.2;
+
+/// Advance of one monospace glyph at 12pt, measured from Rune's active text
+/// system while the window's view runs (`rune::text::lend`). A single `'0'`
+/// gives the exact column width because every registered mono face is fixed
+/// pitch, so this works for gutter boxes and horizontal spacers without
+/// hard-coding a font's metrics. Falls back to [`CHAR_WIDTH`] only before any
+/// face has been registered.
+pub fn char_width() -> f32 {
+    let measured = rune::text::advance("0", mono());
+    if measured.is_finite() && measured > 0.0 {
+        measured
+    } else {
+        CHAR_WIDTH
+    }
+}
 /// Default column window width. A minified 100 MB single line shapes only
 /// this many columns, never the whole line.
 pub const DEFAULT_VISIBLE_COLUMNS: usize = 240;
 /// Above this input size, editing is disabled and the read-only virtual view
-/// takes over. 2 MB is roughly where Rune's native `TextEdit` (which shapes
-/// the whole buffer) stops being interactive.
-pub const EDITABLE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
-/// Banner shown when the editable view falls back to read-only.
-pub const LARGE_FILE_BANNER: &str =
-    "Large file: editing disabled — Format/Minify/Search still work";
+/// takes over. Raised from 2 MiB to 5 MiB after rp-editbench measured Rune's
+/// native `TextEdit` whole-buffer re-shape: pretty-printed 5 MiB has p95
+/// keystroke 12.26 ms (< 16 ms), 10 MiB has 24.33 ms (too slow).
+pub const EDITABLE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+/// Longest single line still allowed in editable mode. A minified/single-line
+/// document is wrap-laid-out in full on every edit: rp-editbench measured
+/// 250 ms/keystroke already at 2 MiB (16 ms budget reached near ~128 KiB).
+/// Such documents stay on the read-only virtualized path regardless of total
+/// size; the longest line comes from the line index's single build pass.
+pub const LONG_LINE_LIMIT_BYTES: usize = 128 * 1024;
+/// Tail of the "large file" banner, kept as a stable marker for tests. The
+/// full banner text prepends the reason and size; see `large_file_banner`.
+pub const LARGE_FILE_BANNER: &str = "editing disabled — Format/Minify/Search still work";
 /// How far a truncated row can be panned horizontally, in columns.
 const HORIZONTAL_PAN_COLUMNS: usize = 8_192;
+/// Red ink / tint / caret used by `TextView::error_marker`.
+const ERROR_INK: Color = Color { r: 0.86, g: 0.22, b: 0.22, a: 1.0 };
+const ERROR_TINT: Color = Color { r: 0.30, g: 0.06, b: 0.08, a: 0.20 };
+const ERROR_CARET_BG: Color = Color { r: 0.60, g: 0.12, b: 0.14, a: 0.55 };
 
 /// How the text is edited.
 pub enum TextViewMode<'a> {
@@ -111,6 +142,9 @@ pub struct TextView<'a> {
     editable_limit: usize,
     horizontal_scroll: bool,
     revision: Option<u64>,
+    /// 1-based error line/column for `error_marker` (additive Validate API).
+    error_line: Option<usize>,
+    error_column: Option<usize>,
 }
 
 impl<'a> TextView<'a> {
@@ -133,6 +167,8 @@ impl<'a> TextView<'a> {
             editable_limit: EDITABLE_LIMIT_BYTES,
             horizontal_scroll: true,
             revision: None,
+            error_line: None,
+            error_column: None,
         }
     }
 
@@ -151,6 +187,8 @@ impl<'a> TextView<'a> {
             editable_limit: EDITABLE_LIMIT_BYTES,
             horizontal_scroll: true,
             revision: None,
+            error_line: None,
+            error_column: None,
         }
     }
 
@@ -225,6 +263,17 @@ impl<'a> TextView<'a> {
         self
     }
 
+    /// Additive Validate marker: highlights the 1-based error `line` (red row
+    /// tint + gutter dot) and draws a caret/underline at the 1-based `column`,
+    /// in both editable and read-only/virtualized modes. The caller reveals it
+    /// with the existing [`TextView::row_key`] + `Tx::scroll_into_view`; any
+    /// folds covering the line are unfolded first (see `fold_index::note_reveal`).
+    pub fn error_marker(mut self, line: usize, column: usize) -> Self {
+        self.error_line = Some(line.max(1));
+        self.error_column = Some(column.max(1));
+        self
+    }
+
     /// Keys the shared line index by the reducer-assigned document revision.
     /// Without it the index is keyed by the rendered buffer's identity, which
     /// is enough for one-off views but not for swapping documents in place.
@@ -246,10 +295,15 @@ impl<'a> TextView<'a> {
         self
     }
 
-    /// Key of virtual row `line`. Hand it to `Tx::scroll_into_view` (or
-    /// `Tx::scroll_center`) to jump to a search hit even when its row is not
-    /// mounted yet.
+    /// Key of virtual row `line` (a 0-based document line, not a visual row).
+    /// Hand it to `Tx::scroll_into_view` (or `Tx::scroll_center`) to jump to a
+    /// search hit even when its row is not mounted yet. As an additive side
+    /// effect it arms `fold_index::note_reveal(line)`: the next `build` unfolds
+    /// any ancestor folds covering the line, so a jump into a folded region
+    /// always lands on a mounted row. Callers that only compute a key (tests,
+    /// pure lookups) are unaffected — with no folds the reveal is a no-op.
     pub fn row_key(key: &str, line: usize) -> String {
+        fold_index::note_reveal(line);
         format!("{key}-row-{line}")
     }
 
@@ -258,35 +312,68 @@ impl<'a> TextView<'a> {
     /// Editable mode emits a multi-line text input (below the size limit);
     /// read-only mode emits a `virtual_rows` growth stack that mounts only the
     /// rows the scroll viewport shows.
-    /// Whether the input is over the editing threshold (read-only fallback).
+    /// Whether editing is disabled: total size over the limit, or a single
+    /// line longer than [`LONG_LINE_LIMIT_BYTES`] (minified input). The size
+    /// check is O(1); the long-line check is skipped for documents too small
+    /// to hold such a line, and otherwise uses one allocation-free scan with
+    /// early exit, so the editable hot path never builds a line index per key.
     pub fn editing_disabled(&self) -> bool {
-        self.text.len() > self.editable_limit
+        self.disable_reason().is_some()
+    }
+
+    fn disable_reason(&self) -> Option<EditDisabled> {
+        let n = self.text.len();
+        if n > self.editable_limit {
+            return Some(EditDisabled::Large(n));
+        }
+        // No line can be longer than the whole document.
+        if n <= LONG_LINE_LIMIT_BYTES {
+            return None;
+        }
+        if longest_line(self.text, LONG_LINE_LIMIT_BYTES) > LONG_LINE_LIMIT_BYTES {
+            return Some(EditDisabled::LongLine(n));
+        }
+        None
+    }
+
+    /// The cached line index for this document (revision-keyed when set).
+    fn snapshot(&self) -> Arc<Snapshot> {
+        match self.revision {
+            Some(revision) => line_index::snapshot_for_revision(self.text, revision),
+            None => line_index::snapshot(self.text),
+        }
     }
 
     pub fn build(&self, key: &str) -> El {
         let theme = tok::theme(true);
-        let editing_disabled = self.editing_disabled();
+        let disabled = self.disable_reason();
         match &self.mode {
-            TextViewMode::Editable(edit) if !editing_disabled => rune::text_input(edit, mono())
-                .key(key.to_string())
-                .label("JSON input")
-                .w_full()
-                .min_h(240.0)
-                .padding(12.0)
-                .fill(theme.card)
-                .color(theme.text)
-                .caret(theme.text, tok::accent(0, true)),
+            TextViewMode::Editable(edit) if disabled.is_none() => {
+                let input = rune::text_input(edit, mono())
+                    .key(key.to_string())
+                    .label("JSON input")
+                    .w_full()
+                    .min_h(240.0)
+                    .padding(12.0)
+                    .fill(theme.card)
+                    .color(theme.text)
+                    .caret(theme.text, tok::accent(0, true));
+                match (self.error_line, self.error_column) {
+                    (Some(line), Some(column)) => editable_error_view(input, key, line, column),
+                    _ => input,
+                }
+            }
             _ => {
-                let snapshot = match self.revision {
-                    Some(revision) => line_index::snapshot_for_revision(self.text, revision),
-                    None => line_index::snapshot(self.text),
-                };
-                let rows = self.virtual_rows(key, &snapshot);
-                if editing_disabled && matches!(self.mode, TextViewMode::Editable(_)) {
+                let snapshot = self.snapshot();
+                let fold_key = fold_index::key(self.revision.unwrap_or(0), self.text);
+                let fold = fold_index::view_for(self.text, fold_key, snapshot.line_count());
+                let rows = self.virtual_rows(key, &snapshot, &fold);
+                let editable_fallback = matches!(self.mode, TextViewMode::Editable(_));
+                if let (Some(reason), true) = (disabled, editable_fallback) {
                     col()
                         .key(format!("{key}-frame"))
                         .w_full()
-                        .child(large_file_banner())
+                        .child(large_file_banner(reason))
                         .child(rows)
                 } else {
                     rows
@@ -298,6 +385,7 @@ impl<'a> TextView<'a> {
     /// [`TextView::build`] plus a one-shot reveal of `line` for search hits.
     /// `S` is the runtime's state type; the handler only needs `Tx`.
     pub fn build_revealing<S: 'static>(&self, key: &str, line: usize) -> El {
+        fold_index::note_reveal(line);
         let fired = Rc::new(Cell::new(false));
         let target = Self::row_key(key, line);
         self.build(key).on_visible::<S>(move |_, on, tx| {
@@ -308,25 +396,39 @@ impl<'a> TextView<'a> {
         })
     }
 
-    fn virtual_rows(&self, key: &str, snapshot: &Arc<Snapshot>) -> El {
+    fn virtual_rows(&self, key: &str, snapshot: &Arc<Snapshot>, fold: &Arc<FoldView>) -> El {
         let base = key.to_string();
-        let count = snapshot.line_count();
+        let count = fold.visible_count();
         let opts = Arc::new(RowOpts {
             base: base.clone(),
             first_column: self.first_column,
             visible_columns: self.visible_columns,
-            gutter_width: count.to_string().len().max(5),
+            gutter_width: snapshot.line_count().to_string().len().max(5),
             line_numbers: self.line_numbers,
             query: self.query.map(str::to_owned),
             highlight_line: self.highlight_line,
             horizontal_scroll: self.horizontal_scroll,
+            char_width: char_width(),
+            fold: Arc::clone(fold),
+            fold_key: fold_index::key(self.revision.unwrap_or(0), self.text),
+            error_line: self.error_line,
+            error_column: self.error_column,
         });
 
         let key_base = base.clone();
+        let key_fold = Arc::clone(fold);
         let build_opts = Arc::clone(&opts);
         let build_snapshot = Arc::clone(snapshot);
         let copy_opts = Arc::clone(&opts);
         let copy_snapshot = Arc::clone(snapshot);
+        // Re-key rows when the document, the fold generation or the error
+        // marker changes. A fold/unfold also changes `count` outright.
+        let version = (
+            snapshot.version(),
+            fold.epoch(),
+            self.error_line,
+            self.error_column,
+        );
 
         col()
             .key(base)
@@ -339,11 +441,27 @@ impl<'a> TextView<'a> {
             .virtual_rows::<AppState>(
                 count,
                 ROW_HEIGHT,
-                move |_state: &AppState, i: usize| Cow::Owned(format!("{key_base}-row-{i}")),
+                move |_state: &AppState, i: usize| {
+                    // Key each row by its document line (not its visual row),
+                    // so scroll_into_view and line numbers stay stable across
+                    // folds.
+                    Cow::Owned(format!("{key_base}-row-{}", key_fold.visual_to_doc(i)))
+                },
                 move |_state: &AppState, i: usize| render_row(&build_snapshot, &build_opts, i),
             )
-            .virtual_rows_version(snapshot.version())
+            .virtual_rows_version(version)
     }
+}
+
+/// Why editable mode fell back to the read-only virtualized view.
+#[derive(Clone, Copy)]
+enum EditDisabled {
+    Large(usize),
+    LongLine(usize),
+}
+
+fn mib(bytes: usize) -> f32 {
+    bytes as f32 / (1024.0 * 1024.0)
 }
 
 /// Settings captured by the `'static` `virtual_rows` closures.
@@ -356,20 +474,169 @@ struct RowOpts {
     query: Option<String>,
     highlight_line: Option<usize>,
     horizontal_scroll: bool,
+    /// Measured mono advance (from `char_width`), not a hard-coded constant.
+    char_width: f32,
+    fold: Arc<FoldView>,
+    fold_key: u64,
+    error_line: Option<usize>,
+    error_column: Option<usize>,
 }
 
-fn large_file_banner() -> El {
-    text(LARGE_FILE_BANNER)
+fn large_file_banner(reason: EditDisabled) -> El {
+    let (label, tint) = match reason {
+        EditDisabled::Large(n) => (
+            format!("Large file ({:.1} MB) — {LARGE_FILE_BANNER}", mib(n)),
+            oklcha(0.84, 0.12, 75.0, 0.12),
+        ),
+        EditDisabled::LongLine(n) => (
+            format!("Very long line ({:.1} MB on one line) — Format to edit", mib(n)),
+            oklcha(0.72, 0.15, 25.0, 0.14),
+        ),
+    };
+    text(label)
         .font(tok::type_::LABEL)
         .color(oklch(0.84, 0.12, 75.0))
         .padding(8.0)
-        .fill(oklcha(0.84, 0.12, 75.0, 0.12))
+        .fill(tint)
 }
 
-fn render_row(snapshot: &Snapshot, opts: &RowOpts, index: usize) -> El {
+/// Longest line (line endings excluded) in one allocation-free SIMD newline
+/// scan, with early exit as soon as a line exceeds `limit`. Used for the
+/// editable gate so it never builds/evicts a line index on every keystroke.
+fn longest_line(text: &str, limit: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut max = 0usize;
+    while i < bytes.len() {
+        match bytes[i..].iter().position(|&b| b == b'\n') {
+            Some(off) => {
+                let nl = i + off;
+                max = max.max(nl.saturating_sub(start));
+                if max > limit {
+                    return max;
+                }
+                i = nl + 1;
+                start = i;
+            }
+            None => {
+                max = max.max(bytes.len().saturating_sub(start));
+                break;
+            }
+        }
+    }
+    max
+}
+
+/// Editable-mode error marker: a red row band, a caret bar at the column and a
+/// gutter dot over the text input. The band carries the reveal key so
+/// `Tx::scroll_into_view(TextView::row_key(key, line - 1))` finds it.
+fn editable_error_view(input: El, key: &str, line: usize, column: usize) -> El {
+    let y = ((line - 1) as f32) * ROW_HEIGHT;
+    let x = ((column - 1) as f32) * char_width();
+    let band = el()
+        .key(format!("{key}-row-{}", line - 1))
+        .pin(Some(0.0), Some(y), Some(0.0), None)
+        .h(ROW_HEIGHT)
+        .w_full()
+        .fill(ERROR_TINT);
+    let caret = el()
+        .key(format!("{key}-error-caret"))
+        .pin(Some(x), Some(y), None, None)
+        .w(2.0)
+        .h(ROW_HEIGHT)
+        .fill(ERROR_INK);
+    let dot = text("●")
+        .key(format!("{key}-error-dot"))
+        .font(mono())
+        .color(ERROR_INK)
+        .pin(Some(2.0), Some(y), None, None)
+        .h(ROW_HEIGHT);
+    let label = text(format!("● line {line}, column {column}"))
+        .key(format!("{key}-error-label"))
+        .font(tok::type_::LABEL)
+        .color(ERROR_INK)
+        .pin(Some(16.0), Some(y), None, None)
+        .h(ROW_HEIGHT);
+    col()
+        .w_full()
+        .min_h(240.0)
+        .child(input.border(1.0, ERROR_INK).radius(6.0))
+        .child(band)
+        .child(caret)
+        .child(dot)
+        .child(label)
+}
+
+/// A folded opening line becomes `"key": {…}` / `[…]`.
+fn fold_placeholder(line: &str, is_array: bool) -> String {
+    let (open, close) = if is_array { ('[', ']') } else { ('{', '}') };
+    if let Some(pos) = line.rfind(open) {
+        let mut out = String::with_capacity(line.len() + 4);
+        out.push_str(&line[..=pos]);
+        out.push('…');
+        out.push(close);
+        out
+    } else {
+        format!("{open}…{close}")
+    }
+}
+
+/// Display-byte range of a 1-based error column, or `None` when the column is
+/// outside the shaped horizontal window.
+fn error_column_range(window: &ColumnWindow, column: usize) -> Option<(usize, usize)> {
+    let c = column.saturating_sub(1);
+    if c < window.byte_start || c >= window.byte_end {
+        return None;
+    }
+    let start = window.span_offset + (c - window.byte_start);
+    let end = (start + 1).min(window.span_offset + window.span_len);
+    (start < end).then_some((start, end))
+}
+
+/// Fixed-width fold gutter: a clickable ▸/▾ arrow on foldable lines, a red dot
+/// on error lines, blank otherwise. Every row reserves the same width so the
+/// document line numbers stay aligned.
+fn fold_gutter(
+    opts: &RowOpts,
+    doc_line: usize,
+    region: Option<fold_index::Region>,
+    folded: bool,
+    is_error: bool,
+) -> El {
+    let w = opts.char_width * 1.6;
+    let slot = el().w(w).h(ROW_HEIGHT).center();
+    if is_error {
+        return slot.child(text("●").font(mono()).color(ERROR_INK));
+    }
+    let Some(region) = region else {
+        return slot;
+    };
+    let glyph = if folded { "▸" } else { "▾" };
+    let start = region.start;
+    let key = opts.fold_key;
+    let label = if folded { "Unfold region" } else { "Fold region" };
+    slot.child(
+        text(glyph)
+            .key(format!("{}-fold-{doc_line}", opts.base))
+            .font(mono())
+            .color(oklch(0.72, 0.02, 250.0))
+            .role("button")
+            .label(label)
+            .on_press(move |state: &mut AppState| {
+                fold_index::toggle(key, start);
+                state.fold_epoch = state.fold_epoch.wrapping_add(1);
+            }),
+    )
+}
+
+fn render_row(snapshot: &Snapshot, opts: &RowOpts, visual_row: usize) -> El {
     let theme = tok::theme(true);
+    let index = opts.fold.visual_to_doc(visual_row); // 0-based document line
     let full_line = snapshot.line(index).unwrap_or_default();
-    let window = column_window(full_line, opts.first_column, opts.visible_columns);
+    let region = opts.fold.region(index);
+    let folded = opts.fold.is_folded(index);
+    let is_error = opts.error_line == Some(index + 1);
     let (_, _, _, _, punctuation_ink) = palette();
 
     let is_hit = opts.highlight_line == Some(index);
@@ -382,10 +649,24 @@ fn render_row(snapshot: &Snapshot, opts: &RowOpts, index: usize) -> El {
         punctuation_ink
     };
 
-    let spans = json_spans(
+    // A folded row shows a compact summary instead of its opening line.
+    let display_source: Cow<'_, str> = if folded {
+        Cow::Owned(fold_placeholder(full_line, region.is_some_and(|r| r.is_array)))
+    } else {
+        Cow::Borrowed(full_line)
+    };
+    let window = column_window(&display_source, opts.first_column, opts.visible_columns);
+    let mut spans = json_spans(
         &window.display[window.span_offset..window.span_offset + window.span_len],
         window.span_offset,
     );
+    if is_error {
+        if let Some(column) = opts.error_column {
+            if let Some((s, e)) = error_column_range(&window, column) {
+                spans.push(Span::new(s, e).underline(ERROR_INK).bg(ERROR_CARET_BG, 1.0));
+            }
+        }
+    }
     let line_el = text(window.display.clone())
         .font(mono())
         .color(base_ink)
@@ -395,31 +676,44 @@ fn render_row(snapshot: &Snapshot, opts: &RowOpts, index: usize) -> El {
 
     let mut content = row().w_full().gap(12.0);
     if opts.line_numbers {
-        // Fixed-width box + Align::End right-aligns the digits. With a real
-        // monospaced face the `>width` padding is exact too; both together keep
-        // the gutter aligned even if a proportional fallback ever resolves.
+        // Right-aligned document line numbers. Folded lines are skipped, so
+        // these remain the real document line numbers.
         content = content.child(
             text(format!("{:>width$}", index + 1, width = opts.gutter_width))
                 .font(mono())
                 .color(theme.text_secondary)
-                .w(opts.gutter_width as f32 * CHAR_WIDTH)
+                .w(opts.gutter_width as f32 * opts.char_width)
                 .align(Align::End),
         );
     }
+    content = content.child(fold_gutter(opts, index, region, folded, is_error));
 
     if opts.horizontal_scroll && (window.left_elided || window.right_elided) {
         let pan = window
             .total_bytes
             .saturating_sub(window.byte_end)
             .min(HORIZONTAL_PAN_COLUMNS);
-        let tail = el().w(pan as f32 * CHAR_WIDTH);
-        content = content.child(
-            row().scroll_x().w_full().child(line_el).child(tail),
-        );
+        let tail = el().w(pan as f32 * opts.char_width);
+        content = content.child(row().scroll_x().w_full().child(line_el).child(tail));
     } else {
         content = content.child(line_el);
     }
 
+    if folded {
+        if let Some(r) = region {
+            let noun = if r.is_array { "items" } else { "keys" };
+            content = content.child(
+                text(format!("… {} {}", r.child_count, noun))
+                    .key(format!("{}-fold-badge-{index}", opts.base))
+                    .font(mono())
+                    .color(theme.text_secondary),
+            );
+        }
+    }
+
+    if is_error {
+        content = content.fill(ERROR_TINT);
+    }
     if is_hit {
         content = content.fill(oklcha(0.78, 0.13, 150.0, 0.16));
     }

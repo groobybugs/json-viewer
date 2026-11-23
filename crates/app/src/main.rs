@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 
+mod fold_index;
 mod line_index;
 use std::path::PathBuf;
 

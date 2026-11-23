@@ -111,6 +111,12 @@ pub struct AppState {
     pub search_edit: TextEdit,
     /// Messages queued by view handlers, drained by the runner.
     pub pending: Vec<Msg>,
+    /// Invalidation counter for code folding. The fold *set* lives in the
+    /// revision-keyed store in `crate::fold_index` (the view only has
+    /// `&AppState`, but a reveal must be able to unfold a line before
+    /// `scroll_into_view`). Fold handlers bump this so Rune re-runs the view
+    /// after a fold/unfold; the value is not otherwise read by the model.
+    pub fold_epoch: u64,
 }
 
 impl Default for AppState {
@@ -124,6 +130,7 @@ impl Default for AppState {
             editors: HashMap::new(),
             search_edit: TextEdit::default(),
             pending: Vec::new(),
+            fold_epoch: 0,
         };
         state.add_tab();
         state
