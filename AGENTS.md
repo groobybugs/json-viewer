@@ -234,6 +234,17 @@ tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
   the index; big docs re-flatten
   off-thread when it toggles.
 
+## Wayland drag-and-drop (rp-xwayland)
+
+winit 0.30 (Rune's pin) has no `WINIT_UNIX_BACKEND` and prefers Wayland when
+`WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set. Rune builds the event loop and
+does not call `EventLoopBuilderExtX11::with_x11`. Native Wayland stays the
+default (scaling, IME). `--x11` and `JSON_VIEWER_BACKEND=x11` clear those two
+variables in `main` before `App::run` so winit falls back to X11/XWayland,
+where XDND works. `platform.rs` (binary module) parses the flag and env;
+macOS/Windows ignore them. Fractional scaling under XWayland is often blurry
+and IME is weaker. `packaging/linux/json-viewer.desktop` launches with
+`--x11`. Headless `drop_files` does not use the window backend.
 
 ## Build, test, run
 

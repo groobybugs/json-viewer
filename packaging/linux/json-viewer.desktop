@@ -1,0 +1,16 @@
+# JSON Viewer desktop entry. Launches under X11/XWayland so file
+# drag-and-drop works (winit 0.30 reports no file drags on native Wayland).
+# Install notes: packaging/linux/README.md
+# Edit Exec to an absolute path if `json-viewer` is not on PATH.
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=JSON Viewer
+GenericName=JSON Viewer
+Comment=View and format JSON (XWayland, so file drag-and-drop works)
+Exec=json-viewer --x11
+Terminal=false
+Categories=Utility;
+Keywords=json;viewer;format;
+StartupNotify=true
+StartupWMClass=json-viewer

@@ -71,8 +71,49 @@ asserts the rendered tree contains the app header.
 
 ## Wayland
 
-File drag-and-drop is not available on Wayland (winit 0.30 reports no file
-drags); use the Open button instead. See Wayland section.
+winit 0.30 (the revision Rune vendors) never reports file drags on native
+Wayland. The default launch stays on native Wayland: fractional scaling and
+IME are better there. Open still works. Drag-and-drop needs the X11 backend,
+which on a Wayland session is XWayland (XDND works).
+
+This winit has no `WINIT_UNIX_BACKEND` variable, and Rune builds the event
+loop itself (it does not call `with_x11`). `--x11` and
+`JSON_VIEWER_BACKEND=x11` clear `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` before
+the loop starts, leaving `DISPLAY` set, so winit falls back to X11. macOS and
+Windows ignore both. `--x11` wins over the environment variable. `auto` (the
+default) and an omitted variable do not change the environment. An unknown
+`JSON_VIEWER_BACKEND` value exits with an error. A stderr line starting with
+`json-viewer: window backend x11` confirms the opt-in.
+
+```sh
+cargo run --release -p json-viewer -- --x11
+JSON_VIEWER_BACKEND=x11 cargo run --release -p json-viewer
+JSON_VIEWER_BACKEND=wayland cargo run --release -p json-viewer   # explicit native Wayland
+JSON_VIEWER_BACKEND=auto cargo run --release -p json-viewer      # same as omitting it
+```
+
+**Trade-off.** XWayland gets drag-and-drop and loses native Wayland quality:
+fractional scaling is often blurry (the compositor scales an integer buffer),
+and IME (fcitx, ibus) is weaker than on native Wayland. Use `--x11` when you
+need to drop files; use the default when scaling and input matter more.
+
+**Desktop launcher.** `packaging/linux/json-viewer.desktop` starts the app
+with `--x11`. Install steps and the same trade-off are in
+`packaging/linux/README.md`. The window app id is `json-viewer`
+(`StartupWMClass`).
+
+**Manual check** (automated tests cannot drag a real file):
+
+1. `cargo build --release -p json-viewer`
+2. `./target/release/json-viewer --x11`
+3. Confirm stderr contains `json-viewer: window backend x11` and
+   `xwininfo -root -tree | grep "JSON Viewer"` finds the window.
+4. Drag a `.json` file from the file manager onto the window. It should open
+   as a tab.
+5. Drag a `.txt` file onto the window. The status line should read
+   `Not a JSON file: <name>`.
+6. Quit, launch without `--x11` on Wayland, and drag again. The drop is
+   ignored (winit limitation). Use Open.
 
 ## Project layout
 
