@@ -1154,10 +1154,9 @@ mod tests {
         assert_eq!(options.file_name.as_deref(), Some("JSON-1.json"));
         rt.resolve_file_dialog(Some(exported.clone())).unwrap();
         pump_until(&mut rt, |state| {
-            state
-                .status
-                .as_deref()
-                .is_some_and(|status| status.contains("out.json"))
+            state.status.as_deref().is_some_and(|status| {
+                status.starts_with("Exported") && status.contains("out.json")
+            })
         });
         assert_eq!(
             std::fs::read_to_string(&exported).unwrap(),
