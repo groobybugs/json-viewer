@@ -147,7 +147,7 @@ fn scripted_type_format_and_switch_to_output() {
 fn scripted_new_tab_and_tab_switching() {
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
-    click(&mut rt, "New JSON");
+    click(&mut rt, "new-tab");
     pump_until(&mut rt, "second tab created", |s| {
         s.tabs.len() == 2 && s.active == 2
     });
