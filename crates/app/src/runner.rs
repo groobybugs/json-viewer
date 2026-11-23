@@ -11,19 +11,28 @@
 //! Bytes move on `json-viewer-read` / `json-viewer-write`. Copy prefers
 //! `Tx::copy`; [`crate::io::spawn_clipboard_copy`] is the arboard fallback when
 //! [`crate::io::start_copy`] is given no `Tx`.
+//!
+//! [`Effect::Persist`] is debounced (~500ms after the last change) and saved on
+//! a single `json-viewer-persist` thread. [`on_close`] / [`on_quit`] flush the
+//! latest snapshot before the process can exit. `rune::run` does not take those
+//! hooks; wire them with `App::new(spec).on_close(on_close).on_quit(on_quit)`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rune::Tx;
 
 use crate::io::{self, CopyQueued};
 use crate::json_ops::{self, JobHandle};
-use crate::state::{AppState, Effect, Msg, TabId};
-use crate::{persist, search};
+#[cfg(not(test))]
+use crate::persist;
+use crate::search;
+use crate::state::{AppState, Effect, Msg, Tab, TabId};
 
 struct Inbox {
     tx: Sender<Msg>,
@@ -162,6 +171,437 @@ fn on_export_picked(
     }
 }
 
+/// How long after the last [`Effect::Persist`] before a save is started.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Bytes of tab text copied on the UI thread per poll.
+///
+/// A full `Vec<Tab>` clone of a 100MB string measured 37.7ms on this machine,
+/// over the 30ms budget, so the hot path never clones the document in one
+/// shot. One 4MB step measured 2.3ms.
+const PERSIST_CHUNK: usize = 4 * 1024 * 1024;
+
+type SaveHook = Arc<dyn Fn(&[Tab]) -> Result<(), String> + Send + Sync>;
+
+struct PersistJob {
+    tabs: Vec<Tab>,
+    gen: u64,
+}
+
+struct PersistAck {
+    gen: u64,
+    error: Option<String>,
+}
+
+struct PersistSlot {
+    job: Option<PersistJob>,
+    stop: bool,
+}
+
+struct PersistShared {
+    slot: Mutex<PersistSlot>,
+    wake: Condvar,
+    save: Mutex<SaveHook>,
+}
+
+#[derive(Clone, Copy)]
+enum CopyField {
+    Input,
+    Output,
+}
+
+struct CopyCursor {
+    dest: Vec<Tab>,
+    tab: usize,
+    field: CopyField,
+    offset: usize,
+    gen: u64,
+}
+
+enum CopyStep {
+    Continue,
+    Done,
+    Restart,
+}
+
+struct PersistCtrl {
+    shared: Arc<PersistShared>,
+    ack_rx: Receiver<PersistAck>,
+    join: Option<JoinHandle<()>>,
+    dirty: bool,
+    last_change: Instant,
+    debounce: Duration,
+    /// Bumped on every [`Effect::Persist`]. An in-flight chunked copy restarts
+    /// when this moves, so a newer edit wins.
+    edit_gen: u64,
+    copy: Option<CopyCursor>,
+    next_gen: u64,
+    acked: u64,
+}
+
+thread_local! {
+    static PERSIST: RefCell<Option<PersistCtrl>> = const { RefCell::new(None) };
+    static QUIT_FLUSHED: Cell<bool> = const { Cell::new(false) };
+}
+
+impl Drop for PersistCtrl {
+    fn drop(&mut self) {
+        {
+            let mut slot = self
+                .shared
+                .slot
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            slot.stop = true;
+        }
+        self.shared.wake.notify_one();
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn builtin_save(tabs: &[Tab]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = tabs;
+        Err("unit test persisted without a save hook".into())
+    }
+    #[cfg(not(test))]
+    {
+        persist::save_tabs(tabs).map_err(|err| err.to_string())
+    }
+}
+
+fn persist_worker(shared: Arc<PersistShared>, ack_tx: Sender<PersistAck>) {
+    loop {
+        let job = {
+            let mut slot = shared.slot.lock().unwrap_or_else(|err| err.into_inner());
+            loop {
+                if let Some(job) = slot.job.take() {
+                    break job;
+                }
+                if slot.stop {
+                    return;
+                }
+                slot = shared
+                    .wake
+                    .wait(slot)
+                    .unwrap_or_else(|err| err.into_inner());
+            }
+        };
+        let hook = shared
+            .save
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let error = hook(&job.tabs).err();
+        if ack_tx
+            .send(PersistAck {
+                gen: job.gen,
+                error,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn spawn_persist() -> PersistCtrl {
+    let shared = Arc::new(PersistShared {
+        slot: Mutex::new(PersistSlot {
+            job: None,
+            stop: false,
+        }),
+        wake: Condvar::new(),
+        save: Mutex::new(Arc::new(builtin_save)),
+    });
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let worker_shared = Arc::clone(&shared);
+    let join = std::thread::Builder::new()
+        .name("json-viewer-persist".into())
+        .spawn(move || persist_worker(worker_shared, ack_tx))
+        .expect("spawn persist worker");
+    PersistCtrl {
+        shared,
+        ack_rx,
+        join: Some(join),
+        dirty: false,
+        last_change: Instant::now(),
+        debounce: PERSIST_DEBOUNCE,
+        edit_gen: 0,
+        copy: None,
+        next_gen: 1,
+        acked: 0,
+    }
+}
+
+fn blank_snapshot(tab: &Tab) -> Tab {
+    let mut copy = Tab::new(tab.id, tab.title.clone());
+    copy.error = tab.error.clone();
+    copy.is_processing = tab.is_processing;
+    copy.view = tab.view;
+    copy.search_query = tab.search_query.clone();
+    copy.search_results = tab.search_results.clone();
+    copy.input.reserve(tab.input.len());
+    copy.output.reserve(tab.output.len());
+    copy
+}
+
+fn begin_copy(state: &AppState, gen: u64) -> CopyCursor {
+    CopyCursor {
+        dest: state.tabs.iter().map(blank_snapshot).collect(),
+        tab: 0,
+        field: CopyField::Input,
+        offset: 0,
+        gen,
+    }
+}
+
+/// Copies at most [`PERSIST_CHUNK`] bytes from `state` into `cursor`.
+fn step_copy(cursor: &mut CopyCursor, state: &AppState) -> CopyStep {
+    if cursor.dest.len() != state.tabs.len() {
+        return CopyStep::Restart;
+    }
+    let mut budget = PERSIST_CHUNK;
+    while budget > 0 && cursor.tab < state.tabs.len() {
+        let src = match cursor.field {
+            CopyField::Input => state.tabs[cursor.tab].input.as_str(),
+            CopyField::Output => state.tabs[cursor.tab].output.as_str(),
+        };
+        if cursor.offset > src.len() {
+            return CopyStep::Restart;
+        }
+        let take = (src.len() - cursor.offset).min(budget);
+        if take > 0 {
+            let end = cursor.offset + take;
+            let piece = &src[cursor.offset..end];
+            match cursor.field {
+                CopyField::Input => cursor.dest[cursor.tab].input.push_str(piece),
+                CopyField::Output => cursor.dest[cursor.tab].output.push_str(piece),
+            }
+            cursor.offset = end;
+            budget -= take;
+        }
+        if cursor.offset == src.len() {
+            cursor.offset = 0;
+            match cursor.field {
+                CopyField::Input => cursor.field = CopyField::Output,
+                CopyField::Output => {
+                    cursor.field = CopyField::Input;
+                    cursor.tab += 1;
+                }
+            }
+        }
+    }
+    if cursor.tab >= state.tabs.len() {
+        CopyStep::Done
+    } else {
+        CopyStep::Continue
+    }
+}
+
+fn with_persist<R>(f: impl FnOnce(&mut PersistCtrl) -> R) -> R {
+    PERSIST.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(spawn_persist());
+        }
+        f(slot.as_mut().expect("persist worker was just started"))
+    })
+}
+
+fn report_persist_error(state: &mut AppState, error: &str) {
+    let text = format!("Could not save tabs: {error}");
+    state.status = Some(text.clone());
+    state.dispatch(Msg::Status(text));
+}
+
+fn enqueue_persist(ctrl: &mut PersistCtrl, tabs: Vec<Tab>) -> u64 {
+    let gen = ctrl.next_gen;
+    ctrl.next_gen += 1;
+    {
+        let mut slot = ctrl
+            .shared
+            .slot
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // One waiting snapshot. A newer one replaces it; the worker saves that.
+        slot.job = Some(PersistJob { tabs, gen });
+    }
+    ctrl.shared.wake.notify_one();
+    gen
+}
+
+fn apply_ack(ctrl: &mut PersistCtrl, state: &mut AppState, ack: PersistAck) -> bool {
+    ctrl.acked = ctrl.acked.max(ack.gen);
+    if let Some(error) = ack.error {
+        report_persist_error(state, &error);
+        return true;
+    }
+    false
+}
+
+fn drain_acks(ctrl: &mut PersistCtrl, state: &mut AppState) -> bool {
+    let mut changed = false;
+    while let Ok(ack) = ctrl.ack_rx.try_recv() {
+        changed |= apply_ack(ctrl, state, ack);
+    }
+    changed
+}
+
+fn finish_copy(ctrl: &mut PersistCtrl, cursor: CopyCursor) {
+    let _ = enqueue_persist(ctrl, cursor.dest);
+}
+
+fn note_persist(tx: &mut Tx) {
+    with_persist(|ctrl| {
+        ctrl.edit_gen = ctrl.edit_gen.wrapping_add(1);
+        ctrl.dirty = true;
+        ctrl.last_change = Instant::now();
+        ctrl.copy = None;
+        tx.wake_after(ctrl.debounce);
+    });
+}
+
+fn start_or_continue_copy(ctrl: &mut PersistCtrl, state: &AppState, tx: &mut Tx) {
+    if ctrl
+        .copy
+        .as_ref()
+        .is_some_and(|cursor| cursor.gen != ctrl.edit_gen)
+    {
+        ctrl.copy = None;
+    }
+    if ctrl.copy.is_none() {
+        if !ctrl.dirty {
+            return;
+        }
+        let elapsed = ctrl.last_change.elapsed();
+        if elapsed < ctrl.debounce {
+            tx.wake_after(ctrl.debounce - elapsed);
+            return;
+        }
+        ctrl.dirty = false;
+        ctrl.copy = Some(begin_copy(state, ctrl.edit_gen));
+    }
+    let step = {
+        let cursor = ctrl.copy.as_mut().expect("copy cursor");
+        step_copy(cursor, state)
+    };
+    match step {
+        CopyStep::Continue => tx.wake_after(Duration::ZERO),
+        CopyStep::Restart => {
+            ctrl.copy = None;
+            ctrl.dirty = true;
+            ctrl.last_change = Instant::now();
+            tx.wake_after(ctrl.debounce);
+        }
+        CopyStep::Done => {
+            if let Some(cursor) = ctrl.copy.take() {
+                finish_copy(ctrl, cursor);
+            }
+        }
+    }
+}
+
+fn drive_persist(state: &mut AppState, tx: &mut Tx) -> bool {
+    let mut changed = false;
+    PERSIST.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctrl) = slot.as_mut() else {
+            return;
+        };
+        changed = drain_acks(ctrl, state);
+        if ctrl.copy.is_some() || ctrl.dirty {
+            start_or_continue_copy(ctrl, state, tx);
+        }
+    });
+    changed
+}
+
+/// Blocks until the latest tabs are saved. Used by [`on_close`] / [`on_quit`].
+fn flush_persist(state: &mut AppState) {
+    with_persist(|ctrl| {
+        ctrl.dirty = false;
+        ctrl.copy = None;
+        // Close/quit must finish before return. Chunk so we never call the
+        // 35ms full-document clone; the loop still runs to completion here.
+        let mut cursor = begin_copy(state, ctrl.edit_gen);
+        loop {
+            match step_copy(&mut cursor, state) {
+                CopyStep::Continue => {}
+                CopyStep::Done => break,
+                CopyStep::Restart => {
+                    cursor = begin_copy(state, ctrl.edit_gen);
+                }
+            }
+        }
+        let gen = enqueue_persist(ctrl, cursor.dest);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctrl.acked < gen {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                report_persist_error(state, "persist flush timed out");
+                return;
+            }
+            match ctrl.ack_rx.recv_timeout(remaining) {
+                Ok(ack) => {
+                    let _ = apply_ack(ctrl, state, ack);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    report_persist_error(state, "persist flush timed out");
+                    return;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    report_persist_error(state, "persist worker stopped");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Rune [`App::on_close`](rune::App::on_close). Saves the current tabs before
+/// the window goes, ignoring the debounce. `rune::run` does not register this;
+/// `main` must build the app with `App::new(spec).on_close(on_close).on_quit(on_quit)`.
+pub fn on_close(state: &mut AppState, tx: &mut Tx) {
+    let _ = tx;
+    flush_persist(state);
+}
+
+/// Rune [`App::on_quit`](rune::App::on_quit). Same flush as [`on_close`].
+/// Windows may end the process when this returns, so the save is finished first.
+pub fn on_quit(state: &mut AppState, tx: &mut Tx) {
+    on_close(state, tx);
+}
+
+#[cfg(test)]
+fn install_persist_save(hook: impl Fn(&[Tab]) -> Result<(), String> + Send + Sync + 'static) {
+    with_persist(|ctrl| {
+        ctrl.dirty = false;
+        ctrl.copy = None;
+        ctrl.debounce = PERSIST_DEBOUNCE;
+        {
+            let mut slot = ctrl
+                .shared
+                .slot
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            slot.job = None;
+        }
+        *ctrl
+            .shared
+            .save
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Arc::new(hook);
+    });
+}
+
+#[cfg(test)]
+fn set_persist_debounce(debounce: Duration) {
+    with_persist(|ctrl| ctrl.debounce = debounce);
+}
+
 /// Rune `poll` hook. Applies every queued message (view messages first, then
 /// completed background jobs) and returns whether state changed.
 pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
@@ -190,6 +630,13 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
     }
     if io_pending() {
         tx.wake_after(Duration::from_millis(16));
+    }
+    if rune::quitting() && !QUIT_FLUSHED.with(|flag| flag.replace(true)) {
+        flush_persist(state);
+        changed = true;
+    }
+    if drive_persist(state, tx) {
+        changed = true;
     }
     changed
 }
@@ -231,11 +678,7 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     })
                     .expect("spawn search worker thread");
             }
-            Effect::Persist => {
-                if let Err(error) = persist::save_tabs(&state.tabs) {
-                    state.dispatch(Msg::Status(format!("Could not save tabs: {error}")));
-                }
-            }
+            Effect::Persist => note_persist(tx),
             Effect::Copy(text) => match io::start_copy(Some(tx), &text) {
                 CopyQueued::Rune => {
                     state.dispatch(Msg::Status("Copied to clipboard".into()));
@@ -281,6 +724,7 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn io_view(state: &AppState, _cx: &mut Cx<AppState>) -> El {
@@ -542,5 +986,179 @@ mod tests {
             r#"{"n":1}"#,
             "export round trip"
         );
+    }
+
+    fn wait_saves(saved: &Arc<Mutex<Vec<String>>>, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while saved.lock().unwrap().len() < n {
+            if Instant::now() > deadline {
+                panic!("saves={:?}", saved.lock().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn debounce_coalesces_rapid_persists_into_one_save() {
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&saved);
+        install_persist_save(move |tabs| {
+            record.lock().unwrap().push(
+                tabs.first()
+                    .map(|tab| tab.input.clone())
+                    .unwrap_or_default(),
+            );
+            Ok(())
+        });
+        set_persist_debounce(Duration::from_secs(3600));
+        let mut state = AppState::default();
+        let mut tx = Tx::default();
+        for i in 0..8 {
+            state.update_input(state.active, format!("v{i}"));
+            execute(&mut state, &mut tx, vec![Effect::Persist]);
+        }
+        assert!(
+            !poll(&mut state, 0.0, &mut tx) || saved.lock().unwrap().is_empty(),
+            "poll must not block, and must not save before the debounce"
+        );
+        assert!(
+            saved.lock().unwrap().is_empty(),
+            "N rapid Persist effects saved early: {:?}",
+            saved.lock().unwrap()
+        );
+        set_persist_debounce(Duration::ZERO);
+        let started = Instant::now();
+        poll(&mut state, 0.0, &mut tx);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "debounced kick blocked the UI thread"
+        );
+        wait_saves(&saved, 1);
+        assert_eq!(saved.lock().unwrap().as_slice(), ["v7"]);
+        poll(&mut state, 0.0, &mut tx);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(saved.lock().unwrap().len(), 1, "coalesced save ran twice");
+    }
+
+    #[test]
+    fn persist_save_returns_before_save_tabs_finishes() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (done_tx, done_rx) = mpsc::channel();
+        let ui = std::thread::spawn(move || {
+            install_persist_save(move |_tabs| {
+                if let Some(tx) = started_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx.lock().unwrap().recv();
+                Ok(())
+            });
+            set_persist_debounce(Duration::ZERO);
+            let mut state = AppState::default();
+            let mut tx = Tx::default();
+            let started = Instant::now();
+            execute(&mut state, &mut tx, vec![Effect::Persist]);
+            poll(&mut state, 0.0, &mut tx);
+            let _ = done_tx.send(started.elapsed());
+        });
+        let elapsed = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_else(|_| {
+                let _ = release_tx.send(());
+                panic!("persist poll blocked on save_tabs");
+            });
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "save did not return immediately: {elapsed:?}"
+        );
+        assert!(
+            started_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "worker never entered save"
+        );
+        let _ = release_tx.send(());
+        ui.join().unwrap();
+    }
+
+    #[test]
+    fn close_flushes_a_debounced_snapshot() {
+        let saved = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&saved);
+        install_persist_save(move |_tabs| {
+            *count.lock().unwrap() += 1;
+            Ok(())
+        });
+        set_persist_debounce(Duration::from_secs(3600));
+        let mut state = AppState::default();
+        let mut tx = Tx::default();
+        state.update_input(state.active, "flush-me".into());
+        execute(&mut state, &mut tx, vec![Effect::Persist]);
+        poll(&mut state, 0.0, &mut tx);
+        assert_eq!(
+            *saved.lock().unwrap(),
+            0,
+            "debounce should still be holding"
+        );
+        on_close(&mut state, &mut tx);
+        assert_eq!(*saved.lock().unwrap(), 1, "close must flush one save");
+    }
+
+    #[test]
+    fn persist_failure_sets_status() {
+        install_persist_save(|_| Err("disk full".into()));
+        set_persist_debounce(Duration::ZERO);
+        let mut state = AppState::default();
+        let mut tx = Tx::default();
+        execute(&mut state, &mut tx, vec![Effect::Persist]);
+        poll(&mut state, 0.0, &mut tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.status.as_deref() != Some("Could not save tabs: disk full") {
+            if Instant::now() > deadline {
+                panic!("status={:?}", state.status);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            poll(&mut state, 0.0, &mut tx);
+        }
+    }
+
+    #[test]
+    fn hundred_mb_snapshot_step_is_under_30ms() {
+        let mut tabs = vec![crate::state::Tab::new(1, "big")];
+        tabs[0].input = "x".repeat(100 * 1024 * 1024);
+        let started = Instant::now();
+        let cloned = tabs.clone();
+        let clone_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("PERSIST_CLONE_MS={clone_ms:.3}");
+        assert_eq!(cloned[0].input.len(), 100 * 1024 * 1024);
+        drop(cloned);
+        drop(tabs);
+
+        let saved = Arc::new(Mutex::new(0usize));
+        let record = Arc::clone(&saved);
+        install_persist_save(move |tabs| {
+            *record.lock().unwrap() = tabs.first().map(|tab| tab.input.len()).unwrap_or(0);
+            Ok(())
+        });
+        set_persist_debounce(Duration::ZERO);
+        let mut state = AppState::default();
+        state.active_tab_mut().unwrap().input = "x".repeat(100 * 1024 * 1024);
+        let mut tx = Tx::default();
+        execute(&mut state, &mut tx, vec![Effect::Persist]);
+        let started = Instant::now();
+        poll(&mut state, 0.0, &mut tx);
+        let step = started.elapsed();
+        eprintln!("PERSIST_STEP_MS={:.3}", step.as_secs_f64() * 1000.0);
+        assert!(
+            step < Duration::from_millis(30),
+            "snapshot step blocked the UI thread: {step:?} (full clone was {clone_ms:.3} ms)"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *saved.lock().unwrap() != 100 * 1024 * 1024 {
+            if Instant::now() > deadline {
+                panic!("saved len={}", saved.lock().unwrap());
+            }
+            poll(&mut state, 0.0, &mut tx);
+        }
     }
 }
