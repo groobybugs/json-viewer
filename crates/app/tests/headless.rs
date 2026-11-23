@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use json_viewer::json_ops::{self, JsonAction};
@@ -15,6 +16,19 @@ use json_viewer::{headless, runner};
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::Runtime;
 use serde_json::Value;
+
+/// `fold_index` keeps one process-wide store, and `TextView::row_key` records a
+/// pending reveal keyed by view base. Every test here drives the real
+/// `ui::view`, whose Output base is `output-text`, so an unguarded test's
+/// frame can consume another test's reveal. No folds are set yet, but the
+/// store is shared: serialize the tests that render the app.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn target_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
@@ -115,6 +129,7 @@ fn render_qa_png(rt: &mut Runtime<AppState>, name: &str) -> Value {
 
 #[test]
 fn scripted_type_format_and_switch_to_output() {
+    let _guard = serial();
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
     let initial_tree = render_qa_png(&mut rt, "initial");
     assert!(initial_tree.to_string().contains("JSON Viewer"));
@@ -150,6 +165,7 @@ fn scripted_type_format_and_switch_to_output() {
 
 #[test]
 fn scripted_new_tab_and_tab_switching() {
+    let _guard = serial();
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
     click(&mut rt, "new-tab");
@@ -174,6 +190,7 @@ fn scripted_new_tab_and_tab_switching() {
 
 #[test]
 fn scripted_search_displays_results() {
+    let _guard = serial();
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
     click(&mut rt, "editor-1");
@@ -203,6 +220,7 @@ fn scripted_search_displays_results() {
 
 #[test]
 fn scripted_clearing_search_clears_results() {
+    let _guard = serial();
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
     click(&mut rt, "editor-1");
@@ -259,6 +277,7 @@ fn large_single_line_fixture() -> String {
 
 #[test]
 fn scripted_large_single_line_format_from_open_and_paste() {
+    let _guard = serial();
     let content = large_single_line_fixture();
     assert!(content.len() > 6 * 1024 * 1024);
     assert!(!content.is_ascii());
@@ -316,6 +335,7 @@ fn scripted_large_single_line_format_from_open_and_paste() {
 
 #[test]
 fn scripted_invalid_json_shows_error() {
+    let _guard = serial();
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
     click(&mut rt, "editor-1");
@@ -339,6 +359,7 @@ fn scripted_invalid_json_shows_error() {
 
 #[test]
 fn scripted_file_drop_loads_tab() {
+    let _guard = serial();
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("dropped.json");
     std::fs::write(&path, r#"{"dropped":true}"#).expect("write dropped fixture");
@@ -361,6 +382,7 @@ fn scripted_file_drop_loads_tab() {
 
 #[test]
 fn scripted_search_hit_scrolls_output_to_line() {
+    let _guard = serial();
     let mut input = String::from("{\"items\":[");
     for index in 0..120 {
         if index > 0 {

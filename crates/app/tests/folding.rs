@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use json_viewer::fold_index::{self, FoldIndex};
@@ -24,6 +24,20 @@ use serde_json::Value;
 
 const SIZE: (f32, f32) = (960.0, 640.0);
 const SCALE: f32 = 1.0;
+
+/// `fold_index` is one process-wide store: fold states, pending reveals keyed
+/// by view base, hover and its LRU. The app is single-threaded, but libtest
+/// runs these tests in parallel inside one process, so an unguarded view build
+/// using the `output-text` base can consume another test's pending reveal and
+/// leave its folds in place (`output_search_hit_click_unfolds_and_reveals_the_row`).
+/// Serialize every test that touches the store.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn target_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
@@ -215,6 +229,7 @@ fn element_keys(tree: &Value) -> Vec<String> {
 
 #[test]
 fn fold_arrow_collapses_to_a_placeholder_with_a_badge() {
+    let _guard = serial();
     let revision = 7_100_001;
     let mut rt = fresh_runtime(doc_state(&small_doc(), revision), view_small);
     assert!(
@@ -261,6 +276,7 @@ fn fold_arrow_collapses_to_a_placeholder_with_a_badge() {
 
 #[test]
 fn fold_all_and_fold_level_pngs() {
+    let _guard = serial();
     let revision = 7_100_002;
     let mut state = doc_state(&api_doc(), revision);
     let key = fold_index::key(revision, &state.tabs[0].output);
@@ -301,6 +317,7 @@ fn fold_all_and_fold_level_pngs() {
 
 #[test]
 fn toolbar_fold_buttons_collapse_and_restore_the_output() {
+    let _guard = serial();
     let revision = 7_100_004;
     let mut state = doc_state(&api_doc(), revision);
     state.tabs[0].output_revision = revision;
@@ -339,6 +356,7 @@ fn toolbar_fold_buttons_collapse_and_restore_the_output() {
 
 #[test]
 fn reveal_of_a_folded_line_unfolds_it_before_scrolling() {
+    let _guard = serial();
     let revision = 7_100_005;
     let doc = api_doc();
     let mut state = doc_state(&doc, revision);
@@ -385,6 +403,7 @@ fn reveal_of_a_folded_line_unfolds_it_before_scrolling() {
 
 #[test]
 fn line_numbers_stay_document_numbers_when_folded() {
+    let _guard = serial();
     let revision = 7_100_006;
     let doc = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3,\n  \"d\": 4\n}\n";
     let mut state = doc_state(doc, revision);
@@ -417,6 +436,7 @@ fn line_numbers_stay_document_numbers_when_folded() {
 
 #[test]
 fn error_marker_pngs_read_only_and_editable() {
+    let _guard = serial();
     let revision = 7_100_007;
     let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}\n";
     let error = json_viewer::json_ops::validate(input).expect_err("invalid fixture");
@@ -451,6 +471,7 @@ fn error_marker_pngs_read_only_and_editable() {
 
 #[test]
 fn output_search_hit_click_unfolds_and_reveals_the_row() {
+    let _guard = serial();
     let revision = 7_100_009;
     let doc = api_doc();
     let target = doc
@@ -495,6 +516,7 @@ fn output_search_hit_click_unfolds_and_reveals_the_row() {
 /// toolbar/keyboard layer can be tested without a window.
 #[test]
 fn keyboard_fold_chords_apply_to_the_output() {
+    let _guard = serial();
     let revision = 7_100_008;
     let state = doc_state(&api_doc(), revision);
     let key = fold_index::key(revision, &state.tabs[0].output);
@@ -625,6 +647,7 @@ fn line_count(text: &str) -> usize {
 #[test]
 #[ignore = "release timing evidence: cargo test --release --test folding -- --ignored"]
 fn release_fold_index_build_7mb_and_100mb() {
+    let _guard = serial();
     for (label, doc) in [("7MB", doc_6_9mb()), ("100MB", doc_100mb())] {
         let lines = line_count(&doc);
         let t = Instant::now();
@@ -643,6 +666,7 @@ fn release_fold_index_build_7mb_and_100mb() {
 #[test]
 #[ignore = "release timing evidence: cargo run in release"]
 fn release_fold_all_and_frame_time_on_2m_lines() {
+    let _guard = serial();
     let doc = doc_2m_nested();
     let revision = 7_200_001;
     let key = revision;
@@ -749,6 +773,7 @@ fn release_fold_all_and_frame_time_on_2m_lines() {
 #[test]
 #[ignore = "release evidence PNG: cargo test --release --test folding -- --ignored"]
 fn release_png_100mb_folded_mid_document() {
+    let _guard = serial();
     let doc = doc_2m_nested();
     let revision = 7_300_001;
     let text: Arc<str> = Arc::from(doc.as_str());
