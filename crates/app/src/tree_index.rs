@@ -279,7 +279,22 @@ impl<'a> Builder<'a> {
         while i < self.text.len() {
             match self.text[i] {
                 b'"' => return Ok(i + 1),
-                b'\\' => i += 2,
+                b'\\' => {
+                    i += 1;
+                    match self.text.get(i).copied() {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                            i += 1;
+                        }
+                        Some(b'u') => {
+                            let hex = self.text.get(i + 1..i + 5).ok_or(())?;
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return Err(());
+                            }
+                            i += 5;
+                        }
+                        _ => return Err(()),
+                    }
+                }
                 b if b < 0x20 => return Err(()),
                 _ => i += 1,
             }
@@ -543,17 +558,31 @@ impl TreeIndex {
     }
 
     /// Finds the node a ` → `-joined path (the search results' format)
-    /// points at, starting from the root. An empty path is the root itself;
-    /// a path that does not resolve is `None`.
+    /// points at, starting from the root. An empty path is the root itself.
+    /// Keys may themselves contain the display separator, so an exact match
+    /// for the remaining path wins before the split-path interpretation.
     pub fn node_for_path(&self, text: &str, path: &str) -> Option<u32> {
+        self.node_for_path_from(text, 0, path)
+    }
+
+    fn node_for_path_from(&self, text: &str, node: u32, path: &str) -> Option<u32> {
         if path.is_empty() {
-            return Some(0);
+            return Some(node);
         }
-        let mut node = 0u32;
-        for segment in path.split(" → ") {
-            node = self.child_by_segment(text, node, segment)?;
+        if let Some(exact) = self.child_by_segment(text, node, path) {
+            return Some(exact);
         }
-        Some(node)
+        for (split, _) in path.match_indices(" → ") {
+            let first = &path[..split];
+            let rest = &path[split + " → ".len()..];
+            let Some(child) = self.child_by_segment(text, node, first) else {
+                continue;
+            };
+            if let Some(found) = self.node_for_path_from(text, child, rest) {
+                return Some(found);
+            }
+        }
+        None
     }
 }
 

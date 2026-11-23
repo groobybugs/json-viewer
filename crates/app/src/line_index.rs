@@ -372,6 +372,23 @@ pub fn snapshot(text: &str) -> Arc<Snapshot> {
     snapshot_keyed(text, TextKey::of(text))
 }
 
+/// Publishes a complete buffer-keyed index for a restored Output tab. Unlike
+/// worker-owned revisions, a persisted revision of zero has no background job
+/// that could replace the provisional prefix. The Output mount calls this once;
+/// [`snapshot`] then returns the warmed entry on every subsequent frame.
+pub(crate) fn prewarm_restored_output(text: &str) -> Arc<Snapshot> {
+    let key = TextKey::of(text);
+    if let Some(hit) = lock().entries.get(&key).cloned() {
+        if !hit.is_partial() {
+            return hit;
+        }
+    }
+    insert(Arc::new(Snapshot::full_with_key(
+        Arc::from(text),
+        key,
+    )))
+}
+
 /// Returns the shared snapshot for a reducer-assigned document revision.
 pub fn snapshot_for_revision(text: &str, revision: u64) -> Arc<Snapshot> {
     snapshot_keyed(text, TextKey::for_revision(revision))

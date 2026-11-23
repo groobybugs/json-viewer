@@ -92,18 +92,7 @@ pub fn search(
     } else {
         query.to_lowercase()
     };
-    let mut searcher = Searcher {
-        needle: &needle,
-        opts,
-        cancel,
-        path: Vec::new(),
-        line: 0,
-        hits: Vec::new(),
-        aborted: false,
-        serialize_only: false,
-        pending: None,
-        captures: Vec::new(),
-    };
+    let mut searcher = Searcher::new(&needle, opts, cancel);
     let mut de = serde_json::Deserializer::from_str(input);
     let outcome = (&mut de)
         .deserialize_any(ValVisitor {
@@ -112,11 +101,199 @@ pub fn search(
         })
         .and_then(|()| de.end());
     if outcome.is_err() && !searcher.aborted {
-        // Invalid JSON: the scaffold's `from_str::<Value>` failed the same
-        // way and returned no hits.
-        return Vec::new();
+        // serde_json rejects grammar the application's hand-rolled parser
+        // deliberately accepts (lone surrogates, arbitrary-size numbers and
+        // deep nesting). Reuse the tree tokenizer for that exceptional path;
+        // the ordinary 100 MB scan never pays for a second parser or a DOM.
+        if crate::json_ops::validate(input).is_err() {
+            return Vec::new();
+        }
+        return search_tree_fallback(input, &needle, opts, cancel);
     }
     searcher.hits
+}
+
+/// Non-recursive walk over the application's own JSON grammar. Tree nodes are
+/// already in document order; explicit events preserve the serde walk's path,
+/// pretty-line, preview-capture, cancellation and result-cap semantics.
+fn search_tree_fallback(
+    input: &str,
+    needle: &str,
+    opts: SearchOptions,
+    cancel: &AtomicBool,
+) -> Vec<SearchHit> {
+    use crate::tree_index::{NodeKind, TreeIndex};
+
+    let Ok(index) = TreeIndex::build(input) else {
+        // This is reachable only if the validator and tree tokenizer drift
+        // apart. Never disguise that as "No matches": raw hits explicitly
+        // identify themselves as an unstructured fallback in the panel.
+        return raw_substring_fallback(input, needle, opts, cancel);
+    };
+    let mut s = Searcher::new(needle, opts, cancel);
+
+    enum Event {
+        Entry {
+            node: u32,
+            key: String,
+            quoted_key: Option<String>,
+        },
+        Value {
+            node: u32,
+            entry_line: usize,
+            pop_path: bool,
+        },
+        Close {
+            node: u32,
+            close: char,
+        },
+        Finish { pop_path: bool },
+    }
+
+    let mut events = vec![Event::Value {
+        node: 0,
+        entry_line: 0,
+        pop_path: false,
+    }];
+    let outcome: Result<(), serde_json::Error> = (|| {
+        while let Some(event) = events.pop() {
+            match event {
+                Event::Entry {
+                    node,
+                    key,
+                    quoted_key,
+                } => {
+                    let entry_line = s.enter_entry(&key)?;
+                    if !s.captures.is_empty() {
+                        s.capture_entry(quoted_key.as_deref());
+                    }
+                    events.push(Event::Value {
+                        node,
+                        entry_line: entry_line.unwrap_or(0),
+                        pop_path: entry_line.is_some(),
+                    });
+                }
+                Event::Value {
+                    node,
+                    entry_line,
+                    pop_path,
+                } => {
+                    match index.kind(node) {
+                        NodeKind::String => {
+                            let decoded = crate::tree_index::decode_string_token(
+                                index.value_text(input, node),
+                            );
+                            if !s.captures.is_empty() {
+                                let quoted =
+                                    serde_json::to_string(decoded.as_ref()).unwrap_or_default();
+                                for cap in &mut s.captures {
+                                    cap.buf.push_str(&quoted);
+                                }
+                            }
+                            if let Some(hit) = s.pending.take() {
+                                s.hits[hit].value_preview = decoded.as_ref().to_owned();
+                            }
+                            if !s.serialize_only
+                                && !s.path.is_empty()
+                                && matches(&decoded, s.needle, s.opts.case_sensitive)
+                            {
+                                s.push_value_hit(entry_line, &decoded);
+                            }
+                        }
+                        NodeKind::Number => {
+                            s.number_text(entry_line, index.value_text(input, node));
+                        }
+                        NodeKind::Bool | NodeKind::Null => {
+                            let text = index.value_text(input, node);
+                            for cap in &mut s.captures {
+                                cap.buf.push_str(text);
+                            }
+                            if let Some(hit) = s.pending.take() {
+                                s.hits[hit].value_preview = text.to_owned();
+                            }
+                        }
+                        NodeKind::Object | NodeKind::Array => {
+                            s.container_checks()?;
+                            let object = index.kind(node) == NodeKind::Object;
+                            s.open_container(if object { '{' } else { '[' });
+                            events.push(Event::Finish { pop_path });
+                            events.push(Event::Close {
+                                node,
+                                close: if object { '}' } else { ']' },
+                            });
+                            for (child_index, child) in
+                                index.child_ids(node).into_iter().enumerate().rev()
+                            {
+                                let key = if object {
+                                    index
+                                        .key_text(input, child)
+                                        .expect("object child has a key")
+                                        .into_owned()
+                                } else {
+                                    child_index.to_string()
+                                };
+                                let quoted_key = object
+                                    .then(|| serde_json::to_string(&key).unwrap_or_default());
+                                events.push(Event::Entry {
+                                    node: child,
+                                    key,
+                                    quoted_key,
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                    if pop_path {
+                        s.path.pop();
+                    }
+                }
+                Event::Close { node, close } => {
+                    if index.child_count(node) > 0 {
+                        s.line += 1;
+                    }
+                    s.close_container(close);
+                }
+                Event::Finish { pop_path } => {
+                    if pop_path {
+                        s.path.pop();
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    if outcome.is_err() && !s.aborted {
+        return raw_substring_fallback(input, needle, opts, cancel);
+    }
+    s.hits
+}
+
+fn raw_substring_fallback(
+    input: &str,
+    needle: &str,
+    opts: SearchOptions,
+    cancel: &AtomicBool,
+) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        if cancel.load(Ordering::SeqCst)
+            || (opts.max_results != 0 && hits.len() >= opts.max_results)
+        {
+            break;
+        }
+        if matches(line, needle, opts.case_sensitive) {
+            hits.push(SearchHit {
+                path: format!(
+                    "Raw text match (structured search unavailable) · line {}",
+                    index + 1
+                ),
+                key: None,
+                value_preview: line.trim().to_owned(),
+                line: Some(index + 1),
+            });
+        }
+    }
+    hits
 }
 
 fn matches(text: &str, needle: &str, case_sensitive: bool) -> bool {
@@ -158,6 +335,23 @@ struct Capture {
     stack: Vec<bool>,
     /// Hit index whose preview this buffer fills.
     placeholder: usize,
+}
+
+impl<'a> Searcher<'a> {
+    fn new(needle: &'a str, opts: SearchOptions, cancel: &'a AtomicBool) -> Self {
+        Self {
+            needle,
+            opts,
+            cancel,
+            path: Vec::new(),
+            line: 0,
+            hits: Vec::new(),
+            aborted: false,
+            serialize_only: false,
+            pending: None,
+            captures: Vec::new(),
+        }
+    }
 }
 
 impl Searcher<'_> {
@@ -437,6 +631,14 @@ impl<'de, 's, 'a> Visitor<'de> for ValVisitor<'s, 'a> {
     where
         E: DeError,
     {
+        // Integers outside serde_json's i64/u64 storage are silently routed
+        // through f64 (and may be rounded) instead of producing a parse error.
+        // Reject that lossy representation so the caller retries with the
+        // application's raw-number tokenizer. In-range floating-point values
+        // keep the original fast path and formatting.
+        if v <= i64::MIN as f64 || v >= u64::MAX as f64 {
+            return Err(E::custom("number requires the raw-token search walk"));
+        }
         // Format like `serde_json::Value` would, so previews and matches are
         // identical to the tree-based scaffold.
         let text = serde_json::Number::from_f64(v)
@@ -646,6 +848,39 @@ mod tests {
     fn empty_containers_preview_as_braces() {
         assert_eq!(run(r#"{"a":{}}"#, "a")[0].value_preview, "{}");
         assert_eq!(run(r#"{"b":[]}"#, "b")[0].value_preview, "[]");
+    }
+
+    #[test]
+    fn tree_fallback_matches_normal_walk_previews_lines_and_caps() {
+        let fallback = r#"{"other":"\uD800","a":{"a":[1,true,null,"needle"]}}"#;
+        let normal = r#"{"other":"ok","a":{"a":[1,true,null,"needle"]}}"#;
+        for query in ["a", "needle", "1", "true"] {
+            for max_results in [0, 1, 2, 1000] {
+                let opts = SearchOptions {
+                    max_results,
+                    ..SearchOptions::default()
+                };
+                let cancel = AtomicBool::new(false);
+                assert_eq!(
+                    search(fallback, query, opts, &cancel),
+                    search(normal, query, opts, &cancel),
+                    "query {query:?}, cap {max_results}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_fallback_labels_its_status_and_matches_case_insensitively() {
+        let hits = raw_substring_fallback(
+            "first\nNeedle here",
+            "needle",
+            SearchOptions::default(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("structured search unavailable"));
+        assert_eq!(hits[0].line, Some(2));
     }
 
     #[test]
