@@ -62,7 +62,7 @@ pub fn row_key(base: &str, line: usize) -> String {
 }
 
 /// Builds the editor for `tab` under `base` (`editor-{id}`). The caller puts
-/// it inside the `document-scroll-{id}` scroll viewport.
+/// it inside the `document-scroll-{id}-input` scroll viewport.
 pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) -> El {
     let id = tab.id;
     let cw = char_width();
@@ -72,7 +72,7 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
     // container or the viewport resizes/moves. First frame reads None →
     // window at 0. The container itself is the anchor: its top is the
     // content top, and unlike a zero-height spacer it is always laid out.
-    let scroll_key = format!("document-scroll-{id}");
+    let scroll_key = format!("document-scroll-{id}-input");
     let viewport = cx.window_layout_with(&scroll_key, |r| (r[1], r[2], r[3]));
     let anchor_y = cx.window_layout_with(base, |r| r[1]);
     let (vp_top, vp_w, vp_h) = viewport.unwrap_or((0.0, FALLBACK_VIEWPORT.0, FALLBACK_VIEWPORT.1));

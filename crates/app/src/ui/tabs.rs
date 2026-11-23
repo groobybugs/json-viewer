@@ -13,6 +13,13 @@ static ADD_ICON: rune::Icon = rune::Icon {
     body: r#"<path d="M8 3.5V12.5M3.5 8H12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
 };
 
+/// Key of the document viewport currently mounted by the real UI.
+pub(crate) fn active_scroll_key(state: &AppState) -> Option<String> {
+    let tab = state.active_tab()?;
+    let tree_open = state.tree.get(&tab.id).is_some_and(|tree| tree.open);
+    Some(document_scroll_key(tab.id, tab.view, tree_open))
+}
+
 /// Browser-style tabs connect the active document to its card. The trailing
 /// add button stays reachable while the tab row itself scrolls horizontally.
 pub fn tab_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
@@ -112,6 +119,19 @@ pub fn tab_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .child(row().h(38.0).center().child(add))
 }
 
+/// The stable viewport key for one tab's Input, Output or Tree display.
+pub(crate) fn document_scroll_key(id: u64, view: TabView, tree_open: bool) -> String {
+    let view = if tree_open {
+        "tree"
+    } else {
+        match view {
+            TabView::Input => "input",
+            TabView::Output => "output",
+        }
+    };
+    format!("document-scroll-{id}-{view}")
+}
+
 /// Input or output for the active tab, plus its validation alert/panel.
 pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let Some(tab) = state.active_tab() else {
@@ -140,13 +160,28 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
                 .fill(PANEL_BG),
         }
     };
+    let scroll_key = document_scroll_key(
+        tab.id,
+        tab.view,
+        state.tree.get(&tab.id).is_some_and(|tree| tree.open),
+    );
+    let offsets = state.scroll_offsets.clone();
+    let offset_key = scroll_key.clone();
     let scroller = col()
-        .key(format!("document-scroll-{}", tab.id))
+        .key(scroll_key)
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .fill(PANEL_BG)
         .scroll_xy()
+        .on_scroll_offset(move |at| {
+            let mut offsets = offsets.borrow_mut();
+            if let Some(offset) = offsets.get_mut(offset_key.as_str()) {
+                *offset = at.offset[1];
+            } else {
+                offsets.insert(offset_key.clone(), at.offset[1]);
+            }
+        })
         .child(body);
 
     col()
