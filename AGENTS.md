@@ -215,6 +215,29 @@ state, Rune re-runs the view and diffs keyed elements. Give dynamic elements
 stable `.key(..)` values; `Runtime::find` / `presented` and tests address
 elements by key.
 
+### Wave-1 integration (wave-1 branches)
+
+- **Fonts.** `main.rs` sets `spec.fonts = headless::APP_FONTS` and
+  `spec.families = headless::APP_FAMILIES`. `AppSpec::new` defaults *both*
+  slots to `"Inter"`, so `TextStyle::mono()` resolves to a proportional face
+  unless the mono slot names the registered `"IBM Plex Mono"`.
+  `headless::text_system()`/`runtime()` use the same faces;
+  `TextSystem::new` replaces Rune's built-in Inter faces when `fonts` is
+  non-empty, so all four assets are needed.
+- **Lifecycle.** `main.rs` runs
+  `rune::App::new(spec).on_close(runner::on_close).on_quit(runner::on_quit).run()`.
+  Both hooks call `runner::flush_persist`, which synchronously drains the
+  debounced persist worker before the window/app goes away.
+- **Line index.** The `Effect::SpawnJson` callback in `runner.rs` calls
+  `line_index::prewarm_off_thread(Arc::from(output))` on the JSON worker
+  thread before it sends `Msg::JsonDone`, so the first Output frame finds the
+  full index. A cold `line_index::snapshot` for a document >= 8 MiB is
+  provisional (first 64 KiB) until that prewarm lands.
+- **Row keys.** Read-only `TextView` rows are keyed
+  `TextView::row_key(base, line)` -> `{base}-row-{line}`; use
+  `TextView::build_revealing(base, line)` or `Tx::scroll_into_view` with that
+  key to jump to a line.
+
 ### Theme and components
 
 - `rune::tok::theme(true)` is the dark palette (`bg`, `card`, `text`,
@@ -301,10 +324,10 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
   itself use `.growth(GrowthSpec::default())`; the row builder receives
   `(&S, i)` and must find rows by key, not index. `on_visible_rows` reports
   the visible index range.
-- `TextView` uses the simpler windowed contract (`first_line` +
-  `visible_lines`) because JSON lines are fixed-height monospace. A later
-  worker can wire a scroll observer to those fields or switch the read-only
-  path to `virtual_rows`; both preserve the frozen API.
+- `TextView` renders read-only JSON through `line_index::Snapshot` and
+  `virtual_rows`, so a large document builds only the mounted window. It
+  keeps the windowed `first_line`/`visible_lines` contract for tests and
+  non-virtualized callers. Use `TextView::row_key` for row keys.
 - `El::scroll_x()` / `scroll_xy()` for wide JSON; `Tx::scroll_into_view(key)`
   to reveal a search hit. Wheel/trackpad momentum is built in.
 

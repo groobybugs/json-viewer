@@ -69,5 +69,8 @@ fn main() {
     spec.fonts = headless::APP_FONTS;
     spec.families = headless::APP_FAMILIES;
     spec.poll = Some(runner::poll);
-    rune::run(spec);
+    rune::App::new(spec)
+        .on_close(runner::on_close)
+        .on_quit(runner::on_quit)
+        .run();
 }

@@ -652,6 +652,11 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
             Effect::SpawnJson { tab, input, action } => {
                 let tx = sender();
                 let handle = json_ops::spawn_process(input, action, move |result| {
+                    // Build the full line index off the UI thread from the
+                    // worker-owned output before the reducer publishes it.
+                    if let Ok(output) = &result {
+                        crate::line_index::prewarm_off_thread(Arc::from(output.as_str()));
+                    }
                     let _ = tx.send(Msg::JsonDone { tab, result });
                 });
                 JOBS.with(|jobs| {
