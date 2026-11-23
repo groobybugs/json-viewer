@@ -18,6 +18,7 @@ pub mod persist;
 pub mod runner;
 pub mod search;
 pub mod state;
+pub mod tree_index;
 pub mod ui;
 
 pub use state::{AppState, Effect, Msg, Tab, TabId, TabView};

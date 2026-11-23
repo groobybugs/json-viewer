@@ -70,8 +70,13 @@ fn main() {
     spec.families = headless::APP_FAMILIES;
     spec.poll = Some(runner::poll);
     spec.on_key = Some(ui::on_key);
-    rune::App::new(spec)
+    let app = rune::App::new(spec)
         .on_close(runner::on_close)
-        .on_quit(runner::on_quit)
-        .run();
+        .on_quit(runner::on_quit);
+    // Give the tree explorer a way to deliver off-thread results: its
+    // index/rows workers call `AppHandle::update` to wake the loop and queue
+    // a Msg for `runner::poll` (see tree_index::ensure_index). Without this
+    // (tests, `--headless`) every tree job runs synchronously.
+    json_viewer::tree_index::set_app_handle(app.handle());
+    app.run();
 }

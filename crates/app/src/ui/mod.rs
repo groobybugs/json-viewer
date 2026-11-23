@@ -10,6 +10,7 @@ pub mod shell;
 pub mod tabs;
 pub mod text_view;
 pub mod toolbar;
+pub mod tree_view;
 
 use rune::{col, Color, Cx, El, KeyEvent, Tx};
 use rune_kit::{Kit, PaletteSeed};

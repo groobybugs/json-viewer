@@ -55,38 +55,45 @@ pub fn tab_content(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let Some(tab) = state.active_tab() else {
         return col().w_full().grow(1.0).fill(EDITOR_BG);
     };
-    let body = match tab.view {
-        TabView::Input => {
-            let edit = state.editor(tab.id).expect("every tab has an editor");
-            TextView::editable(&tab.input, edit)
-                .revision(tab.input_revision)
+    // The tree explorer is a third display mode held outside `TabView` (its
+    // open flag lives in `AppState::tree`); when it is on, it replaces the
+    // code text area entirely.
+    let body = if state.tree.get(&tab.id).is_some_and(|tree| tree.open) {
+        super::tree_view::tree_body(state, tab.id)
+    } else {
+        match tab.view {
+            TabView::Input => {
+                let edit = state.editor(tab.id).expect("every tab has an editor");
+                TextView::editable(&tab.input, edit)
+                    .revision(tab.input_revision)
+                    .line_numbers(true)
+                    .build(&format!("editor-{}", tab.id))
+                    .placeholder("Paste your JSON here or drop a JSON file…", MUTED)
+                    .fill(EDITOR_BG)
+                    .padding(16.0)
+                    .w_full()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .on_edit(|state: &mut AppState| {
+                        let id = state.active;
+                        state
+                            .editors
+                            .get_mut(&id)
+                            .expect("active tab has an editor")
+                    })
+                    .on_input_change(|state: &mut AppState, _| state.sync_active_editor())
+                    .on_input_key(super::handle_shortcut)
+            }
+            TabView::Output => TextView::read_only(&tab.output)
+                .revision(tab.output_revision)
                 .line_numbers(true)
-                .build(&format!("editor-{}", tab.id))
-                .placeholder("Paste your JSON here or drop a JSON file…", MUTED)
-                .fill(EDITOR_BG)
-                .padding(16.0)
+                .visible_lines(200)
+                .highlight(&tab.search_query)
+                .build("output-text")
                 .w_full()
                 .grow(1.0)
-                .min_h(0.0)
-                .on_edit(|state: &mut AppState| {
-                    let id = state.active;
-                    state
-                        .editors
-                        .get_mut(&id)
-                        .expect("active tab has an editor")
-                })
-                .on_input_change(|state: &mut AppState, _| state.sync_active_editor())
-                .on_input_key(super::handle_shortcut)
+                .fill(EDITOR_BG),
         }
-        TabView::Output => TextView::read_only(&tab.output)
-            .revision(tab.output_revision)
-            .line_numbers(true)
-            .visible_lines(200)
-            .highlight(&tab.search_query)
-            .build("output-text")
-            .w_full()
-            .grow(1.0)
-            .fill(EDITOR_BG),
     };
     let scroller = col()
         .key(format!("document-scroll-{}", tab.id))
