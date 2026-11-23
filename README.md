@@ -4,6 +4,8 @@ A native desktop app for viewing, formatting, and searching JSON, built in Rust
 with [Rune](https://github.com/anomalyco/rune), a GPU-rendered UI framework.
 Ported from the original Electron + React app; dark theme by default.
 
+![JSON Viewer screenshot](docs/screenshot.png)
+
 ## Features
 
 - Multiple document tabs, persisted across restarts

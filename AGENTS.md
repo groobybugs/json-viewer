@@ -1,9 +1,10 @@
 # AGENTS.md — JSON Viewer (Rust + Rune)
 
-Wave 0 scaffold for porting the Electron + React app in `src/` and `electron/`
-to Rust with [Rune](https://github.com/anomalyco/rune). The old TypeScript and
-Electron files are **read-only reference** during this port: do not edit or
-delete them. Rust lives in `crates/app/`.
+JSON Viewer is a native desktop app built in Rust with
+[Rune](https://github.com/anomalyco/rune), ported from an Electron + React app.
+The original TypeScript/Electron sources were removed in the port cleanup;
+their behavior lives in git history at `main@869ef92` (`src/`, `electron/`).
+All current code is in `crates/app/`.
 
 Rune is pinned to dev revision
 `194126ab55d8fee0e8750535a08ca9650f5b7b9e`. Every Rune dependency must come
@@ -14,16 +15,20 @@ Cargo.toml                     workspace (edition 2021, stable)
 rust-toolchain.toml            Rust 1.99.1 (stable; Rune's pinned toolchain)
 crates/app/
   Cargo.toml                   json-viewer package, dependencies frozen
+  assets/                      Inter + IBM Plex Mono faces (SIL OFL)
   src/
     lib.rs                     modules + re-exports
-    main.rs                    window, --headless mode, boot/persistence
+    main.rs                    window/App hooks, --headless mode, boot/persistence
     state.rs                   pure model, Msg, Effect, reducers, reducer tests
     json_ops.rs                format/minify + background job
     search.rs                  JSON search (worker semantics)
     persist.rs                 tab store (replaces IndexedDB)
     io.rs                      dialogs, file read/write, clipboard, drop
     runner.rs                  drains Msg queue, executes Effect values
+    line_index.rs              revision-keyed line index + snapshot cache
     headless.rs                offscreen PNG + element-tree dump
+    bin/gen_fixtures.rs        QA fixture generator
+    bin/screenshot.rs          renders docs/screenshot.png
     ui/
       mod.rs                   fn view + composition
       shell.rs                 page frame, header, status line
@@ -33,6 +38,11 @@ crates/app/
       text_view.rs             TextView: editable or virtualized read-only
   tests/
     smoke.rs                   PNG smoke test + title assertion
+    headless.rs                scripted input QA suite
+    perf.rs                    ignored 100 MB perf harness
+    text_view.rs               TextView + line index rendering tests
+    ui_shell.rs                shell layout, shortcuts, accessibility
+  benches/json_ops.rs          format/minify throughput
 ```
 
 ## Data flow (the one rule)
@@ -62,7 +72,9 @@ helpers; if a signature truly cannot work, raise it and update **all** call
 sites and this document in one commit.
 
 - `state.rs`: `TabId`, `Tab`, `TabView`, `AppState`, `Msg`, `Effect`, reducer
-  methods, `AppState::update`.
+  methods, `AppState::update`. `Tab.input_revision`/`output_revision` and
+  `Msg::JsonDone.revision` were added by the integration round so the line
+  index can be keyed by a document generation instead of sampling content.
 - `json_ops.rs`: `JsonAction`, `JsonError`, `process`, `JsonJob`,
   `spawn_process`, `JobHandle`.
 - `search.rs`: `SearchHit`, `SearchOptions`, `search`.
@@ -70,20 +82,21 @@ sites and this document in one commit.
   `save_tabs`.
 - `io.rs`: `IoError`, `read_json_file`, `pick_open_file`,
   `pick_export_path`, `write_file`, `copy_to_clipboard`, `on_file_dropped`.
-- `ui/mod.rs`: `view`, `TITLE`.
+- `ui/mod.rs`: `view`, `on_key`, `TITLE`.
 - `ui/shell.rs`: `shell`, `header`, `status_bar`.
 - `ui/tabs.rs`: `tab_bar`, `tab_content`.
 - `ui/toolbar.rs`: `toolbar`.
 - `ui/search_bar.rs`: `search_bar`, `search_results`.
 - `ui/text_view.rs`: `TextViewMode`, `TextView::{editable, read_only,
   first_line, visible_lines, line_numbers, highlight, line_count,
-  visible_range, line, build}`.
+  visible_range, line, build, revision, row_key, build_revealing}`.
 - `headless.rs`: `DEFAULT_SIZE`, `DEFAULT_SCALE`, `runtime`, `render_png`,
   `element_tree`, `write_tree`, `render_and_dump`.
 
-`src/` and `electron/` behavior is the reference for semantics, especially
+The removed TypeScript app is the reference for semantics, especially
 `tabsSlice.ts` (reducers), `jsonWorker.ts` (JSON and search), and
-`JsonViewer.tsx` / `SearchBar.tsx` / `FileDropzone.tsx` (UI behavior).
+`JsonViewer.tsx` / `SearchBar.tsx` / `FileDropzone.tsx` (UI behavior). Read
+them from git history: `git show main@869ef92:src/store/tabsSlice.ts`.
 
 ## Ownership map
 
@@ -95,6 +108,7 @@ frozen API or a PR comment.
 | `crates/app/src/state.rs` | model, reducers, messages, effects |
 | `crates/app/src/json_ops.rs` | JSON parse/format/minify worker |
 | `crates/app/src/search.rs` | search traversal and hit model |
+| `crates/app/src/line_index.rs` | revision-keyed line index + snapshot cache |
 | `crates/app/src/persist.rs` | tab persistence |
 | `crates/app/src/io.rs` | dialogs, files, clipboard, drop |
 | `crates/app/src/runner.rs` | message/effect loop |
@@ -228,15 +242,36 @@ elements by key.
   `rune::App::new(spec).on_close(runner::on_close).on_quit(runner::on_quit).run()`.
   Both hooks call `runner::flush_persist`, which synchronously drains the
   debounced persist worker before the window/app goes away.
-- **Line index.** The `Effect::SpawnJson` callback in `runner.rs` calls
-  `line_index::prewarm_off_thread(Arc::from(output))` on the JSON worker
-  thread before it sends `Msg::JsonDone`, so the first Output frame finds the
-  full index. A cold `line_index::snapshot` for a document >= 8 MiB is
-  provisional (first 64 KiB) until that prewarm lands.
+- **Line index.** The `Effect::SpawnJson` callback in `runner.rs` reserves
+  `line_index::next_revision()`, calls
+  `line_index::prewarm_off_thread(Arc::from(output), revision)` on the JSON
+  worker thread, and sends `Msg::JsonDone { revision, .. }`. The reducer stores
+  that revision on `Tab.output_revision`; `TextView::revision(..)` looks the
+  snapshot up with `snapshot_for_revision`. Revisions are globally unique, so
+  a different document can never reuse a stale index even when length and
+  head/tail bytes match. A cold revision miss for a document >= 8 MiB is
+  provisional (first 64 KiB) until the prewarm lands. Input edits bump
+  `Tab.input_revision`, which keys the read-only fallback for very large
+  inputs.
 - **Row keys.** Read-only `TextView` rows are keyed
   `TextView::row_key(base, line)` -> `{base}-row-{line}`; use
   `TextView::build_revealing(base, line)` or `Tx::scroll_into_view` with that
   key to jump to a line.
+- **Search jump.** `search_bar::select_hit` dispatches `SwitchView(Output)` and
+  queues `runner::queue_reveal(TextView::row_key("output-text", line - 1))`.
+  `hit.line` is 1-based; rows are 0-based. The reveal waits for the next idle
+  `runner::poll`, after the Output view has mounted, then calls
+  `tx.instant(); tx.scroll_into_view(key)`.
+- **Viewport axes.** Use `.scroll_xy()` for the document viewport.
+  `.scroll(..).scroll_x()` replaces the axes with X-only, so vertical wheel,
+  reveal and jump-to-line silently stop working.
+- **Shortcuts.** `main.rs` sets `spec.on_key = Some(ui::on_key)` so shortcuts
+  work before any control has focus. The root view and both text inputs also
+  bind `ui::handle_shortcut`/`on_input_key`; focused text inputs route keys
+  through `on_input_key`, not ancestor handlers.
+- **Drop path.** `ui::view` wraps the shell root in `io::drop_zone(...)`: the
+  single drop handler, with the `.json` filter, hover overlay, reject status,
+  and `Msg::FileDropped`. Do not add another `.on_drop_files` handler.
 
 ### Theme and components
 
@@ -341,8 +376,12 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
   pointer events.
 - Wayland in winit 0.30 reports no file drags; macOS, Windows and X11 do.
   Headless scripts use `{"drop_files": {"paths": [...], "key": "..."}}`.
-- Our view does not yet attach `on_drop_files`; `FileDropped`/`Effect::ReadDroppedFile`
-  are ready for the worker who owns `ui/mod.rs`.
+- `io::drop_zone(el)` is the app's only drop path. It accepts `.json`
+  (case-insensitive), dispatches `Msg::FileDropped` for the first file,
+  reports `Not a JSON file: {name}` for rejects, and paints a keyed
+  `drop-highlight` overlay while a drag is over the window. Hover state is a
+  thread-local because `AppState` has no hover field; the status write forces
+  the rebuild that paints the overlay.
 
 ### Clipboard and dialogs
 
@@ -350,16 +389,21 @@ rune::render::write_png(path, px_w, px_h, &rgba)?;
   (asynchronous, skipped in headless runs), `tx.copy_rich`,
   `tx.read_clipboard`, and `rune::clipboard` for HTML/RTF/images. On Linux it
   uses X11 or the Wayland data-control protocol.
-- We also depend on `arboard` directly because `io::copy_to_clipboard` is
-  called from the runner thread without a `Tx`. Consider migrating to
-  `Tx::copy` once copy moves into a view handler.
+- `io::start_copy(Some(tx), ..)` returns `CopyQueued::Rune` (handled by
+  `Tx::copy`) or `CopyQueued::NeedsArboard`; the latter runs
+  `io::spawn_clipboard_copy` on the `json-viewer-clipboard` thread. Plain
+  `copy_to_clipboard` still blocks for callers without a `Tx`.
 - Rune's native file dialogs are behind the `native-file-dialog` feature:
   `FileDialogs::native().open(options).await`, parented to the window and
-  never blocking Cocoa's main thread. We currently use `rfd` synchronously
-  from the runner. That is acceptable for the scaffold but should become an
-  async task or a worker before release (Rune explicitly warns against
-  `pollster::block_on` on the main thread).
+  never blocking Cocoa's main thread. `runner::execute` uses
+  `Tx::open_file`/`Tx::save_file` with `io::open_dialog_options`/
+  `io::export_dialog_options`; reads and writes run on
+  `json-viewer-read`/`json-viewer-write`. Never `pollster::block_on` a dialog
+  on the UI thread.
 - Headless clipboard uses an in-memory backend; no system clipboard writes.
+- `Effect::Persist` is debounced onto a persist worker (`runner::spawn_persist`);
+  `on_close`/`on_quit` call `flush_persist` so the last snapshot lands before
+  the window or app goes away.
 
 ### Gotchas
 

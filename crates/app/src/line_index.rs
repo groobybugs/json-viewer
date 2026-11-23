@@ -515,7 +515,6 @@ mod tests {
             &without_newlines[without_newlines.len() - 32..]
         );
 
-        clear_cache();
         let first = snapshot_for_revision(&with_newlines, next_revision());
         let second = snapshot_for_revision(&without_newlines, next_revision());
         assert_eq!(first.line_count(), 69);

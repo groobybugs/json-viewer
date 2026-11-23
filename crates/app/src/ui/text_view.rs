@@ -44,7 +44,8 @@
 //! no O(document) work on the UI thread: `snapshot` copies and scans only a
 //! bounded prefix ([`crate::line_index::PARTIAL_SCAN_BYTES`]), which is enough
 //! to mount the first viewport, then a background job replaces it with the
-//! full index through `line_index::prewarm_off_thread`. Above
+//! full index through `line_index::prewarm_off_thread` under the document's
+//! revision. Above
 //! [`EDITABLE_LIMIT_BYTES`] the editable mode falls back to this read-only
 //! virtualized view with [`LARGE_FILE_BANNER`].
 //!
@@ -55,7 +56,7 @@
 //! `"Inter"` (proportional) behind that slot. `headless::APP_FONTS` /
 //! `headless::APP_FAMILIES` register IBM Plex Mono there for both the window
 //! (`AppSpec::fonts`/`families`) and headless (`Runtime::with_text`). See
-//! `NOTES-rp-view.md`. The line-number gutter is a fixed-width box with
+//! `AGENTS.md`. The line-number gutter is a fixed-width box with
 //! `Align::End`, so digits are right-aligned.
 
 use std::borrow::Cow;
