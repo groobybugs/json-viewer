@@ -6,8 +6,10 @@
 //! [`Effect`]s. That keeps reducers deterministic and unit-testable while
 //! still allowing background JSON and search work.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use rune::TextEdit;
@@ -150,6 +152,9 @@ pub struct AppState {
     /// keyboard layer records the prefix here and completes it on the next
     /// key; any other key clears it. Presentation-only, like `fold_epoch`.
     pub fold_chord: bool,
+    /// Last drawn vertical offset for each `(tab, view)` document viewport.
+    /// Runtime-only: scroll positions are intentionally not persisted.
+    pub(crate) scroll_offsets: Rc<RefCell<HashMap<String, f32>>>,
 }
 
 impl Default for AppState {
@@ -167,6 +172,7 @@ impl Default for AppState {
             pending: Vec::new(),
             fold_epoch: 0,
             fold_chord: false,
+            scroll_offsets: Rc::new(RefCell::new(HashMap::new())),
         };
         state.add_tab();
         state
@@ -262,6 +268,9 @@ impl AppState {
         let tab = self.tabs.remove(index);
         self.editors.remove(&id);
         self.tree.remove(&id);
+        self.scroll_offsets
+            .borrow_mut()
+            .retain(|key, _| !key.starts_with(&format!("document-scroll-{id}-")));
         crate::editor::state::remove(id);
         if self.active == id {
             let next = index.min(self.tabs.len() - 1);
@@ -750,6 +759,7 @@ impl AppState {
             .collect();
         // Restored tabs get fresh tree state (indexes are never persisted).
         self.tree.clear();
+        self.scroll_offsets.borrow_mut().clear();
         crate::editor::state::clear_all();
         self.tabs = tabs;
         self.status = None;

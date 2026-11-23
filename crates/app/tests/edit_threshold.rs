@@ -134,7 +134,7 @@ fn bench_tab_content(state: &AppState) -> El {
             .fill(EDITOR_BG),
     };
     let scroller = col()
-        .key(format!("document-scroll-{}", tab.id))
+        .key(format!("document-scroll-{}-input", tab.id))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -410,7 +410,7 @@ fn bench_variant(label: &str, text: String, forced: bool) -> VariantResult {
     let t = Instant::now();
     rt.update(|s, tx| {
         s.editors.get_mut(&id).expect("editor").set_caret(mid);
-        tx.scroll_to_y(format!("document-scroll-{id}"), (editor_h * 0.5 - 200.0).max(0.0));
+        tx.scroll_to_y(format!("document-scroll-{id}-input"), (editor_h * 0.5 - 200.0).max(0.0));
     });
     rt.update_if(|s, tx| runner::poll(s, 0.0, tx));
     rt.frame(1.0 / 60.0);
@@ -731,7 +731,7 @@ fn rope_place_caret(rt: &mut Runtime<AppState>, id: u64, caret: usize) {
             ed.buffer.byte_to_line(ed.caret)
         });
         tx.instant();
-        tx.scroll_to_y(format!("document-scroll-{id}"), (line as f32 * 16.0 - 200.0).max(0.0));
+        tx.scroll_to_y(format!("document-scroll-{id}-input"), (line as f32 * 16.0 - 200.0).max(0.0));
     });
     rt.frame(0.0);
     rt.frame(0.0);

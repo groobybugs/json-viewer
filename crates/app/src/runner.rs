@@ -636,9 +636,27 @@ fn set_persist_debounce(debounce: Duration) {
     with_persist(|ctrl| ctrl.debounce = debounce);
 }
 
+/// Restores the destination viewport after a tab or display change. Rune
+/// drops a scroll node's offset when its exit is pruned, so the app keeps the
+/// last drawn offset in `AppState` and applies it to the new mount.
+fn restore_changed_scroll(state: &AppState, previous: Option<String>, tx: &mut Tx) -> bool {
+    let current = crate::ui::tabs::active_scroll_key(state);
+    if previous == current {
+        return false;
+    }
+    let Some(key) = current else {
+        return false;
+    };
+    let offset = state.scroll_offsets.borrow().get(&key).copied().unwrap_or(0.0);
+    tx.instant();
+    tx.scroll_to_y(key, offset);
+    true
+}
+
 /// Rune `poll` hook. Applies every queued message (view messages first, then
 /// completed background jobs) and returns whether state changed.
 pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
+    let previous_scroll_key = crate::ui::tabs::active_scroll_key(state);
     let mut changed = false;
     let mut applied = false;
     loop {
@@ -663,6 +681,9 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
                 state.dispatch(Msg::Status(format!("Opened {name}")));
             }
         }
+    }
+    if restore_changed_scroll(state, previous_scroll_key, tx) {
+        changed = true;
     }
     // Editor caret auto-scroll (rp-editor): the reducer marks the caret
     // line; scroll minimally to keep it inside the viewport.
@@ -734,7 +755,7 @@ fn reveal_editor_caret(state: &mut AppState, tx: &mut Tx) -> bool {
     match target {
         Some(target) => {
             tx.instant();
-            tx.scroll_to_y(format!("document-scroll-{id}"), target.max(0.0));
+            tx.scroll_to_y(format!("document-scroll-{id}-input"), target.max(0.0));
             true
         }
         None => false,
@@ -764,7 +785,7 @@ fn reveal_editor_line(state: &mut AppState, tx: &mut Tx, id: u64, line: Option<u
         let row_h = crate::ui::text_view::ROW_HEIGHT;
         let y = target_line as f32 * row_h;
         let centered = if viewport_h > 0.0 { y - viewport_h * 0.5 } else { y };
-        tx.scroll_to_y(format!("document-scroll-{id}"), centered.max(0.0));
+        tx.scroll_to_y(format!("document-scroll-{id}-input"), centered.max(0.0));
     } else {
         tx.scroll_into_view(format!("editor-{id}"));
     }

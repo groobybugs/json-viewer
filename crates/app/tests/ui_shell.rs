@@ -210,7 +210,7 @@ fn six_shell_states_render_with_controls_and_layout() {
         assert_disabled(&empty, key, true);
     }
     assert_disabled(&empty, "open", false);
-    let editor = &element(&empty, "document-scroll-1")["rect"];
+    let editor = &element(&empty, "document-scroll-1-input")["rect"];
     assert!(
         editor[3].as_f64().unwrap() > 400.0,
         "document must fill remaining height: {editor}"

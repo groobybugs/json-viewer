@@ -23,7 +23,7 @@ fn editor_view(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let tab = state.active_tab().expect("active tab");
     let base = format!("editor-{}", tab.id);
     col()
-        .key(format!("document-scroll-{}", tab.id))
+        .key(format!("document-scroll-{}-input", tab.id))
         .w_full()
         .h_full()
         .scroll(ScrollSpec { stick_bottom: false })
@@ -276,7 +276,7 @@ fn hundred_mb_windowing_and_scroll_timings() {
     let t = Instant::now();
     rt.update(|_, tx| {
         tx.instant();
-        tx.scroll_to_y(format!("document-scroll-{id}"), mid_line as f32 * 16.0 - 200.0);
+        tx.scroll_to_y(format!("document-scroll-{id}-input"), mid_line as f32 * 16.0 - 200.0);
     });
     rt.frame(1.0 / 60.0);
     rt.frame(1.0 / 60.0);
