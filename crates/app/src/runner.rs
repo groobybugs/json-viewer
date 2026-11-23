@@ -221,6 +221,9 @@ enum CopyField {
 
 struct CopyCursor {
     dest: Vec<Tab>,
+    /// O(1) rope snapshots for tabs whose editor holds unmaterialized
+    /// edits; `None` copies from `Tab::input` as before.
+    inputs: Vec<Option<ropey::Rope>>,
     tab: usize,
     field: CopyField,
     offset: usize,
@@ -361,6 +364,11 @@ fn blank_snapshot(tab: &Tab) -> Tab {
 fn begin_copy(state: &AppState, gen: u64) -> CopyCursor {
     CopyCursor {
         dest: state.tabs.iter().map(blank_snapshot).collect(),
+        inputs: state
+            .tabs
+            .iter()
+            .map(|tab| crate::editor::state::dirty_snapshot(tab.id))
+            .collect(),
         tab: 0,
         field: CopyField::Input,
         offset: 0,
@@ -375,25 +383,41 @@ fn step_copy(cursor: &mut CopyCursor, state: &AppState) -> CopyStep {
     }
     let mut budget = PERSIST_CHUNK;
     while budget > 0 && cursor.tab < state.tabs.len() {
-        let src = match cursor.field {
-            CopyField::Input => state.tabs[cursor.tab].input.as_str(),
-            CopyField::Output => state.tabs[cursor.tab].output.as_str(),
+        let rope = cursor.inputs.get(cursor.tab).and_then(|r| r.as_ref());
+        let src_len = match cursor.field {
+            CopyField::Input => rope
+                .map(|r| r.len_bytes())
+                .unwrap_or_else(|| state.tabs[cursor.tab].input.len()),
+            CopyField::Output => state.tabs[cursor.tab].output.len(),
         };
-        if cursor.offset > src.len() {
+        if cursor.offset > src_len {
             return CopyStep::Restart;
         }
-        let take = (src.len() - cursor.offset).min(budget);
+        let take = (src_len - cursor.offset).min(budget);
         if take > 0 {
             let end = cursor.offset + take;
-            let piece = &src[cursor.offset..end];
             match cursor.field {
-                CopyField::Input => cursor.dest[cursor.tab].input.push_str(piece),
-                CopyField::Output => cursor.dest[cursor.tab].output.push_str(piece),
+                CopyField::Input => {
+                    // The rope snapshot is immutable: a consistent document
+                    // even while the user keeps typing into the live rope.
+                    let piece = match rope {
+                        Some(r) => r
+                            .slice(r.byte_to_char(cursor.offset)..r.byte_to_char(end))
+                            .to_string(),
+                        None => state.tabs[cursor.tab].input[cursor.offset..end].to_owned(),
+                    };
+                    cursor.dest[cursor.tab].input.push_str(&piece);
+                }
+                CopyField::Output => {
+                    cursor.dest[cursor.tab].output.push_str(
+                        &state.tabs[cursor.tab].output[cursor.offset..end],
+                    );
+                }
             }
             cursor.offset = end;
             budget -= take;
         }
-        if cursor.offset == src.len() {
+        if cursor.offset == src_len {
             cursor.offset = 0;
             match cursor.field {
                 CopyField::Input => cursor.field = CopyField::Output,
@@ -847,6 +871,24 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     io::display_name(&path)
                 )));
                 spawn_read(path);
+            }
+            Effect::MaterializeRope { tab, input, job } => {
+                // O(1) snapshot in, String out on a worker thread: the UI
+                // thread never copies the document for Format/Minify/
+                // Validate/Search.
+                let tx = io_sender();
+                track_io_job();
+                std::thread::Builder::new()
+                    .name("json-viewer-rope".into())
+                    .spawn(move || {
+                        let text: Arc<str> = Arc::from(input.to_string());
+                        let _ = tx.send(Msg::RopeMaterialized {
+                            tab,
+                            input: text,
+                            job,
+                        });
+                    })
+                    .expect("spawn rope materialize thread");
             }
         }
     }

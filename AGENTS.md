@@ -27,6 +27,11 @@ crates/app/
     line_index.rs              revision-keyed line index + snapshot cache
     tree_index.rs              streaming JSON node index + tree row jobs
     fold_index.rs              fold index + fold set + visual-row map
+    editor/                    Zed-style large-file input editor (rp-editor)
+      buffer.rs                ropey buffer + grouped undo/redo + O(1) snapshots
+      state.rs                 per-tab caret/selection store + semantic actions
+      view.rs                  visible-line rope rendering + mouse + cache
+      keys.rs                  keyboard, clipboard routing, IME
     headless.rs                offscreen PNG + element-tree dump
     bin/gen_fixtures.rs        QA fixture generator
     bin/screenshot.rs          renders docs/screenshot.png
@@ -44,6 +49,8 @@ crates/app/
     headless.rs                scripted input QA suite
     perf.rs                    ignored 100 MB perf harness
     edit_threshold.rs          ignored native-editor threshold measurements
+                               + ignored rope-editor performance proof (E5)
+    editor.rs                  rope editor evidence (render/mouse/keys/IME)
     text_view.rs               TextView + line index rendering tests
     validate.rs                validation parser/worker/panel/marker tests
     tree_view.rs               tree explorer evidence + release timings
@@ -125,6 +132,8 @@ frozen API or a PR comment.
 | `crates/app/src/line_index.rs` | revision-keyed line index + snapshot cache |
 | `crates/app/src/tree_index.rs` | tree explorer: node index, row jobs |
 | `crates/app/src/fold_index.rs` | fold index, fold set, visual-row map |
+| `crates/app/src/editor/*` | rope input editor: buffer, state store, view, keys (rp-editor) |
+| `crates/app/tests/editor.rs` | rope editor evidence (render/mouse/keys/IME) |
 | `crates/app/src/persist.rs` | tab persistence |
 | `crates/app/src/io.rs` | dialogs, files, clipboard, drop |
 | `crates/app/src/runner.rs` | message/effect loop |
@@ -234,6 +243,133 @@ tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
   the index; big docs re-flatten
   off-thread when it toggles.
 
+
+## Large-file input editor (rp-editor)
+
+The Input view is a self-drawn, Zed-style editor over a `ropey` rope
+(`crates/app/src/editor/`), editable at **every** size — the 5 MiB
+`EDITABLE_LIMIT_BYTES` gate, the 128 KiB long-line gate and the read-only
+banners no longer apply to tab input. `ui/text_view.rs` is untouched: it
+remains the read-only Output component and its frozen `TextView::editable`
+legacy component (with its gates) still exists for its own tests
+(`tests/text_view.rs`, `tests/folding.rs`); the app simply never mounts it
+for input anymore.
+
+### Buffer and state
+
+- `editor::buffer::Buffer` wraps `ropey::Rope`: insert/delete/replace by byte
+  or char offset, line↔offset mapping, a revision counter, and undo/redo with
+  grouped transactions (consecutive typing coalesces per word, a paste is one
+  step, caret moves break the group). History is capped at 64 MiB of edit
+  text. `snapshot()` is an O(1) `Rope` clone; `to_string()` (via `Display`) is
+  O(n) and belongs on worker threads or explicit bulk actions only.
+- `editor::state::EditorState` (caret, selection anchor, horizontal
+  `first_column`, goal column, IME preedit, reveal request, viewport
+  geometry) lives in a **thread-local store keyed by `TabId`** — the same
+  pattern as `fold_index`, because the view only has `&AppState`. Every
+  access goes through `state::with(id, &tab.input, tab.input_revision, …)`,
+  which first re-syncs the rope from `Tab::input` when the text changed
+  outside the editor (revision mismatch, or a length mismatch while clean —
+  this covers direct assignments in tests/bins). `take_reveal`,
+  `existing_snapshot` and `dirty_snapshot` read existing entries without
+  creating one, so `runner::poll` never builds a rope for a tab no editor
+  has shown.
+- **`Tab::input` is a materialized cache, not the keystroke source of
+  truth.** Editor edits set `EditorState::dirty` and bump
+  `Tab::input_revision`; no per-keystroke `String` copy happens anywhere
+  (`sync_active_editor` is no longer called by the app).
+  `AppState::materialize_input(id)` refreshes the cache and is called by
+  explicit consumers: paste, Copy/Export, tree index builds,
+  `ValidationDone` (the error panel reads source context), and the
+  empty↔non-empty boundary (so the toolbar's enabled state stays correct).
+  The status line's line count reads the cache and can lag a typing burst
+  by a few lines; it refreshes at the next bulk action.
+
+### Rendering (E2)
+
+`editor::view::build` renders only the visible lines as plain keyed rows
+between two spacers — **not** `El::virtual_rows`, whose key list
+rematerializes O(line count) on every count change (Enter/paste on a
+multi-million-line document). The window comes from tracked layout reads:
+`cx.window_layout_with("document-scroll-{id}", …)` and
+`cx.window_layout_with("editor-{id}", …)` give viewport and content top;
+their difference is the scroll offset, and the view re-runs when scrolling
+moves it. Rows are exactly `text_view::ROW_HEIGHT` (16.0) tall, so every
+spacer height is a multiple of 16 and f32 layout positions stay exact past
+4M lines. Row keys are `editor-{id}-row-{line}` — the same shape as
+`TextView::row_key`, so `validation_panel`'s reveal keeps working;
+`runner::poll` parses those keys and scrolls by offset (far jumps work
+without a mounted row) and places the caret on the validation error.
+
+Very long lines are never materialized: each row slices only its visible
+column window (`VISIBLE_COLUMNS`, narrowed to the viewport width) straight
+from the rope and tokenizes that window; a bounded 512-byte quote-parity
+lookback decides whether the window starts inside a JSON string. A
+thread-local content-hash cache (`(tab, line, window bounds, hash)`) skips
+re-slicing/re-tokenizing unchanged windows; Rune's own shape cache keys on
+the display string, so unchanged lines are not reshaped. Caret (inline
+2 pt bar splitting the row text), selection (`Span::bg`), error marker
+(row tint + underline + gutter dot + `editor-{id}-error-dot`/`-error-label`
+strip, same keys as the old editable error view) and IME preedit are drawn
+per visible row. Mouse: click/shift-click/drag (char), double-click drag
+(word), triple-click drag (line) via `El::on_drag` + `Drag::clicks`;
+horizontal wheel/shift-wheel pans `first_column` via `El::on_wheel`.
+Caret moves auto-pan the column window and set `EditorState::reveal`,
+which `runner::poll` turns into a minimal `Tx::scroll_to_y`.
+
+### Editing (E3)
+
+`editor::keys::handle` is the container's `on_key`: typing/Enter (auto-
+indent copies the line's leading whitespace, +2 after `{`/`[`),
+Backspace/Delete (CRLF pairs count as one), Tab (2 spaces), arrows /
+Home/End / PageUp/PageDown / Ctrl+arrows (word) / Ctrl+Home/End, Shift
+extends, Ctrl+A, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, Ctrl+C/X queue
+`Msg::EditorCopy`. Unhandled keys delegate to `ui::on_key` (the same
+shortcut dispatcher the native field bound), so app chords work with or
+without a window-level hook. Ctrl/Cmd+V falls through to Rune's paste
+action; the root `on_paste` in `ui/mod.rs` delivers it as
+`Msg::EditorPaste` while the input view is showing (native fields take
+their own pastes when focused). IME: `App::on_ime(editor::keys::on_ime)` —
+preedit draws underlined at the caret (`El::ime_cursor` marks the surface),
+commit inserts one undo step. Handlers queue semantic `Msg::EditorEdit`
+values; the reducer applies them through `EditorState::apply` and does the
+tab bookkeeping (revision bump, error/validation clear, tree refresh).
+Presentation-only pointer/pan handlers mutate the store directly, like
+fold toggles.
+
+### Workers and persist (E4)
+
+`Msg`/`Effect` grew additively (frozen signatures unchanged):
+`Msg::EditorEdit/EditorPaste/EditorCopy/RopeMaterialized`,
+`Effect::MaterializeRope { tab, input: Rope, job: RopeJob }` and
+`RopeJob::{Json, Validate, Search}`. Format/Minify/Validate/Search take an
+O(1) `existing_snapshot` when the editor owns the text; the runner
+converts the rope to `Arc<str>` on a `json-viewer-rope` worker thread and
+returns `Msg::RopeMaterialized`, which emits the classic
+`SpawnJson/SpawnValidation/Search` effect (job handles stay registered on
+the UI thread). Tabs with no editor entry (restored, never opened) keep
+the classic `Arc::from(tab.input)` path. Persist's chunked copy snapshots
+dirty ropes at `begin_copy` (`dirty_snapshot`, O(1)) and slices 4 MB
+chunks from the immutable snapshot — a consistent document even while
+typing continues; the chunk machinery stays because `Tab::output` is
+still a `String` (measured: the 100 MB snapshot-step test stays <30 ms).
+
+### Evidence
+
+- `cargo test -p json-viewer --test editor` — render/mouse/keys/IME/cut/
+  paste evidence, PNGs in `target/headless/editor-*.png`.
+- `cargo test --release -p json-viewer --test editor -- --ignored --nocapture`
+  — 100 MB windowing: load 45 ms, first frame 90 ms, scroll-to-middle
+  2.8 ms, caret-move p95 0.6 ms, 59 rows mounted (3.85M lines).
+- `cargo test --release -p json-viewer --test edit_threshold -- --ignored
+  --nocapture` — the historical native-`TextEdit` threshold table **and**
+  the rope-editor performance proof (E5): typing p95 at start/middle/end,
+  1 KB/10 MB paste, undo of a large paste, select-all+delete, first frame
+  and peak RSS for 1/10/100 MB pretty and the 6.9 MB single line.
+- `tests/validate.rs::go_to_error_reveals_the_error_line_in_the_rope_editor`
+  replaces the old read-only-fallback banner test (coordinator-approved):
+  the 6 MB single-line input is editable, Go to error reveals and marks
+  the error line and puts the caret on it.
 
 ## Build, test, run
 

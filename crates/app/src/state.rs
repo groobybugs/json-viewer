@@ -288,11 +288,11 @@ impl AppState {
         };
         tab.input = input.clone();
         tab.input_revision = crate::line_index::next_revision();
-        let tab_revision = tab.input_revision;
         tab.error = None;
         tab.validation = None;
-        // The rope editor rebuilds from the new text (revision mismatch).
-        crate::editor::state::with(id, &input, tab_revision, |_| {});
+        // The rope editor rebuilds lazily on its next access (revision
+        // mismatch): reducer-only callers never pay for a rope they do not
+        // use, and the first editor view build syncs from the new text.
         if let Some(edit) = self.editors.get_mut(&id) {
             if edit.text != input {
                 edit.replace_text(input);
@@ -524,6 +524,9 @@ impl AppState {
     /// input. Idempotent: skips when the index covers `input_revision` or a
     /// build for it is already in flight.
     fn ensure_tree_index(&mut self, id: TabId) {
+        // The tree index reads `Tab::input`; refresh the editor cache first
+        // (one O(n) copy per tree build, never per keystroke).
+        self.materialize_input(id);
         let Some(tab) = self.tab(id) else {
             return;
         };
@@ -835,6 +838,15 @@ impl AppState {
                     }
                 }
             }
+            Msg::RopeMaterialized { tab, input, job } => match job {
+                RopeJob::Json(action) => vec![Effect::SpawnJson { tab, input, action }],
+                RopeJob::Validate { input_revision } => vec![Effect::SpawnValidation {
+                    tab,
+                    input,
+                    input_revision,
+                }],
+                RopeJob::Search { query } => vec![Effect::Search { tab, input, query }],
+            },
             Msg::Clear => {
                 self.clear_tab(self.active);
                 vec![Effect::Persist]
@@ -843,6 +855,7 @@ impl AppState {
             Msg::Minify => self.start_json(JsonAction::Minify),
             Msg::Validate => self.start_validation(),
             Msg::Copy => {
+                self.materialize_input(self.active);
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
                 };
@@ -859,6 +872,7 @@ impl AppState {
                 }
             }
             Msg::Export => {
+                self.materialize_input(self.active);
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
                 };
@@ -894,12 +908,7 @@ impl AppState {
                     return Vec::new();
                 }
                 tab.is_processing = true;
-                let input: Arc<str> = Arc::from(tab.input.as_str());
-                vec![Effect::Search {
-                    tab: id,
-                    input,
-                    query,
-                }]
+                vec![self.spawn_input_job(id, RopeJob::Search { query })]
             }
             Msg::JsonDone {
                 tab,
@@ -1197,12 +1206,7 @@ impl AppState {
         tab.is_processing = true;
         tab.error = None;
         tab.validation = None;
-        let input: Arc<str> = Arc::from(tab.input.as_str());
-        vec![Effect::SpawnJson {
-            tab: id,
-            input,
-            action,
-        }]
+        vec![self.spawn_input_job(id, RopeJob::Json(action))]
     }
 
     fn start_validation(&mut self) -> Vec<Effect> {
@@ -1217,12 +1221,32 @@ impl AppState {
         tab.is_processing = true;
         tab.error = None;
         tab.validation = None;
-        let input: Arc<str> = Arc::from(tab.input.as_str());
-        vec![Effect::SpawnValidation {
-            tab: id,
-            input,
-            input_revision: tab.input_revision,
-        }]
+        let input_revision = tab.input_revision;
+        vec![self.spawn_input_job(id, RopeJob::Validate { input_revision })]
+    }
+
+    /// Starts a background job over the tab's input. When the rope editor
+    /// owns the text, the effect carries an O(1) rope snapshot and the
+    /// runner materializes it on a worker thread; otherwise (no editor
+    /// entry, e.g. a restored tab never opened) the classic `Arc<str>` copy
+    /// path is used.
+    fn spawn_input_job(&self, id: TabId, job: RopeJob) -> Effect {
+        let tab = self.tab(id).expect("caller checked the tab");
+        match crate::editor::state::existing_snapshot(id) {
+            Some(input) => Effect::MaterializeRope { tab: id, input, job },
+            None => {
+                let input: Arc<str> = Arc::from(tab.input.as_str());
+                match job {
+                    RopeJob::Json(action) => Effect::SpawnJson { tab: id, input, action },
+                    RopeJob::Validate { input_revision } => Effect::SpawnValidation {
+                        tab: id,
+                        input,
+                        input_revision,
+                    },
+                    RopeJob::Search { query } => Effect::Search { tab: id, input, query },
+                }
+            }
+        }
     }
 }
 
@@ -1252,6 +1276,12 @@ pub enum Msg {
     EditorPaste { tab: TabId, text: String },
     /// Copy (or cut) the editor selection.
     EditorCopy { tab: TabId, cut: bool },
+    /// A rope snapshot was converted to text off-thread; start the job.
+    RopeMaterialized {
+        tab: TabId,
+        input: Arc<str>,
+        job: RopeJob,
+    },
     /// Format the active tab.
     Format,
     /// Minify the active tab.
@@ -1336,6 +1366,17 @@ pub enum Msg {
     },
 }
 
+/// Which background job a rope snapshot is materialized for. The reducer
+/// hands `Effect::MaterializeRope` to the runner, which converts the rope
+/// to an `Arc<str>` on a worker thread and returns it as
+/// `Msg::RopeMaterialized`; the reducer then emits the classic job effect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RopeJob {
+    Json(JsonAction),
+    Validate { input_revision: u64 },
+    Search { query: String },
+}
+
 /// Side effects returned by [`AppState::update`]. The runner owns execution;
 /// the model never performs I/O itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -1371,6 +1412,14 @@ pub enum Effect {
     Open,
     /// Read a dropped file and deliver [`Msg::FileLoaded`].
     ReadDroppedFile(PathBuf),
+    /// Convert an O(1) editor rope snapshot to text on a worker thread and
+    /// deliver [`Msg::RopeMaterialized`] (rp-editor: Format/Minify/Validate/
+    /// Search never copy the document on the UI thread).
+    MaterializeRope {
+        tab: TabId,
+        input: ropey::Rope,
+        job: RopeJob,
+    },
 }
 
 fn default_export_name(tab: &Tab) -> String {
@@ -1396,6 +1445,22 @@ fn default_export_name(tab: &Tab) -> String {
 mod tests {
     use super::*;
     use crate::json_ops::JsonError;
+
+    /// Simulates the runner's off-thread rope conversion: a
+    /// `MaterializeRope` effect becomes the classic job effect after the
+    /// (here synchronous) `RopeMaterialized` round trip.
+    fn finish_materialize(state: &mut AppState, effects: Vec<Effect>) -> Vec<Effect> {
+        effects
+            .into_iter()
+            .flat_map(|effect| match effect {
+                Effect::MaterializeRope { tab, input, job } => {
+                    let input: Arc<str> = Arc::from(input.to_string());
+                    state.update(Msg::RopeMaterialized { tab, input, job })
+                }
+                other => vec![other],
+            })
+            .collect()
+    }
 
     #[test]
     fn default_state_has_one_empty_tab() {
@@ -1532,11 +1597,31 @@ mod tests {
         state.update_input(id, "{\"a\":1}".into());
         let effects = state.update(Msg::Format);
         assert_eq!(effects.len(), 1);
+        // No editor entry yet (reducer-only): the classic copy path.
         assert!(matches!(
             &effects[0],
             Effect::SpawnJson { tab, action: JsonAction::Format, .. } if *tab == id
         ));
         assert!(state.tab(id).unwrap().is_processing);
+    }
+
+    #[test]
+    fn format_uses_the_rope_snapshot_when_the_editor_owns_the_text() {
+        let mut state = AppState::default();
+        let id = state.active;
+        state.update_input(id, "{\"a\":1}".into());
+        // Mount-equivalent: the editor view/handlers create the entry.
+        crate::editor::state::with(id, &state.tab(id).unwrap().input, state.tab(id).unwrap().input_revision, |_| {});
+        let effects = state.update(Msg::Format);
+        assert!(matches!(
+            &effects[0],
+            Effect::MaterializeRope { tab, job: RopeJob::Json(JsonAction::Format), .. } if *tab == id
+        ));
+        let effects = finish_materialize(&mut state, effects);
+        assert!(matches!(
+            &effects[0],
+            Effect::SpawnJson { tab, action: JsonAction::Format, .. } if *tab == id
+        ));
     }
 
     #[test]

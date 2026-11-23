@@ -605,6 +605,26 @@ pub fn take_reveal(id: TabId) -> Option<(usize, f32, f32)> {
     })
 }
 
+/// O(1) snapshot from an *existing* entry (no create, no sync): background
+/// jobs use it when the editor owns the text; `None` means the tab has no
+/// live editor and `Tab::input` is the truth.
+pub fn existing_snapshot(id: TabId) -> Option<Rope> {
+    STORE.with(|store| {
+        let map = store.borrow();
+        map.get(&id).map(|state| state.buffer.snapshot())
+    })
+}
+
+/// Snapshot only when the editor holds unmaterialized edits (persist).
+pub fn dirty_snapshot(id: TabId) -> Option<Rope> {
+    STORE.with(|store| {
+        let map = store.borrow();
+        map.get(&id)
+            .filter(|state| state.dirty)
+            .map(|state| state.buffer.snapshot())
+    })
+}
+
 /// Whether the buffer holds edits `Tab::input` has not seen.
 pub fn is_dirty(id: TabId, input: &str, revision: u64) -> bool {
     with(id, input, revision, |state| state.dirty)
