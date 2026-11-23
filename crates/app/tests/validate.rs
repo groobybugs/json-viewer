@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use json_viewer::json_ops::{self, JsonAction, JsonError, ValidationInfo};
@@ -13,6 +14,20 @@ use serde_json::Value;
 
 const MIB: usize = 1024 * 1024;
 const SIZE: (f32, f32) = (1280.0, 800.0);
+
+/// `fold_index` keeps one process-wide store (fold states, pending reveals
+/// keyed by view base, hover, LRU) and `line_index` one process-wide snapshot
+/// LRU. The app is single-threaded, but libtest runs these tests in parallel
+/// inside one process: a concurrent app render can consume another test's
+/// pending reveal or evict a warmed revision. Serialize every test that
+/// renders the app.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn assert_error(input: &str, line: usize, column: usize, message: &str) -> JsonError {
     let error = json_ops::validate(input).expect_err("fixture must be invalid");
@@ -220,6 +235,7 @@ fn validation_runs_off_the_calling_thread() {
 
 #[test]
 fn headless_valid_alert_png() {
+    let _guard = serial();
     let mut state = AppState::default();
     state.update_input(state.active, "{\n  \"a\": [1, true]\n}".into());
     run_validation(&mut state);
@@ -234,6 +250,7 @@ fn headless_valid_alert_png() {
 
 #[test]
 fn headless_format_error_panel_png_and_go_to_error() {
+    let _guard = serial();
     let input = "{\n  \"a\": 1\n  \"b\": 2\n}";
     let error = json_ops::process(input, JsonAction::Format).unwrap_err();
     let mut state = AppState::default();
@@ -276,6 +293,7 @@ fn headless_format_error_panel_png_and_go_to_error() {
 
 #[test]
 fn validate_error_marker_and_go_to_error_use_the_real_position() {
+    let _guard = serial();
     let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";
     let error = json_ops::validate(input).expect_err("invalid fixture");
     assert_eq!((error.line, error.column), (3, 8));
@@ -312,6 +330,7 @@ fn validate_error_marker_and_go_to_error_use_the_real_position() {
 
 #[test]
 fn go_to_error_reveals_the_error_line_in_the_rope_editor() {
+    let _guard = serial();
     let mut input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3,\n  \"pad\": \"".to_owned();
     input.push_str(&"x".repeat(6 * MIB));
     input.push_str("\"\n}\n");
@@ -354,6 +373,7 @@ fn go_to_error_reveals_the_error_line_in_the_rope_editor() {
 
 #[test]
 fn headless_large_single_line_error_panel_png() {
+    let _guard = serial();
     let mut input = valid_fixture(6 * MIB);
     input.pop();
     input.pop();

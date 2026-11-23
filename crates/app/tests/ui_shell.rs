@@ -1,6 +1,7 @@
 //! UI-shell evidence: real headless PNGs, element assertions and keyboard input.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use json_viewer::headless;
 use json_viewer::json_ops::JsonError;
@@ -10,6 +11,20 @@ use rune::{Key, KeyEvent, Mods, Runtime};
 use serde_json::Value;
 
 const SIZE: (f32, f32) = (1280.0, 800.0);
+
+/// `fold_index` keeps one process-wide store (fold states, pending reveals
+/// keyed by view base, hover, LRU) and `line_index` one process-wide snapshot
+/// LRU. The app is single-threaded, but libtest runs these tests in parallel
+/// inside one process: a concurrent app render can consume another test's
+/// pending reveal or evict a warmed revision. Serialize every test that
+/// renders the app.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 const SAMPLE: &str = r#"{
   "name": "Ada Lovelace",
   "active": true,
@@ -201,6 +216,7 @@ fn assert_toolbar_present(tree: &Value) {
 
 #[test]
 fn six_shell_states_render_with_controls_and_layout() {
+    let _guard = serial();
     let empty = render(AppState::default(), "01-empty-tab");
     assert_toolbar_present(&empty);
     assert_eq!(tab_count(&empty), 1);
@@ -287,6 +303,7 @@ fn six_shell_states_render_with_controls_and_layout() {
 
 #[test]
 fn toolbar_groups_fit_wide_and_narrow_windows() {
+    let _guard = serial();
     let actions = [
         "validate", "format", "minify", "copy", "export", "open", "clear",
     ];
@@ -352,6 +369,7 @@ fn toolbar_groups_fit_wide_and_narrow_windows() {
 
 #[test]
 fn tab_strip_handles_long_titles_overflow_and_hover() {
+    let _guard = serial();
     let mut overflow_state = AppState::default();
     let first = overflow_state.active;
     let second = overflow_state.add_tab();
@@ -406,6 +424,7 @@ fn command(key: char, shift: bool) -> KeyEvent {
 
 #[test]
 fn window_shortcut_adds_a_tab_before_any_control_has_focus() {
+    let _guard = serial();
     let mut runtime = headless::runtime(AppState::default(), SIZE, 1.0);
     // AppSpec installs this same function in main.rs; Runtime exposes the field
     // directly so the startup route can be exercised without opening a window.
@@ -427,6 +446,7 @@ fn window_shortcut_adds_a_tab_before_any_control_has_focus() {
 
 #[test]
 fn shortcuts_queue_messages_and_focus_search() {
+    let _guard = serial();
     let mut runtime = headless::runtime(AppState::default(), SIZE, 1.0);
     runtime.update(|_, tx| tx.focus("editor-1", false));
     runtime.frame(0.0);
@@ -470,6 +490,7 @@ fn shortcuts_queue_messages_and_focus_search() {
 
 #[test]
 fn search_hit_selects_output_and_reports_its_line() {
+    let _guard = serial();
     let mut runtime = headless::runtime(search_state(), SIZE, 1.0);
     let (x, y) = runtime.find("search-hit-1").expect("second hit is visible");
     runtime.pointer_down(x, y);

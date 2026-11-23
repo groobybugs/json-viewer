@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use json_viewer::headless::{self, element_tree};
@@ -26,6 +27,20 @@ use serde_json::Value;
 
 const SIZE: (f32, f32) = (1280.0, 800.0);
 const SCALE: f32 = 1.0;
+
+/// `fold_index` keeps one process-wide store (fold states, pending reveals
+/// keyed by view base, hover, LRU) and `line_index` one process-wide snapshot
+/// LRU. The app is single-threaded, but libtest runs these tests in parallel
+/// inside one process: a concurrent app render can consume another test's
+/// pending reveal or evict a warmed revision. Serialize every test that
+/// renders the app.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The small document from the task's sketch: nested objects, an array,
 /// scalars of every kind.
@@ -246,6 +261,7 @@ fn api_shaped_doc(entries: usize) -> String {
 /// the footer.
 #[test]
 fn tree_png_small_doc_expanded() {
+    let _guard = serial();
     let mut state = tree_state(SMALL);
     expand_first_containers(&mut state, 2);
     select_row_containing(&mut state, "cargo build");
@@ -274,6 +290,7 @@ fn tree_png_small_doc_expanded() {
 /// api.json shape: 326 top-level keys on one minified line, collapsed.
 #[test]
 fn tree_png_api_shaped_collapsed() {
+    let _guard = serial();
     let doc = api_shaped_doc(326);
     let state = tree_state(&doc);
     let tree = render_png(state, "tree-api-collapsed.png");
@@ -292,6 +309,7 @@ fn tree_png_api_shaped_collapsed() {
 /// Same document partially expanded, scrolled so the expansion is visible.
 #[test]
 fn tree_png_api_shaped_partially_expanded() {
+    let _guard = serial();
     let doc = api_shaped_doc(326);
     let mut state = tree_state(&doc);
     expand_first_containers(&mut state, 3);
@@ -334,6 +352,7 @@ fn tree_png_api_shaped_partially_expanded() {
 /// not its placeholder.
 #[test]
 fn tree_png_filter_active() {
+    let _guard = serial();
     let doc = api_shaped_doc(326);
     let mut state = tree_state(&doc);
     state.update(Msg::TreeFilterChanged {
@@ -371,6 +390,7 @@ fn tree_png_filter_active() {
 /// (`alpha_2` before `alpha_10`), view-only.
 #[test]
 fn tree_png_sorted() {
+    let _guard = serial();
     let doc = api_shaped_doc(326);
     let mut state = tree_state(&doc);
     let before: Vec<u32> = state.tree[&state.active]
@@ -413,6 +433,7 @@ fn tree_png_sorted() {
 /// The tree mounts on a broken document with a parse alert, not a crash.
 #[test]
 fn tree_png_invalid_document() {
+    let _guard = serial();
     let mut state = AppState::default();
     let id = state.active;
     state.update_input(id, "{\"broken\": tru".into());
@@ -427,6 +448,7 @@ fn tree_png_invalid_document() {
 /// Switching between Code and Tree keeps both views alive in one frame set.
 #[test]
 fn tree_png_switches_with_code_view() {
+    let _guard = serial();
     let mut state = tree_state(SMALL);
     let id = state.active;
     // Tree → Output → Tree again.
@@ -444,6 +466,7 @@ fn tree_png_switches_with_code_view() {
 /// and selected, and the tree stays open (no jump to the Output view).
 #[test]
 fn tree_search_hit_click_reveals_and_selects() {
+    let _guard = serial();
     let mut state = tree_state(SMALL);
     let id = state.active;
     state.apply_search_results(
@@ -535,6 +558,7 @@ fn hundred_mb_doc() -> String {
 #[test]
 #[ignore]
 fn tree_100mb_perf_evidence() {
+    let _guard = serial();
     let gpu = Gpu::headless();
     let cancel = AtomicBool::new(false);
 
@@ -647,6 +671,7 @@ fn tree_100mb_perf_evidence() {
 #[test]
 #[ignore]
 fn tree_7mb_perf_evidence() {
+    let _guard = serial();
     let doc = api_shaped_doc(19_000);
     let mb = doc.len() as f64 / (1024.0 * 1024.0);
     println!("API_DOC_BYTES={} ({mb:.2} MiB single line)", doc.len());

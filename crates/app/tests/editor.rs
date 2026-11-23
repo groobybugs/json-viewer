@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use json_viewer::editor::{state as editor_state, view};
@@ -18,6 +19,21 @@ use rune::{col, Cx, El, Env, Ime, Key, KeyEvent, Mods, Runtime, ScrollSpec, Whee
 
 const SIZE: (f32, f32) = (1280.0, 800.0);
 const MIB: usize = 1024 * 1024;
+
+/// `fold_index` keeps one process-wide store (fold states, pending reveals
+/// keyed by view base, hover, LRU) and `line_index` one process-wide snapshot
+/// LRU. The app is single-threaded, but libtest runs these tests in parallel
+/// inside one process: a concurrent Output render can consume another test's
+/// pending reveal or evict a warmed revision. Serialize the tests that mount
+/// the Output `TextView`; the Input-only rope-editor tests use thread-local
+/// state and stay parallel.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn editor_view(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let tab = state.active_tab().expect("active tab");
@@ -561,6 +577,7 @@ fn status_bar_line_count_stays_correct_after_edits() {
 
 #[test]
 fn status_bar_line_count_after_external_replace_in_output_view() {
+    let _guard = serial();
     let state = doc_state("a\nb\n".into());
     let mut rt = app_runtime(state);
     assert!(summary_text(&rt).contains("2 lines"));
@@ -589,6 +606,7 @@ fn probe_line_count_scan_cost() {
 
 #[test]
 fn app_switch_to_output_and_back_keeps_rope() {
+    let _guard = serial();
     let state = doc_state("{\"a\":1}".into());
     let mut rt = app_runtime(state);
     press(&mut rt, Key::Text("Z".into()), Mods::default());

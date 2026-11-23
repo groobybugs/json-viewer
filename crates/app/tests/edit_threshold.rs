@@ -28,6 +28,7 @@
 //! `cargo test --release -p json-viewer --test edit_threshold -- --ignored --nocapture`
 
 use std::fmt::Write as _;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use json_viewer::state::{AppState, TabView};
@@ -58,6 +59,19 @@ const TEXT: Color = Color { r: 0.760525, g: 0.806952, b: 0.871367, a: 1.0 };
 const MUTED: Color = Color { r: 0.296138, g: 0.366253, b: 0.47932, a: 1.0 };
 const DANGER: Color = Color { r: 0.938686, g: 0.165132, b: 0.165132, a: 1.0 };
 const DANGER_BG: Color = Color { r: 0.0356013, g: 0.0109601, b: 0.0193824, a: 1.0 };
+
+/// `fold_index` keeps one process-wide store (fold states, pending reveals
+/// keyed by view base, hover, LRU) and `line_index` one process-wide snapshot
+/// LRU. The app is single-threaded, but libtest runs these tests in parallel
+/// inside one process: a concurrent Output render can consume another test's
+/// pending reveal or evict a warmed revision. Serialize the benches.
+static FOLD_STORE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FOLD_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// `ui::view` with the input editor's read-only gates lifted. Everything else
 /// — shell, toolbar, tab strip, search, handlers, scroll viewport — is the
@@ -553,6 +567,7 @@ fn recommend(results: &[VariantResult], prefix: &str) -> String {
 #[test]
 #[ignore]
 fn edit_threshold_bench() {
+    let _guard = serial();
     let mut results = Vec::new();
 
     // Control: the forced native path at 1 MiB. (The real `ui::view` now
@@ -914,6 +929,7 @@ fn rope_bench_variant(label: &str, text: String) -> RopeResult {
 #[test]
 #[ignore]
 fn rope_editor_bench() {
+    let _guard = serial();
     // Error-marker evidence through the real app view.
     {
         let input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3\n}";

@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use json_viewer::headless::{element_tree, text_system};
@@ -26,6 +26,20 @@ const SIZE: (f32, f32) = (960.0, 640.0);
 const LONG_SIZE: (f32, f32) = (640.0, 360.0);
 const SCALE: f32 = 1.0;
 const BASE: &str = "output-text";
+
+/// `line_index` keeps one process-wide snapshot LRU and `TextView::row_key`
+/// writes the process-wide `fold_index` reveal map keyed by view base. libtest
+/// runs these tests in parallel inside one process: a concurrent build can
+/// evict a warmed revision (breaking the 100 MB `Arc::ptr_eq` cache assertion)
+/// or consume BASE's pending reveal. Serialize every test that builds a
+/// snapshot or arms a reveal.
+static GLOBALS: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    GLOBALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn target_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
@@ -140,6 +154,7 @@ fn measured_char_width_is_fixed_pitch() {
 /// the banner says why (so `Format` is the suggested fix).
 #[test]
 fn long_line_gate_reports_the_reason() {
+    let _guard = serial();
     let doc = format!("[{}0]", "1,".repeat(100_000)); // one ~200 KB line
     let edit = TextEdit::default();
     let view = TextView::editable(&doc, &edit);
@@ -167,6 +182,7 @@ fn long_line_gate_reports_the_reason() {
 /// line, not just a large file, so the banner can suggest Format.
 #[test]
 fn six_point_nine_megabyte_single_line_is_a_long_line() {
+    let _guard = serial();
     let mut doc = String::with_capacity(7_300_000);
     doc.push_str("[1");
     while doc.len() < 7_236_000 {
@@ -357,6 +373,7 @@ fn mono_slot_resolves_to_a_fixed_pitch_face() {
 /// A PNG whose columns align: mixed 'i'/'W' runs and nested indentation.
 #[test]
 fn alignment_png_has_a_monospaced_gutter() {
+    let _guard = serial();
     let directory = target_dir();
     std::fs::create_dir_all(&directory).unwrap();
     let gpu = Gpu::headless();
@@ -376,6 +393,7 @@ fn alignment_png_has_a_monospaced_gutter() {
 /// Issue 3: a cold 100 MB miss must cost only the bounded window, not O(n).
 #[test]
 fn cold_large_miss_is_o_window() {
+    let _guard = serial();
     let doc = "z".repeat(100 * 1024 * 1024);
     let t = Instant::now();
     let snapshot = line_index::snapshot(&doc);
@@ -394,6 +412,7 @@ fn cold_large_miss_is_o_window() {
 
 #[test]
 fn editable_fallback_shows_the_large_file_banner() {
+    let _guard = serial();
     let mut state = AppState::default();
     state.tabs[0].input = "x".repeat(128);
     let gpu = Gpu::headless();
@@ -410,6 +429,7 @@ fn editable_fallback_shows_the_large_file_banner() {
 
 #[test]
 fn small_formatted_json_has_syntax_colours() {
+    let _guard = serial();
     let pretty = serde_json::to_string_pretty(&serde_json::json!({
         "name": "json-viewer",
         "version": 3,
@@ -444,6 +464,7 @@ fn small_formatted_json_has_syntax_colours() {
 
 #[test]
 fn headless_pngs_and_frame_timings() {
+    let _guard = serial();
     let directory = target_dir();
     std::fs::create_dir_all(&directory).unwrap();
     let gpu = Gpu::headless();
