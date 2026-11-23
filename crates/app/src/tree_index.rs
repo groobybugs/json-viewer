@@ -520,6 +520,41 @@ impl TreeIndex {
         let (start, end) = self.value_range(node);
         &text[start.min(text.len())..end.min(text.len())]
     }
+
+    /// Resolves one path segment from `node`: an object member's key, or an
+    /// array element's index. The first matching child wins, matching the
+    /// streaming search walk's behaviour on duplicate keys.
+    pub fn child_by_segment(&self, text: &str, node: u32, segment: &str) -> Option<u32> {
+        if self.kind(node) == NodeKind::Object {
+            let mut child = self.first_child(node);
+            while let Some(c) = child {
+                if self.key_text(text, c).as_deref() == Some(segment) {
+                    return Some(c);
+                }
+                child = self.next_sibling(c);
+            }
+            None
+        } else {
+            let index = segment.parse::<u32>().ok()?;
+            self.children(node)
+                .get(index as usize)
+                .map(|&(child, _)| child)
+        }
+    }
+
+    /// Finds the node a ` → `-joined path (the search results' format)
+    /// points at, starting from the root. An empty path is the root itself;
+    /// a path that does not resolve is `None`.
+    pub fn node_for_path(&self, text: &str, path: &str) -> Option<u32> {
+        if path.is_empty() {
+            return Some(0);
+        }
+        let mut node = 0u32;
+        for segment in path.split(" → ") {
+            node = self.child_by_segment(text, node, segment)?;
+        }
+        Some(node)
+    }
 }
 
 /// Parses one value at `b.pos`, recording its node. Containers stay on the
@@ -1068,24 +1103,81 @@ fn initial_rows(index: &TreeIndex) -> Vec<TreeRow> {
     rows
 }
 
-/// Sorts `(id, doc_index)` pairs by unescaped key text, case-insensitively,
-/// ties by document order. Pure: called from UI thread and job threads.
+/// Sorts `(id, doc_index)` pairs in case-insensitive **natural** order
+/// (`alpha_2` before `alpha_10`, digit runs compared numerically, leading
+/// zeros tying), ties broken by document order so the permutation is
+/// stable. Pure: called from UI thread and job threads.
 fn sorted_pairs(index: &TreeIndex, text: &str, pairs: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     let mut keyed: Vec<(String, u32, u32)> = pairs
         .into_iter()
         .map(|(id, doc_index)| {
             let key = index
                 .key_text(text, id)
-                .map(|key| key.to_lowercase())
+                .map(|key| key.into_owned())
                 .unwrap_or_default();
             (key, doc_index, id)
         })
         .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    keyed.sort_by(|a, b| natural_cmp(&a.0, &b.0).then(a.1.cmp(&b.1)));
     keyed
         .into_iter()
         .map(|(_, doc_index, id)| (id, doc_index))
         .collect()
+}
+
+/// Case-insensitive natural order: runs of ASCII digits compare numerically
+/// (so `alpha_2` < `alpha_10`), every other character compares by its
+/// lowercased form, and one string running out first sorts first. Equal by
+/// this order (for example `alpha_02` vs `alpha_2`) is a tie the caller
+/// breaks, keeping the sort stable.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    while ia < a.len() && ib < b.len() {
+        let (ca, na) = char_at(a, ia);
+        let (cb, nb) = char_at(b, ib);
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let (a_run, a_end) = digit_run(a, ia);
+            let (b_run, b_end) = digit_run(b, ib);
+            let at = a_run.trim_start_matches('0');
+            let bt = b_run.trim_start_matches('0');
+            match at.len().cmp(&bt.len()).then_with(|| at.cmp(bt)) {
+                Ordering::Equal => {
+                    ia = a_end;
+                    ib = b_end;
+                }
+                other => return other,
+            }
+        } else {
+            match lower_key(ca).cmp(&lower_key(cb)) {
+                Ordering::Equal => {
+                    ia = na;
+                    ib = nb;
+                }
+                other => return other,
+            }
+        }
+    }
+    (a.len() - ia).cmp(&(b.len() - ib))
+}
+
+fn char_at(s: &str, byte: usize) -> (char, usize) {
+    let c = s[byte..].chars().next().expect("byte index on a boundary");
+    (c, byte + c.len_utf8())
+}
+
+fn digit_run(s: &str, from: usize) -> (&str, usize) {
+    let bytes = s.as_bytes();
+    let end = bytes[from..]
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .map_or(s.len(), |offset| from + offset);
+    (&s[from..end], end)
+}
+
+fn lower_key(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 // ── Off-thread row jobs ────────────────────────────────────────────────────
@@ -1658,6 +1750,58 @@ mod tests {
             .map(|&(id, _)| index.value_text(doc, id))
             .collect();
         assert_eq!(values, ["3", "1", "2"]);
+    }
+
+    #[test]
+    fn natural_order_compares_digit_runs_numerically() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("alpha_2", "alpha_10"), Less);
+        assert_eq!(natural_cmp("alpha_10", "alpha_2"), Greater);
+        // Case-insensitive: byte order would put "Bravo" first.
+        assert_eq!(natural_cmp("Bravo_1", "alpha_0"), Greater);
+        assert_eq!(natural_cmp("Alpha_1", "alpha_2"), Less);
+        assert_eq!(natural_cmp("Alpha_1", "alpha_1"), Equal);
+        // Leading zeros tie; the caller's stability breaks them.
+        assert_eq!(natural_cmp("alpha_02", "alpha_2"), Equal);
+        assert_eq!(natural_cmp("alpha_02", "alpha_10"), Less);
+        // Prefixes and embedded digits.
+        assert_eq!(natural_cmp("abc", "abcd"), Less);
+        assert_eq!(natural_cmp("x1y2", "x1y10"), Less);
+        assert_eq!(natural_cmp("", ""), Equal);
+        assert_eq!(natural_cmp("a", ""), Greater);
+    }
+
+    #[test]
+    fn sorted_pairs_use_natural_order() {
+        let doc = r#"{"zeta_2":1,"zeta_10":2,"Alpha_1":3,"alpha_2":4,"m":5}"#;
+        let index = TreeIndex::build(doc).unwrap();
+        let sorted = sorted_pairs(&index, doc, index.children(0));
+        let keys: Vec<String> = sorted
+            .iter()
+            .map(|&(id, _)| index.key_text(doc, id).unwrap().into_owned())
+            .collect();
+        // Case-insensitive and numeric: alpha_2 before zeta_10, not between
+        // zeta_10 and zeta_2 the way byte order would place it.
+        assert_eq!(keys, ["Alpha_1", "alpha_2", "m", "zeta_2", "zeta_10"]);
+    }
+
+    #[test]
+    fn node_for_path_resolves_search_paths() {
+        let index = doc_index();
+        // Object keys, then an array index.
+        let element = index
+            .node_for_path(DOC, "scripts → items → 1")
+            .expect("path resolves");
+        assert_eq!(index.kind(element), NodeKind::String);
+        assert_eq!(index.value_text(DOC, element), r#""x""#);
+        assert!(index.node_for_path(DOC, "scripts → name").is_some());
+        // Unknown keys and out-of-range indices do not resolve.
+        assert!(index.node_for_path(DOC, "scripts → nope").is_none());
+        assert!(index.node_for_path(DOC, "scripts → items → 9").is_none());
+        // An empty path is the root; a scalar root resolves too.
+        assert_eq!(index.node_for_path(DOC, ""), Some(0));
+        let scalar = TreeIndex::build("42").unwrap();
+        assert_eq!(scalar.node_for_path("42", ""), Some(0));
     }
 
     #[test]

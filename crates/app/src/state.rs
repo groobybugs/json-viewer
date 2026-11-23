@@ -381,6 +381,18 @@ impl AppState {
         }
     }
 
+    /// Shows `query` in the shared tree filter field. The field is one
+    /// `TextEdit` across tabs, so it is re-synced whenever the active tab
+    /// changes, the tree is (re)entered, or a filter arrives from anywhere
+    /// other than typing (restored sessions, scripts, other tabs). A field
+    /// that already holds the text is left alone: `replace_text` would
+    /// reset the caret and selection.
+    fn sync_tree_filter_field(&mut self, query: &str) {
+        if self.tree_filter_edit.text != query {
+            self.tree_filter_edit.replace_text(query.to_owned());
+        }
+    }
+
     /// Makes sure the tab showing the tree has a fresh index for its current
     /// input. Idempotent: skips when the index covers `input_revision` or a
     /// build for it is already in flight.
@@ -443,12 +455,47 @@ impl AppState {
                 let filter = tree.filter.clone();
                 tree.install_index(index, revision);
                 if !filter.is_empty() {
+                    // A new document re-runs the active filter; the fresh
+                    // rows are the base that clearing the filter restores.
+                    tree.save_filter_base();
                     self.start_tree_job(id, TreeJob::Filter(filter));
                 }
             }
             IndexOutcome::Failed(error) => {
                 tree.error = Some(error.to_string());
             }
+        }
+    }
+
+    /// Expands every container along `path` so its target row exists, then
+    /// selects that row. Used by the search-results hook in tree mode.
+    fn tree_reveal_path(&mut self, id: TabId, path: &str) {
+        let Some(index) = self.tree.get(&id).and_then(|tree| tree.index.clone()) else {
+            return;
+        };
+        // `self.tabs` (read) and `self.tree` (mutated) are disjoint fields.
+        let input: &str = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.input.as_str())
+            .unwrap_or("");
+        let mut node = 0u32;
+        for segment in path.split(" → ") {
+            match index.child_by_segment(input, node, segment) {
+                Some(next) => {
+                    if index.is_container(node) {
+                        if let Some(tree) = self.tree.get_mut(&id) {
+                            tree.expand(&index, input, node);
+                        }
+                    }
+                    node = next;
+                }
+                None => return, // stale path: nothing to reveal
+            }
+        }
+        if let Some(tree) = self.tree.get_mut(&id) {
+            tree.select(&index, input, node);
         }
     }
 
@@ -598,6 +645,11 @@ impl AppState {
                 if self.tree.get(&id).is_some_and(|tree| tree.open) {
                     self.ensure_tree_index(id);
                 }
+                // The tree filter field is shared: it always shows the
+                // active tab's filter.
+                if let Some(filter) = self.tree.get(&id).map(|tree| tree.filter.clone()) {
+                    self.sync_tree_filter_field(&filter);
+                }
                 Vec::new()
             }
             Msg::SwitchView(view) => {
@@ -707,6 +759,14 @@ impl AppState {
                 } else {
                     self.tree.insert(id, TreeUi::new(true));
                 }
+                // Entering (or re-entering) the tree shows this tab's filter
+                // in the shared field.
+                let filter = self
+                    .tree
+                    .get(&id)
+                    .map(|tree| tree.filter.clone())
+                    .unwrap_or_default();
+                self.sync_tree_filter_field(&filter);
                 self.ensure_tree_index(id);
                 Vec::new()
             }
@@ -758,6 +818,10 @@ impl AppState {
                         tree.select(&index, input, node);
                     }
                 }
+                Vec::new()
+            }
+            Msg::TreeRevealPath { tab, path } => {
+                self.tree_reveal_path(tab, &path);
                 Vec::new()
             }
             Msg::TreeExpandAll { tab } => {
@@ -829,6 +893,11 @@ impl AppState {
                     if let Some(tree) = self.tree.get_mut(&tab) {
                         tree.clear_filter();
                     }
+                    // The field follows here too: a cleared filter must not
+                    // leave stale text behind.
+                    if tab == self.active {
+                        self.sync_tree_filter_field(&query);
+                    }
                     Vec::new()
                 } else {
                     let node_count = self
@@ -841,6 +910,12 @@ impl AppState {
                         if let Some(tree) = self.tree.get_mut(&tab) {
                             tree.filter = query.clone();
                             tree.save_filter_base();
+                        }
+                        // The field follows the active tab's filter, whether
+                        // the query came from typing (already equal, a
+                        // no-op) or from anywhere else.
+                        if tab == self.active {
+                            self.sync_tree_filter_field(&query);
                         }
                         // Filtering runs through the job machinery: inline
                         // without an app handle, off-thread (canceling any
@@ -1008,6 +1083,9 @@ pub enum Msg {
     TreeCollapse { tab: TabId, node: u32 },
     /// Select `node` (shows its path in the tree footer).
     TreeSelect { tab: TabId, node: u32 },
+    /// Expand the containers along a ` → `-joined path and select its node
+    /// (the search-results hook's tree-mode behaviour).
+    TreeRevealPath { tab: TabId, path: String },
     /// Expand every container (off-thread above `tree_index::SYNC_ROW_LIMIT`
     /// nodes).
     TreeExpandAll { tab: TabId },
@@ -1616,5 +1694,112 @@ mod tests {
             outcome,
         });
         assert_eq!(state.tree[&id].rows.len(), 3, "stale delivery ignored");
+    }
+
+    #[test]
+    fn tree_filter_field_shows_the_active_tab_filter() {
+        let (mut state, id) = tree_ready_state();
+        // Set programmatically (scripts, restored runs): the field follows.
+        state.update(Msg::TreeFilterChanged {
+            tab: id,
+            query: "simple".into(),
+        });
+        assert_eq!(state.tree_filter_edit.text, "simple");
+        // The same query again must not disturb the field.
+        state.update(Msg::TreeFilterChanged {
+            tab: id,
+            query: "simple".into(),
+        });
+        assert_eq!(state.tree_filter_edit.text, "simple");
+
+        // A second tab with its own filter: the shared field follows the
+        // active tab.
+        let second = state.add_tab();
+        state.update_input(second, r#"{"x":1}"#.into());
+        state.update(Msg::TreeOpen);
+        state.update(Msg::TreeFilterChanged {
+            tab: second,
+            query: "other".into(),
+        });
+        assert_eq!(state.tree_filter_edit.text, "other");
+        state.update(Msg::SelectTab(id));
+        assert_eq!(state.tree_filter_edit.text, "simple");
+        state.update(Msg::SelectTab(second));
+        assert_eq!(state.tree_filter_edit.text, "other");
+
+        // Leaving for a code view and re-entering the tree keeps the text.
+        state.update(Msg::SwitchView(TabView::Output));
+        assert!(!state.tree[&second].open);
+        state.update(Msg::TreeOpen);
+        assert_eq!(state.tree_filter_edit.text, "other");
+
+        // Clearing the filter clears the field (the view's clear button
+        // replaces the buffer text itself; the reducer path stays in step).
+        state.update(Msg::TreeFilterChanged {
+            tab: second,
+            query: String::new(),
+        });
+        assert_eq!(state.tree_filter_edit.text, "");
+    }
+
+    #[test]
+    fn tree_reveal_path_expands_ancestors_and_selects() {
+        let (mut state, id) = tree_ready_state();
+        // The target (`items`) sits under a collapsed `scripts`; the reveal
+        // must expand the containers along the path, then select.
+        let scripts = state.tree[&id].rows[1].node;
+        assert!(!state.tree[&id].rows[1].expanded);
+        state.update(Msg::TreeRevealPath {
+            tab: id,
+            path: "scripts → items".into(),
+        });
+        let tree = &state.tree[&id];
+        assert!(
+            tree.row_of_node(scripts)
+                .is_some_and(|row| tree.rows[row].expanded)
+        );
+        let selection = tree.selected.as_ref().expect("node selected");
+        assert_eq!(selection.path, "scripts → items");
+        assert_eq!(
+            &state.tab(id).unwrap().input
+                [selection.value_off as usize..(selection.value_off + selection.value_len) as usize],
+            r#"[12,"x"]"#
+        );
+        // A path that no longer resolves changes nothing.
+        state.update(Msg::TreeRevealPath {
+            tab: id,
+            path: "scripts → nope → deeper".into(),
+        });
+        assert_eq!(
+            state.tree[&id].selected.as_ref().unwrap().path,
+            "scripts → items"
+        );
+    }
+
+    #[test]
+    fn tree_filter_survives_an_input_change_and_clears_back() {
+        let (mut state, id) = tree_ready_state();
+        // "a" matches `name` in the old doc and cat/canary in the new one.
+        state.update(Msg::TreeFilterChanged {
+            tab: id,
+            query: "a".into(),
+        });
+        assert!(state.tree[&id].filter_matched.unwrap_or(0) > 0);
+        // New document with the filter still active: the re-run must keep a
+        // saved base so clearing the filter restores the fresh rows.
+        state.update_input(id, r#"{"cat":1,"canary":2,"dog":3}"#.into());
+        assert!(state.tree[&id].filter_matched.unwrap_or(0) >= 2);
+        state.update(Msg::TreeFilterChanged {
+            tab: id,
+            query: String::new(),
+        });
+        let tree = &state.tree[&id];
+        assert!(tree.filter.is_empty());
+        assert_eq!(
+            tree.rows.len(),
+            4,
+            "unfiltered rows restored: {}",
+            tree.rows.len()
+        );
     }
 }

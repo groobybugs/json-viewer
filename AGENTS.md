@@ -131,13 +131,23 @@ frozen API or a PR comment.
 A classic JSON-editor tree view, per tab: the document-card header's
 `Input | Output | Tree` switch (the "View" switch) enters it, and its own
 toolbar offers **Expand all**, **Collapse all**, **Sort A→Z** (view order
-only — data is never touched) and a **Filter** box (keys and scalar values
-match case-insensitively, `search.rs` rules; matched nodes keep their
-ancestors and auto-expand; expansion is blocked while a filter is active).
-Rows show expand arrows, indentation guides, keys (or `[index]` for array
-elements), type-coloured values and `{n}`/`[n]` child counts; selecting a
-row shows its ` → `-joined path in a footer with **Copy path** /
-**Copy value** (the whole subtree text for containers).
+only — data is never touched; case-insensitive *natural* order, digit runs
+compared numerically so `alpha_2` sorts before `alpha_10`, ties stable by
+document order) and a **Filter** box (keys and scalar values match
+case-insensitively, `search.rs` rules; matched nodes keep their ancestors
+and auto-expand; expansion is blocked while a filter is active). The filter
+field is one shared `TextEdit` (`AppState::tree_filter_edit`) that always
+displays the active tab's filter — the reducer re-syncs it on
+`TreeOpen`, `SelectTab` and every filter change, including queries that
+arrive without typing (scripts, restored runs). Rows show expand arrows,
+indentation guides, keys (or `[index]` for array elements), type-coloured
+values and `{n}`/`[n]` child counts; selecting a row shows its
+` → `-joined path in a footer with **Copy path** / **Copy value** (the
+whole subtree text for containers). Clicking a search hit while the tree
+is open reveals and selects that node in place (`Msg::TreeRevealPath`
+expands the path's containers; the hook is the one `select_hit` branch in
+`ui/search_bar.rs`); with the tree closed, hit clicks jump to the code
+output view as before.
 
 New state (small frozen-API extension, documented here): `AppState` gains
 `tree: HashMap<TabId, TreeUi>` and `tree_filter_edit: TextEdit`;
@@ -146,12 +156,11 @@ New state (small frozen-API extension, documented here): `AppState` gains
 exhaustive `match tab.view` this branch does not own, so a tab "is in tree
 mode" iff `state.tree.get(&id)` exists with `open` set (runtime-only, never
 persisted). `Msg` gains `TreeOpen/TreeClose/TreeExpand/TreeCollapse/
-TreeSelect/TreeExpandAll/TreeCollapseAll/TreeSortToggled/TreeFilterChanged/
-TreeCopyPath/TreeCopyValue/TreeIndexDone/TreeRowsReady`; copy actions reuse
-the existing `Effect::Copy`, and choosing a code view (`Msg::SwitchView`)
-leaves tree mode, so search-result jumps behave as before. Clicking a search
-hit in tree mode switches to the code output view (in-tree reveal was not
-implemented because `ui/search_bar.rs` is outside this branch's scope).
+TreeSelect/TreeRevealPath/TreeExpandAll/TreeCollapseAll/TreeSortToggled/
+TreeFilterChanged/TreeCopyPath/TreeCopyValue/TreeIndexDone/TreeRowsReady`;
+copy actions reuse the existing `Effect::Copy`, and choosing a code view
+(`Msg::SwitchView`) leaves tree mode, so search-result jumps in code views
+behave as before.
 
 Performance design (evidence: `cargo test --release -p json-viewer --test
 tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
@@ -182,9 +191,11 @@ tree_view -- --ignored --nocapture`, PNGs in `target/headless/tree-*.png`):
   status spinner and a per-tab cancel flag (a newer job cancels the old).
   Measured: 100 MB expand-all 181 ms off the UI thread, no cap needed.
 - **Filter** runs off-thread with the same cancel machinery; measured
-  201 ms on 100 MB (259k matches). **Sort** is a per-object permutation
-  computed lazily at enumeration time (cached doc-order children per
-  expanded container), never mutating the index; big docs re-flatten
+  201 ms on 100 MB (259k matches). **Sort** is a per-object natural-order
+  permutation (`tree_index::natural_cmp`: case-insensitive, digit runs
+  numeric, ties stable by document order) computed lazily at enumeration
+  time (cached doc-order children per expanded container), never mutating
+  the index; big docs re-flatten
   off-thread when it toggles.
 
 

@@ -12,12 +12,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use json_viewer::headless::{self, element_tree};
+use json_viewer::search::SearchHit;
 use json_viewer::state::{AppState, Msg, TabId};
 use json_viewer::tree_index::{self, TreeJob};
 use json_viewer::ui;
+use json_viewer::runner;
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::{Env, Runtime};
 use serde_json::Value;
@@ -182,7 +184,9 @@ fn row_labels(tree: &Value) -> Vec<String> {
 }
 
 /// A models.dev api.json-shaped document: `entries` top-level keys, deep
-/// nesting, mixed scalar types, minified onto a single line.
+/// nesting, mixed scalar types, minified onto a single line. Indices are
+/// unpadded on purpose: byte order (`alpha_10` < `alpha_2`) differs from
+/// natural order, which is what the sorted view demonstrates.
 fn api_shaped_doc(entries: usize) -> String {
     let names = ["alpha", "Bravo", "charlie", "Delta", "echo", "fox-trot", "golf", "Hotel"];
     let mut doc = String::with_capacity(entries * 400 + 32);
@@ -196,7 +200,7 @@ fn api_shaped_doc(entries: usize) -> String {
         let deprecated = if i % 5 == 0 { "true" } else { "false" };
         let timeout_ms = 2500 + i;
         doc.push_str(&format!(
-            r#""{name}_{i:03}":{{
+            r#""{name}_{i}":{{
                 "name":"Service {i} of {entries}",
                 "count":{i},
                 "verified":{verified},
@@ -280,7 +284,7 @@ fn tree_png_api_shaped_collapsed() {
         "root row shows the top-level key count: {labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label.starts_with("\"alpha_000\":")),
+        labels.iter().any(|label| label.starts_with("\"alpha_0\":")),
         "first key row missing: {labels:?}"
     );
 }
@@ -315,18 +319,19 @@ fn tree_png_api_shaped_partially_expanded() {
         "expanded member row missing: {labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label.starts_with("\"Bravo_001\":")),
+        labels.iter().any(|label| label.starts_with("\"Bravo_1\":")),
         "expanded parent row missing: {labels:?}"
     );
     let rendered = tree.to_string();
     assert!(
-        rendered.contains("Bravo_001 → name"),
+        rendered.contains("Bravo_1 → name"),
         "footer path missing: {rendered}"
     );
 }
 
 /// Filter active: only matching nodes and their ancestors, with the match
-/// count in the toolbar.
+/// count in the toolbar — and the filter field showing the active query,
+/// not its placeholder.
 #[test]
 fn tree_png_filter_active() {
     let doc = api_shaped_doc(326);
@@ -337,20 +342,33 @@ fn tree_png_filter_active() {
     });
     let tree = state.tree.get(&state.active).unwrap();
     assert!(tree.filter_matched.unwrap_or(0) >= 2, "expected matches");
-    let rendered = render_png(state, "tree-api-filter.png").to_string();
+    let tree_json = render_png(state, "tree-api-filter.png");
+    let rendered = tree_json.to_string();
     assert!(
         rendered.contains("match"),
         "match count label missing"
     );
+    // The shared filter field displays the active tab's filter text.
+    let field_text = tree_json["elements"]
+        .as_array()
+        .and_then(|elements| {
+            elements
+                .iter()
+                .find(|element| element["key"] == "tree-filter")
+                .and_then(|element| element["text"].as_str())
+        })
+        .expect("tree-filter element");
+    assert_eq!(field_text, "Bravo_", "filter field shows {field_text:?}");
     // Every mounted key row is a Bravo_* member or its ancestors/children.
     assert!(rendered.contains("\"Bravo_"), "filtered rows missing");
     assert!(
-        !rendered.contains("\"alpha_000\":"),
+        !rendered.contains("\"alpha_0\":"),
         "unmatched key still visible under the filter"
     );
 }
 
-/// Sort A→Z on: the same rows, alphabetical display order, view-only.
+/// Sort A→Z on: the same rows, in case-insensitive *natural* order
+/// (`alpha_2` before `alpha_10`), view-only.
 #[test]
 fn tree_png_sorted() {
     let doc = api_shaped_doc(326);
@@ -375,11 +393,21 @@ fn tree_png_sorted() {
         })
         .collect();
     let mut sorted_window = keys.clone();
-    sorted_window.sort_by_key(|key| key.to_lowercase());
+    sorted_window.sort_by(|a, b| tree_index::natural_cmp(a, b));
     assert!(
         !keys.is_empty() && keys == sorted_window,
-        "mounted rows are not in A→Z order: {keys:?}"
+        "mounted rows are not in natural A→Z order: {keys:?}"
     );
+    // Byte order would put alpha_104 before alpha_8; natural order must not.
+    let alpha_keys: Vec<&String> = keys.iter().filter(|k| k.starts_with("alpha_")).collect();
+    if alpha_keys.len() >= 2 {
+        let first = alpha_keys[0].trim_start_matches("alpha_");
+        assert_eq!(
+            first.parse::<u32>().ok(),
+            Some(0),
+            "natural order starts at the first key, not a byte-order pick: {keys:?}"
+        );
+    }
 }
 
 /// The tree mounts on a broken document with a parse alert, not a crash.
@@ -410,6 +438,71 @@ fn tree_png_switches_with_code_view() {
     assert!(state.tree[&id].open);
     let tree = render_png(state, "tree-after-switch-back.png").to_string();
     assert!(tree.contains("tree-toolbar"), "tree did not come back");
+}
+
+/// Search-result click while the tree is open: the hit's node is revealed
+/// and selected, and the tree stays open (no jump to the Output view).
+#[test]
+fn tree_search_hit_click_reveals_and_selects() {
+    let mut state = tree_state(SMALL);
+    let id = state.active;
+    state.apply_search_results(
+        id,
+        vec![SearchHit {
+            path: "scripts → build".into(),
+            key: Some("build".into()),
+            value_preview: r#""cargo build""#.into(),
+            line: Some(5),
+        }],
+    );
+    let mut rt = app_runtime(state);
+
+    // Click the search result through the real view.
+    let (x, y) = rt
+        .find("search-hit-0")
+        .expect("search result is on screen");
+    rt.pointer_move(x, y);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+
+    // Pump the runner until the reveal lands (expand → select → scroll).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut revealed = false;
+    while !revealed {
+        rt.update_if(|state, tx| runner::poll(state, 0.0, tx));
+        rt.frame(1.0 / 60.0);
+        let selected = rt
+            .state
+            .tree
+            .get(&rt.state.active)
+            .and_then(|tree| tree.selected.clone());
+        revealed = selected.as_ref().is_some_and(|sel| sel.path == "scripts → build");
+        assert!(Instant::now() < deadline, "timed out waiting for the reveal");
+    }
+    rt.settle_all();
+    rt.frame(0.0);
+
+    // The tab stayed in tree mode with the node selected and revealed.
+    assert!(rt.state.tree[&rt.state.active].open, "left tree mode");
+    let node = rt
+        .state
+        .tree
+        .get(&rt.state.active)
+        .and_then(|tree| tree.selected.as_ref().map(|sel| sel.node))
+        .expect("selection");
+    let rendered = element_tree(&rt).to_string();
+    assert!(
+        rendered.contains(&format!("tree-row-{node}")),
+        "the hit's row is not mounted after the reveal"
+    );
+    assert!(
+        rendered.contains("scripts → build"),
+        "footer path missing after the reveal"
+    );
+
+    // PNG evidence.
+    let gpu = Gpu::headless();
+    draw(&mut rt, &gpu, &target_dir().join("tree-hit-reveal.png"));
 }
 
 // ── Big-document evidence (release, --ignored) ────────────────────────────
