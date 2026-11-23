@@ -15,11 +15,20 @@
 //! truncated store behind. The whole operation is safe to run on a background
 //! thread.
 //!
+//! Save order is payload temps, payload renames, index temp, index rename,
+//! then deletion of closed-tab payloads. A crash at any earlier step leaves a
+//! loadable store: committed files win over temps, a missing index is recovered
+//! from a complete temp or from payload files, and closed-tab files are not
+//! removed until the new index is committed. A corrupt index or an unsupported
+//! version is a [`PersistError`]; [`TabsStore::save`] then refuses to overwrite
+//! that index or delete payloads, so a boot fallback cannot destroy recoverable
+//! data. A missing or unreadable *payload* is skipped with a warning
+//! ([`load_warnings`]) instead of failing the whole store.
+//!
 //! The default location is the platform data directory
 //! (`~/.local/share/json-viewer/` on Linux); [`TabsStore`] accepts an explicit
-//! base directory so tests never touch the real profile. A missing store loads
-//! as an empty list (first run). A corrupt or inconsistent store is returned as
-//! a [`PersistError`] so the caller can surface it and still start the app.
+//! base directory so tests never touch the real profile. A missing store with
+//! no payloads loads as an empty list (first run).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -27,6 +36,8 @@ use std::hash::Hasher;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use rustc_hash::FxHasher;
 use serde::de::Error as _;
@@ -38,6 +49,45 @@ use crate::state::{Tab, TabId, TabView};
 /// On-disk format version. Bump when the index/payload shape changes; an
 /// unknown version is treated as a corrupt store rather than guessed at.
 const FORMAT_VERSION: u32 = 1;
+
+/// Warnings from the latest [`TabsStore::load`] of each index path. Keyed by
+/// the index file so tests and the app profile do not clobber each other.
+static LOAD_WARNINGS: LazyLock<Mutex<HashMap<PathBuf, Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn record_warnings(path: &Path, warnings: Vec<String>) {
+    LOAD_WARNINGS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(path.to_path_buf(), warnings);
+}
+
+/// Warnings produced by the latest load of `path` (the index file). Empty when
+/// that path has not been loaded, or the load was clean.
+pub fn load_warnings(path: &Path) -> Vec<String> {
+    LOAD_WARNINGS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(path)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Takes and clears the boot-path warning for [`data_path`], if any.
+///
+/// `main` starts from [`load_tabs`] and does not have a warning channel.
+/// [`crate::runner`] applies this to the status line on the first poll.
+pub fn take_boot_warning() -> Option<String> {
+    let path = data_path();
+    let mut reports = LOAD_WARNINGS.lock().unwrap_or_else(|err| err.into_inner());
+    let warnings = reports.get_mut(&path)?;
+    if warnings.is_empty() {
+        return None;
+    }
+    let text = warnings.join("; ");
+    warnings.clear();
+    Some(text)
+}
 
 /// Why loading or saving tabs failed.
 #[derive(Debug, Error)]
@@ -101,46 +151,68 @@ impl TabsStore {
         &self.file
     }
 
-    /// Loads tabs in index order. A missing index is an empty list (first
-    /// run), not an error. A corrupt index, an unsupported version, or a
-    /// missing/corrupt payload is a [`PersistError`] the caller can surface
-    /// while still starting the app.
+    /// Loads tabs in index order.
+    ///
+    /// A missing index with no payloads is an empty list (first run). A missing
+    /// index is otherwise recovered from a complete index temp, or from the
+    /// payload files, so a crash before the index rename does not drop data.
+    /// A corrupt index or an unsupported version is a [`PersistError`]. A
+    /// missing or unreadable payload is skipped; the warning is available from
+    /// [`load_warnings`].
     pub fn load(&self) -> Result<Vec<Tab>, PersistError> {
-        let text = match fs::read_to_string(&self.file) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(PersistError::Io(error)),
-        };
-        let index: Index = serde_json::from_str(&text)?;
-        if index.version != FORMAT_VERSION {
-            return Err(PersistError::Json(serde_json::Error::custom(format!(
-                "unsupported tab store version {}",
-                index.version
-            ))));
-        }
-        let mut tabs = Vec::with_capacity(index.tabs.len());
-        for entry in &index.tabs {
-            let payload = fs::read_to_string(self.payload_path(entry.id))?;
-            let tab: Tab = serde_json::from_str(&payload)?;
-            if tab.id != entry.id {
-                return Err(PersistError::Json(serde_json::Error::custom(format!(
-                    "tab payload id {} does not match index entry {}",
-                    tab.id, entry.id
-                ))));
+        match self.read_index_source() {
+            IndexSource::Unreadable(error) => {
+                record_warnings(self.path(), Vec::new());
+                Err(error)
             }
-            tabs.push(tab);
+            IndexSource::Missing => {
+                if let Some(index) = self.recover_index_tmp() {
+                    let mut warnings =
+                        vec!["recovered tab index from temporary file".to_owned()];
+                    let tabs = self.load_listed(&index.tabs, &mut warnings);
+                    record_warnings(self.path(), warnings);
+                    Ok(tabs)
+                } else {
+                    let mut warnings = Vec::new();
+                    let tabs = self.recover_orphan_payloads(&mut warnings);
+                    if !tabs.is_empty() {
+                        warnings.insert(
+                            0,
+                            format!(
+                                "recovered {} tab(s) from payload files; index was missing",
+                                tabs.len()
+                            ),
+                        );
+                    }
+                    record_warnings(self.path(), warnings);
+                    Ok(tabs)
+                }
+            }
+            IndexSource::Ready(index) => {
+                let mut warnings = Vec::new();
+                let tabs = self.load_listed(&index.tabs, &mut warnings);
+                record_warnings(self.path(), warnings);
+                Ok(tabs)
+            }
         }
-        Ok(tabs)
     }
 
     /// Writes tabs atomically, rewriting only changed payloads.
     ///
-    /// Each payload and the index are written to a unique sibling temp file
-    /// and renamed over the destination, so a crash cannot leave a truncated
-    /// file. Payloads are written before the index; if any write fails the
-    /// index is left untouched and the error is returned. Payloads for tabs no
-    /// longer present are removed. Safe to call from a background thread.
+    /// Order: changed payloads (temp + rename), then the index (temp + rename),
+    /// then deletion of payloads the previous readable index named and this
+    /// save dropped. A failed index write therefore leaves every payload in
+    /// place and the previous index untouched. An unreadable index is not
+    /// overwritten and its payloads are not deleted, so a blank boot fallback
+    /// cannot wipe a store the app failed to load. Safe to call from a
+    /// background thread.
     pub fn save(&self, tabs: &[Tab]) -> Result<(), PersistError> {
+        if self.index_blocks_overwrite() {
+            return Err(PersistError::Json(serde_json::Error::custom(
+                "refusing to overwrite an unreadable tab index; recoverable payloads were left in place",
+            )));
+        }
+
         let parent = self
             .file
             .parent()
@@ -150,7 +222,6 @@ impl TabsStore {
         let payload_dir = self.payload_dir();
         fs::create_dir_all(&payload_dir)?;
 
-        // A corrupt/old index is treated as "nothing saved yet": rewrite all.
         let old = self.read_index();
         let old_hashes: HashMap<TabId, u64> = old
             .as_ref()
@@ -164,32 +235,32 @@ impl TabsStore {
             entries.push(IndexEntry { id: tab.id, hash });
             keep.insert(tab.id);
             let path = self.payload_path(tab.id);
-            if old_hashes.get(&tab.id) == Some(&hash) && path.exists() {
+            if old_hashes.get(&tab.id) == Some(&hash) && path.is_file() {
                 continue; // unchanged: skip serialization and write entirely
             }
             let bytes = serde_json::to_vec(tab)?;
             atomic_write(&path, &bytes)?;
         }
 
-        // Drop payload files for tabs that are gone (best effort).
-        if let Ok(read_dir) = fs::read_dir(&payload_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<TabId>().ok()) {
-                    if !keep.contains(&id) {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-
-        let index = Index { version: FORMAT_VERSION, tabs: entries };
+        let index = Index {
+            version: FORMAT_VERSION,
+            tabs: entries,
+        };
         if old.as_ref() != Some(&index) {
             let bytes = serde_json::to_vec_pretty(&index)?;
             atomic_write(&self.file, &bytes)?;
+        }
+
+        // Closed-tab cleanup runs only after the index commit, and only for
+        // ids the previous readable index named. Orphans and temps stay, so a
+        // crash between rename and deletion cannot lose a tab the new index
+        // still names, and a failed index write never reaches this loop.
+        if let Some(old) = &old {
+            for entry in &old.tabs {
+                if !keep.contains(&entry.id) {
+                    let _ = fs::remove_file(self.payload_path(entry.id));
+                }
+            }
         }
         Ok(())
     }
@@ -211,15 +282,181 @@ impl TabsStore {
     }
 
     /// Reads the index, returning `None` when missing, corrupt, or an
-    /// unsupported version (so [`Self::save`] rewrites everything).
+    /// unsupported version.
+    ///
+    /// [`Self::save`] does *not* treat that as "rewrite everything": an
+    /// unreadable index blocks overwrite (see [`Self::index_blocks_overwrite`]).
+    /// `None` here only means "no hash cache", so changed tabs are rewritten.
     fn read_index(&self) -> Option<Index> {
-        let text = fs::read_to_string(&self.file).ok()?;
-        let index: Index = serde_json::from_str(&text).ok()?;
-        if index.version != FORMAT_VERSION {
-            return None;
+        match self.read_index_source() {
+            IndexSource::Ready(index) => Some(index),
+            IndexSource::Missing | IndexSource::Unreadable(_) => None,
         }
-        Some(index)
     }
+
+    fn read_index_source(&self) -> IndexSource {
+        let text = match fs::read_to_string(&self.file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return IndexSource::Missing,
+            Err(error) => return IndexSource::Unreadable(PersistError::Io(error)),
+        };
+        let index: Index = match serde_json::from_str(&text) {
+            Ok(index) => index,
+            Err(error) => return IndexSource::Unreadable(PersistError::Json(error)),
+        };
+        if index.version != FORMAT_VERSION {
+            return IndexSource::Unreadable(PersistError::Json(serde_json::Error::custom(
+                format!("unsupported tab store version {}", index.version),
+            )));
+        }
+        IndexSource::Ready(index)
+    }
+
+    /// True when an index file is present but cannot be trusted. Saving over
+    /// it (or deleting its payloads) would turn a boot fallback into data loss.
+    fn index_blocks_overwrite(&self) -> bool {
+        match fs::metadata(&self.file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            Ok(meta) if !meta.is_file() => true,
+            Ok(_) => self.read_index().is_none(),
+        }
+    }
+
+    fn load_listed(&self, entries: &[IndexEntry], warnings: &mut Vec<String>) -> Vec<Tab> {
+        let mut tabs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(tab) = self.read_payload(entry.id, warnings) {
+                tabs.push(tab);
+            }
+        }
+        tabs
+    }
+
+    fn read_payload(&self, id: TabId, warnings: &mut Vec<String>) -> Option<Tab> {
+        let path = self.payload_path(id);
+        if path.is_file() {
+            return match parse_payload_file(&path, id) {
+                Ok(tab) => Some(tab),
+                Err(message) => {
+                    warnings.push(message);
+                    None
+                }
+            };
+        }
+        if let Some(tab) = self.recover_payload_tmp(id) {
+            warnings.push(format!(
+                "recovered payload for tab {id} from temporary file"
+            ));
+            return Some(tab);
+        }
+        warnings.push(format!("skipped missing payload for tab {id}"));
+        None
+    }
+
+    /// Newest complete `{id}.json.*.tmp` whose payload id matches. Partials
+    /// that do not parse are ignored. Used only when the destination is missing.
+    fn recover_payload_tmp(&self, id: TabId) -> Option<Tab> {
+        let prefix = format!("{id}.json.");
+        newest_tmp(&self.payload_dir(), &prefix, |path| parse_payload_file(path, id).ok())
+    }
+
+    /// Newest complete `tabs.json.*.tmp` with this format version. Used only
+    /// when the index file itself is missing (crash after the temp sync,
+    /// before rename).
+    fn recover_index_tmp(&self) -> Option<Index> {
+        let parent = self
+            .file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = self.file.file_name()?.to_str()?;
+        let prefix = format!("{file_name}.");
+        newest_tmp(parent, &prefix, |path| {
+            let text = fs::read_to_string(path).ok()?;
+            let index: Index = serde_json::from_str(&text).ok()?;
+            (index.version == FORMAT_VERSION).then_some(index)
+        })
+    }
+
+    /// Payload files left behind when the index never got committed.
+    fn recover_orphan_payloads(&self, warnings: &mut Vec<String>) -> Vec<Tab> {
+        let Ok(entries) = fs::read_dir(self.payload_dir()) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Some(id) = name.strip_suffix(".json").and_then(|s| s.parse::<TabId>().ok()) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut tabs = Vec::with_capacity(ids.len());
+        for id in ids {
+            match parse_payload_file(&self.payload_path(id), id) {
+                Ok(tab) => tabs.push(tab),
+                Err(message) => warnings.push(message),
+            }
+        }
+        tabs
+    }
+}
+
+enum IndexSource {
+    Missing,
+    Unreadable(PersistError),
+    Ready(Index),
+}
+
+fn parse_payload_file(path: &Path, id: TabId) -> Result<Tab, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("skipped unreadable payload for tab {id}: {error}"))?;
+    let tab: Tab = serde_json::from_str(&text)
+        .map_err(|error| format!("skipped unreadable payload for tab {id}: {error}"))?;
+    if tab.id != id {
+        return Err(format!(
+            "skipped payload for tab {id}: id mismatch (file has {})",
+            tab.id
+        ));
+    }
+    Ok(tab)
+}
+
+/// Newest parseable `prefix + * + .tmp` file in `dir`, by mtime.
+fn newest_tmp<T>(dir: &Path, prefix: &str, parse: impl Fn(&Path) -> Option<T>) -> Option<T> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best: Option<(SystemTime, T)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let Some(value) = parse(&path) else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(prev, _)| mtime >= *prev) {
+            best = Some((mtime, value));
+        }
+    }
+    best.map(|(_, value)| value)
 }
 
 /// Deterministic content fingerprint of a tab. Covers every persisted field so
@@ -323,8 +560,23 @@ pub fn load_tabs() -> Result<Vec<Tab>, PersistError> {
 }
 
 /// Saves tabs to [`data_path`].
+///
+/// Cargo test binaries live in `target/{debug,release}/deps`. Those processes
+/// must not write the real profile: integration tests compile this crate
+/// without `cfg(test)`, so the runner's default save hook calls this, and a
+/// `Persist` effect or `on_close` would overwrite the user's tabs.
 pub fn save_tabs(tabs: &[Tab]) -> Result<(), PersistError> {
+    if invoked_from_test_harness() {
+        return Ok(());
+    }
     TabsStore::from_file(data_path()).save(tabs)
+}
+
+fn invoked_from_test_harness() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.ends_with("deps")))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -408,29 +660,46 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_payload_is_an_error() {
+    fn corrupt_payload_is_skipped_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let store = TabsStore::new(dir.path());
         store.save(&[tab(1, "JSON 1", "{}")]).unwrap();
         fs::write(store.payload_path(1), "{not json").unwrap();
-        assert!(matches!(store.load(), Err(PersistError::Json(_))));
+        assert_eq!(store.load().unwrap(), Vec::new());
+        let warnings = load_warnings(store.path());
+        assert!(
+            warnings.iter().any(|w| w.contains("unreadable") && w.contains("tab 1")),
+            "warning missing: {warnings:?}"
+        );
     }
 
     #[test]
-    fn missing_payload_is_an_error() {
+    fn missing_payload_is_skipped_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let store = TabsStore::new(dir.path());
         store.save(&[tab(1, "JSON 1", "{}")]).unwrap();
         fs::remove_file(store.payload_path(1)).unwrap();
-        assert!(matches!(store.load(), Err(PersistError::Io(_))));
+        assert_eq!(store.load().unwrap(), Vec::new());
+        let warnings = load_warnings(store.path());
+        assert!(
+            warnings.iter().any(|w| w.contains("missing") && w.contains("tab 1")),
+            "warning missing: {warnings:?}"
+        );
     }
 
     #[test]
     fn unsupported_version_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = TabsStore::new(dir.path());
-        fs::write(store.path(), r#"{"version":99,"tabs":[]}"#).unwrap();
+        fs::create_dir_all(store.payload_dir()).unwrap();
+        fs::write(store.payload_path(1), br#"{"id":1,"title":"A","input":"keep"}"#).unwrap();
+        let index = r#"{"version":99,"tabs":[{"id":1,"hash":1}]}"#;
+        fs::write(store.path(), index).unwrap();
         assert!(matches!(store.load(), Err(PersistError::Json(_))));
+        // A boot fallback must not replace an unsupported store.
+        assert!(store.save(&[]).is_err());
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), index);
+        assert!(store.payload_path(1).exists());
     }
 
     #[test]
