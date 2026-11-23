@@ -1485,6 +1485,10 @@ static APP_HANDLE: OnceLock<Mutex<Option<Handle>>> = OnceLock::new();
 /// Called once by `main` before `App::run`. Without a handle (tests, the
 /// `--headless` CLI) every job runs synchronously instead.
 pub fn set_app_handle(handle: Handle) {
+    let redraw = handle.clone();
+    crate::line_index::set_redraw_callback(move || {
+        redraw.update_if(|_, _| true);
+    });
     let slot = APP_HANDLE.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(handle);
 }

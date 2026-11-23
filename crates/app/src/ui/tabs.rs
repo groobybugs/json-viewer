@@ -149,26 +149,15 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
                 // native TextEdit and no read-only size/long-line gates.
                 crate::editor::view::build(state, cx, tab, &format!("editor-{}", tab.id))
             }
-            TabView::Output => {
-                // Restored tabs have no JSON worker revision and therefore
-                // no background prewarm. Publish the full index before the
-                // first Output build so the virtual list never remains stuck
-                // on the provisional 64 KiB prefix.
-                if tab.output_revision == 0
-                    && tab.output.len() >= crate::line_index::LARGE_DOCUMENT_BYTES
-                {
-                    crate::line_index::prewarm_restored_output(&tab.output);
-                }
-                TextView::read_only(&tab.output)
-                    .revision(tab.output_revision)
-                    .line_numbers(true)
-                    .visible_lines(200)
-                    .highlight(&tab.search_query)
-                    .build("output-text")
-                    .w_full()
-                    .grow(1.0)
-                    .fill(PANEL_BG)
-            }
+            TabView::Output => TextView::read_only(&tab.output)
+                .revision(tab.output_revision)
+                .line_numbers(true)
+                .visible_lines(200)
+                .highlight(&tab.search_query)
+                .build("output-text")
+                .w_full()
+                .grow(1.0)
+                .fill(PANEL_BG),
         }
     };
     let scroll_key = document_scroll_key(

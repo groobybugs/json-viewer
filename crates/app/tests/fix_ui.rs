@@ -2,10 +2,12 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use json_viewer::json_ops::{self, JsonAction};
 use json_viewer::state::{AppState, Msg, Tab, TabView};
-use json_viewer::{headless, line_index, search, tree_index};
+use json_viewer::{headless, line_index, search, tree_index, ui};
+use rune::{Env, Runtime};
 
 static GLOBALS: Mutex<()> = Mutex::new(());
 
@@ -105,14 +107,80 @@ fn restored_large_output_gets_a_complete_line_index() {
     let actual_lines = restored.output.lines().count();
     let mut state = AppState::default();
     state.update(Msg::TabsLoaded(vec![restored]));
+    line_index::prewarm_restored_output(&state.tabs[0].output);
     let mut runtime = headless::runtime(state, headless::DEFAULT_SIZE, 1.0);
     runtime.frame(0.0);
 
-    let tab = runtime.state.active_tab().expect("restored tab");
-    assert_eq!(tab.output_revision, 0);
-    let snapshot = line_index::snapshot(&tab.output);
-    assert!(!snapshot.is_partial(), "restored output must not stay on the 64 KiB prefix");
-    assert_eq!(snapshot.line_count(), actual_lines);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = {
+            let tab = runtime.state.active_tab().expect("restored tab");
+            assert_eq!(tab.output_revision, 0);
+            line_index::snapshot(&tab.output)
+        };
+        if !snapshot.is_partial() {
+            assert_eq!(snapshot.line_count(), actual_lines);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restored output stayed on the 64 KiB prefix"
+        );
+        runtime.frame(1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+#[ignore = "generates a 100 MB fixture; run with cargo test --release -- --ignored --nocapture"]
+fn restored_100mb_first_output_frame_stays_under_16ms() {
+    let _guard = serial();
+    let mut restored = Tab::new(42, "restored-100mb");
+    restored.output = format!("{{\"data\":\"{}\"}}", "x".repeat(100 * 1024 * 1024));
+    restored.output_revision = 0;
+    restored.view = TabView::Output;
+    let mut state = AppState::default();
+    state.update(Msg::TabsLoaded(vec![restored]));
+
+    let mut runtime = Runtime::with_text(
+        AppState::default(),
+        ui::view,
+        headless::DEFAULT_SIZE,
+        Env::new(true, 1.0),
+        headless::text_system(),
+    );
+    runtime.set_srgb_blend(true);
+    // Warm process-wide font/layout caches, then measure the restored Output
+    // mount in a running app rather than Rune's one-time startup work.
+    runtime.frame(0.0);
+    runtime.settle_all();
+    runtime.frame(0.0);
+    // Match main::boot, which starts the job after loading persisted tabs and
+    // before the window's first Output frame.
+    line_index::prewarm_restored_output(&state.tabs[0].output);
+    runtime.update(|current, _| *current = state);
+    let started = Instant::now();
+    runtime.frame(0.0);
+    let first_frame_ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!("RESTORED_100MB_FIRST_OUTPUT_FRAME_MS={first_frame_ms:.3}");
+    assert!(
+        first_frame_ms < 16.0,
+        "restored first Output frame blocked the UI thread: {first_frame_ms:.3} ms"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let complete = {
+            let tab = runtime.state.active_tab().expect("restored tab");
+            !line_index::snapshot(&tab.output).is_partial()
+        };
+        if complete {
+            break;
+        }
+        assert!(Instant::now() < deadline, "restored prewarm did not finish");
+        runtime.frame(1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]
