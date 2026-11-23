@@ -31,7 +31,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::state::{AppState, Tab};
 use crate::ui::text_view::{char_width, ROW_HEIGHT};
-use crate::ui::{ACCENT, EDITOR_BG, MUTED, TEXT};
+use crate::ui::{ACCENT, MUTED, PANEL_BG, TEXT};
 
 use super::state::{self, DragMode, EditorState};
 
@@ -98,19 +98,20 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
         (lines, first, last, rows, gutter_w)
     });
 
-    let strip_h = if error.is_some() { ROW_HEIGHT } else { 0.0 };
-    let mut container = col()
+    let container = col()
         .key(base.to_string())
         .label("JSON input")
         .role("textbox")
         .focusable(true)
+        // The inline caret already shows focus; do not draw a separate box ring.
+        .no_focus_ring()
         .ime_cursor()
         .on_key(super::keys::handle)
         .w_full()
         .padding(PAD)
-        .fill(EDITOR_BG)
+        .fill(PANEL_BG)
         .on_drag(move |s: &mut AppState, d: &mut Drag, tx: &mut Tx| {
-            pointer_drag(s, id, d, tx, cw, gutter_w, strip_h);
+            pointer_drag(s, id, d, tx, cw, gutter_w);
         })
         .on_wheel(move |s: &mut AppState, e: WheelEvent, _tx: &mut Tx| {
             // Horizontal deltas (or shift+wheel) pan the column window;
@@ -131,33 +132,6 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
             }
             true
         });
-
-    // Error strip (same keys the Validate panel's evidence tests assert).
-    if let Some((line, column)) = error {
-        container = container.child(
-            row()
-                .key(format!("{base}-error-strip"))
-                .w_full()
-                .h(ROW_HEIGHT)
-                .gap(6.0)
-                .center_y()
-                .child(
-                    el()
-                        .key(format!("{base}-error-dot"))
-                        .w(6.0)
-                        .h(6.0)
-                        .radius(3.0)
-                        .fill(ERROR_INK)
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(format!("line {line}, column {column}"))
-                        .key(format!("{base}-error-label"))
-                        .font(tok::type_::LABEL)
-                        .color(ERROR_INK),
-                ),
-        );
-    }
 
     container
         .child(el().key(format!("{base}-anchor")).w_full().h(first as f32 * ROW_HEIGHT))
@@ -451,14 +425,14 @@ fn clone_window(w: &CachedWindow) -> CachedWindow {
 
 /// Click/drag selection. Presentation-only (like fold toggles): mutates the
 /// thread-local editor state directly; the handler event re-runs the view.
-fn pointer_drag(s: &mut AppState, id: u64, d: &mut Drag, tx: &mut Tx, cw: f32, gutter_w: usize, strip_h: f32) {
+fn pointer_drag(s: &mut AppState, id: u64, d: &mut Drag, tx: &mut Tx, cw: f32, gutter_w: usize) {
     let Some(tab) = s.tab(id) else {
         return;
     };
     let input = tab.input.as_str();
     let revision = tab.input_revision;
     let x_origin = PAD + gutter_w as f32 * cw + cw * 1.2 + GAP;
-    let y_origin = PAD + strip_h;
+    let y_origin = PAD;
     state::with(id, input, revision, |ed| {
         let lines = ed.buffer.len_lines();
         let line = (((d.y - y_origin) / ROW_HEIGHT).floor().max(0.0) as usize).min(lines - 1);

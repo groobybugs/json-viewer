@@ -444,14 +444,8 @@ fn error_marker_pngs_read_only_and_editable() {
     let tree = render_to(&mut rt, "fold-error-editable.png");
     let text = tree.to_string();
     assert!(
-        text.contains("line 3, column 8"),
-        "error label missing: {text}"
-    );
-    assert!(
-        element_keys(&tree)
-            .iter()
-            .any(|key| key == "fold-error-input-error-dot"),
-        "editable gutter dot missing"
+        !text.contains("line 3, column 8") && !text.contains("fold-error-input-error-dot"),
+        "editable duplicate error strip should be gone: {text}"
     );
 }
 

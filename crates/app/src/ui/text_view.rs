@@ -102,7 +102,7 @@ pub fn char_width() -> f32 {
 }
 
 /// Height of one monospace line at 12pt, measured from the same text system.
-/// The editable error marker uses it instead of assuming a fixed 16pt row.
+/// Measured monospace line height for callers that need font-derived geometry.
 pub fn line_height() -> f32 {
     let measured = rune::text::measure("0", &[], mono(), None).1;
     if measured.is_finite() && measured > 0.0 {
@@ -380,7 +380,7 @@ impl<'a> TextView<'a> {
                     .w_full()
                     .min_h(240.0)
                     .padding(12.0)
-                    .fill(theme.card)
+                    .fill(super::PANEL_BG)
                     .color(theme.text)
                     .caret(theme.text, tok::accent(0, true));
                 match (self.error_line, self.error_column) {
@@ -633,11 +633,11 @@ fn line_byte_range(text: &str, line: usize) -> Option<(usize, usize)> {
 /// through the field's own layout, wrapping and IME preedit, so they stay on
 /// the right glyphs without assuming row geometry or the caller's padding.
 ///
-/// The gutter dot and the `line N, column C` label sit in a strip above the
-/// field; the strip carries the reveal key, so
+/// The wrapper carries the reveal key, so
 /// `Tx::scroll_into_view(TextView::row_key(key, line - 1))` scrolls the field
 /// into view. (A text field is one scroll target; the accurate position is the
-/// underline inside it.)
+/// underline inside it.) The validation panel owns the single position label;
+/// the input itself has no inset border or duplicate error strip.
 fn editable_error_view(input: El, key: &str, source: &str, line: usize, column: usize) -> El {
     let mut decorations = Vec::new();
     if let Some((start, end)) = line_byte_range(source, line) {
@@ -651,38 +651,11 @@ fn editable_error_view(input: El, key: &str, source: &str, line: usize, column: 
             );
         }
     }
-    let strip = row()
+    col()
         .key(format!("{key}-row-{}", line.saturating_sub(1)))
         .w_full()
-        .h(line_height())
-        .gap(6.0)
-        .center_y()
-        .child(
-            el()
-                .key(format!("{key}-error-dot"))
-                .w(6.0)
-                .h(6.0)
-                .radius(3.0)
-                .fill(ERROR_INK)
-                .a11y_hidden(),
-        )
-        .child(
-            text(format!("line {line}, column {column}"))
-                .key(format!("{key}-error-label"))
-                .font(tok::type_::LABEL)
-                .color(ERROR_INK),
-        );
-    col()
-        .w_full()
         .min_h(240.0)
-        .gap(4.0)
-        .child(strip)
-        .child(
-            input
-                .decorations(decorations)
-                .border(1.0, ERROR_INK)
-                .radius(6.0),
-        )
+        .child(input.decorations(decorations))
 }
 
 /// A folded opening line becomes `"key": {…}` / `[…]`.

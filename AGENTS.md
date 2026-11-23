@@ -331,9 +331,11 @@ bounds, hash, lex state, tail)`) skips re-slicing/re-tokenizing unchanged
 windows; Rune's own shape cache keys on the display string, so unchanged
 lines are not reshaped. Caret (inline
 2 pt bar splitting the row text), selection (`Span::bg`), error marker
-(row tint + underline + gutter dot + `editor-{id}-error-dot`/`-error-label`
-strip, same keys as the old editable error view) and IME preedit are drawn
-per visible row. Mouse: click/shift-click/drag (char), double-click drag
+(row tint + underline + `editor-{id}-error-dot-{line}` gutter dot) and IME
+preedit are drawn per visible row. The validation panel owns the single error
+position label; there is no duplicate strip above the editor. Input, Output
+and Tree bodies use `PANEL_BG`, the same fill as the document card, with no
+inset input border. Mouse: click/shift-click/drag (char), double-click drag
 (word), triple-click drag (line) via `El::on_drag` + `Drag::clicks`;
 horizontal wheel/shift-wheel pans `first_column` via `El::on_wheel`.
 Caret moves auto-pan the column window and set `EditorState::reveal`,
@@ -407,7 +409,7 @@ still a `String` (measured: the 100 MB snapshot-step test stays <30 ms).
   `target/headless/rope-100mb-middle-selection.png` (mid-file caret + word
   selection at line 1,927,667), `rope-single-line-col-3m.png` (editing at
   column 3,000,000 with elided column window), `rope-error-marker.png`
-  (row tint, gutter dot, underline, error strip). The historical
+  (row tint, gutter dot, underline, panel-only position label). The historical
   native-`TextEdit` threshold table still runs as `edit_threshold_bench`.
 - The status bar's line count is `editor::state::display_line_count`
   (coordinator-approved one-line `ui/shell.rs` change): O(1) rope
@@ -741,12 +743,10 @@ in both modes:
   dedicated gutter cell (reserved on every row so text columns stay aligned),
   and an underlined caret span at the column inside the shaped window.
 - Editable: `TextEdit` decorations (`Span::bg` on the line, `Span::underline`
-  at the column) so Rune maps them through wrapping and IME preedit, plus a
-  circular-dot `line N, column C` strip above the field. Both dots are drawn
-  shapes, not font glyphs, so missing fonts cannot turn them into tofu. A
-  text field is one scroll target; the keyed strip is `row_key(base, line - 1)` so
-  `Tx::scroll_into_view` still works, but the precise position is the
-  underline.
+  at the column) so Rune maps them through wrapping and IME preedit. The
+  keyed wrapper is `row_key(base, line - 1)` so `Tx::scroll_into_view` still
+  works. The field uses the document-card fill and has no separate error
+  border or duplicate position strip; the validation panel owns that label.
 
 ### Editable thresholds
 

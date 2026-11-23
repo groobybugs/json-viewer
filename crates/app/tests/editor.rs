@@ -313,7 +313,7 @@ fn hundred_mb_windowing_and_scroll_timings() {
 }
 
 #[test]
-fn error_marker_strip_and_gutter_dot_render() {
+fn error_marker_has_gutter_dot_without_duplicate_strip() {
     let input = "{\n  \"a\": 1,\n  \"b\": oops\n}";
     let mut state = doc_state(input.into());
     let id = state.active;
@@ -326,15 +326,9 @@ fn error_marker_strip_and_gutter_dot_render() {
     });
     let mut rt = runtime(state);
     let keys: Vec<String> = rt.elements().iter().filter_map(|e| e.key.clone()).collect();
-    assert!(keys.contains(&"editor-1-error-dot".to_string()));
     assert!(keys.contains(&"editor-1-error-dot-2".to_string()));
-    let label = rt
-        .elements()
-        .iter()
-        .find(|e| e.key.as_deref() == Some("editor-1-error-label"))
-        .and_then(|e| e.text.clone())
-        .expect("error label");
-    assert_eq!(label, "line 3, column 8");
+    assert!(!keys.contains(&"editor-1-error-strip".to_string()));
+    assert!(!keys.contains(&"editor-1-error-label".to_string()));
     draw(&mut rt, "editor-error-marker.png");
 }
 

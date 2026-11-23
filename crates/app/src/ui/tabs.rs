@@ -3,7 +3,7 @@
 use rune::{col, el, row, text, Color, Cx, El, TextStyle};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant};
 
-use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT};
+use super::{kit, ACCENT, BORDER, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
 use crate::ui::text_view::TextView;
 
@@ -115,7 +115,7 @@ pub fn tab_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
 /// Input or output for the active tab, plus its validation alert/panel.
 pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
     let Some(tab) = state.active_tab() else {
-        return col().w_full().grow(1.0).fill(EDITOR_BG);
+        return col().w_full().grow(1.0).fill(PANEL_BG);
     };
     // The tree explorer is a third display mode held outside `TabView` (its
     // open flag lives in `AppState::tree`); when it is on, it replaces the
@@ -137,7 +137,7 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
                 .build("output-text")
                 .w_full()
                 .grow(1.0)
-                .fill(EDITOR_BG),
+                .fill(PANEL_BG),
         }
     };
     let scroller = col()
@@ -145,7 +145,7 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(EDITOR_BG)
+        .fill(PANEL_BG)
         .scroll_xy()
         .child(body);
 
@@ -153,7 +153,7 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(EDITOR_BG)
+        .fill(PANEL_BG)
         .child(super::validation_panel::validation_panel(state, cx))
         .child(scroller)
 }

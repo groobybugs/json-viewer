@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use rune::{col, el, oklch, row, spacer, text, tok, Color, El, GrowthSpec, TextStyle};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Spinner};
 
-use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, TEXT, WINDOW_BG};
+use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, PANEL_BG, TEXT, WINDOW_BG};
 use crate::state::{AppState, Msg, TabId};
 use crate::tree_index::{NodeKind, TreeUi};
 
@@ -74,7 +74,7 @@ pub fn tree_body(state: &AppState, tab: TabId) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(EDITOR_BG)
+        .fill(PANEL_BG)
         .child(tree_toolbar(state, tab, tree).sticky_top(0.0))
         .child(tree_list(state, tab, tree))
         .child(tree_footer(tab, tree).sticky_bottom(0.0))

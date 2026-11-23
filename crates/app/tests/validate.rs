@@ -292,11 +292,9 @@ fn validate_error_marker_and_go_to_error_use_the_real_position() {
 
     let tree = render(state.clone(), "error-marker-panel");
     assert_eq!(element(&tree, "error-location")["text"], "Line 3, column 8");
-    assert_eq!(
-        element(&tree, "editor-1-error-label")["text"],
-        "line 3, column 8"
-    );
-    assert!(element(&tree, "editor-1-error-dot")["key"] == "editor-1-error-dot");
+    assert_eq!(element(&tree, "editor-1-error-dot-2")["key"], "editor-1-error-dot-2");
+    assert!(!tree.to_string().contains("editor-1-error-label"));
+    assert!(!tree.to_string().contains("editor-1-error-strip"));
 
     let mut runtime = headless::runtime(state, SIZE, 1.0);
     click(&mut runtime, "go-to-error");
@@ -309,7 +307,7 @@ fn validate_error_marker_and_go_to_error_use_the_real_position() {
         runtime.state.editor(id).unwrap().focus,
         input.find("oops").unwrap()
     );
-    assert!(runtime.find("editor-1-error-dot").is_some());
+    assert!(runtime.find("editor-1-error-dot-2").is_some());
 }
 
 #[test]
