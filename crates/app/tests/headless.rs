@@ -267,6 +267,13 @@ fn scripted_search_hit_scrolls_output_to_line() {
     let hit = hits.first().expect("fixture has one hit").clone();
     let line = hit.line.expect("value hit has a line");
     assert!(line > 100, "hit should be far down the document");
+    assert!(
+        formatted
+            .lines()
+            .nth(line - 1)
+            .is_some_and(|text| text.contains("item-100")),
+        "hit.line must be a 1-based line in the formatted document"
+    );
 
     let mut state = AppState::default();
     state.tabs[0].input = input;
