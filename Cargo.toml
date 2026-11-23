@@ -9,14 +9,27 @@ license = "MIT"
 
 # Rune's workspace patches crates.io packages; a dependency's `[patch]` does
 # not apply to the workspace that depends on it, so apps must repeat the ones
-# they need. `parley_engine` 0.12.0 on crates.io lacks the `line-dictionaries`
-# feature Rune enables (and the vendored bidi/shaping fixes), so build fails
-# without this patch. See `vendor/parley_engine` and Rune's `vendor/` README.
+# they need. Cargo resolves a git patch by package name anywhere in the repo,
+# so every entry below points at the pinned Rune revision, whose `vendor/`
+# tree holds the already-patched sources (each `vendor/<crate>.patch` there
+# shows the changes; re-check them when bumping the revision):
+#
+# - `parley_engine` — crates.io 0.12.0 has no `line-dictionaries` feature,
+#   which `rune-text` enables, and lacks Rune's bidi/shaping fixes.
+# - `winit` / `sctk-adwaita` — Rune calls
+#   `WindowExtWayland::{content_corner_radius, has_client_side_frame}`, added
+#   by Rune's winit patch, and sctk-adwaita supplies the radius behind it.
+# - `wgpu-hal` — DX12/GL fixes (adapter exposure, partial presents, DLL
+#   loading, drain on removed devices). Rune vendors 30.0.1, so the graph
+#   resolves wgpu 30.0.1 (Rune pins `~30.0.1`), the combination Rune's own
+#   lockfile tests.
+# - `accesskit_windows` / `accesskit_macos` — headings/landmarks reach UIA /
+#   VoiceOver and long text keeps its ranges. Linux builds never compile
+#   these; the entries are inert here and required for macOS/Windows builds.
 [patch.crates-io]
-parley_engine = { path = "vendor/parley_engine" }
-# Rune calls Win32/Wayland additions that live in its patched winit:
-# `WindowExtWayland::{content_corner_radius,has_client_side_frame}` (and the
-# sctk-adwaita methods behind them). Apps that build Rune must repeat these
-# patches because a dependency's `[patch]` does not apply to its consumers.
-winit = { path = "vendor/winit" }
-sctk-adwaita = { path = "vendor/sctk-adwaita" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e" }

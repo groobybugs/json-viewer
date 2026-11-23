@@ -12,7 +12,6 @@ from that exact git revision (Cargo unifies them by source).
 ```
 Cargo.toml                     workspace (edition 2021, stable)
 rust-toolchain.toml            Rust 1.99.1 (stable; Rune's pinned toolchain)
-vendor/                        patched Rune dependencies (see "Rune patches")
 crates/app/
   Cargo.toml                   json-viewer package, dependencies frozen
   src/
@@ -158,24 +157,37 @@ there is no display server requirement for the offscreen path.
 ### Rune patches (required, not optional)
 
 A dependency's `[patch]` does not apply to the workspace that depends on it,
-so this workspace repeats the patches Rune needs. `vendor/` holds the
-verbatim Rune copies:
+so this workspace repeats the patches Rune needs in its root `Cargo.toml` as
+git patches pointing at the pinned Rune revision. Cargo resolves a git patch
+by package name anywhere in the repo, and Rune's `vendor/` tree holds the
+already-patched sources, so no code is vendored here. Every entry Rune
+declares is repeated (`winit`, `sctk-adwaita`, `parley_engine`, `wgpu-hal`,
+`accesskit_windows`, `accesskit_macos`):
 
 - `parley_engine` — crates.io 0.12.0 has no `line-dictionaries` feature,
   which `rune-text` enables, and lacks Rune's bidi/shaping fixes.
 - `winit` / `sctk-adwaita` — Rune calls
   `WindowExtWayland::{content_corner_radius, has_client_side_frame}`, added by
   Rune's winit patch, and sctk-adwaita supplies the radius behind it.
-- `wgpu-hal` and `accesskit_{windows,macos}` are also patched upstream. The
-  Linux build uses the published crates and the code has fallbacks; before
-  shipping macOS/Windows builds, vendor those three as well (copy from Rune's
-  `vendor/` and add them to `[patch.crates-io]`).
+- `wgpu-hal` — DX12/GL fixes (adapter exposure, partial presents, DLL
+  loading, drain on removed devices). Rune vendors wgpu-hal 30.0.1, so
+  `Cargo.lock` pins the whole wgpu family at 30.0.1 — the pairing Rune's own
+  lockfile tests. A newer patch release (30.0.2) stays unused and warns,
+  because `wgpu 30.0.x` requires a matching `wgpu-hal`; keep the lock at
+  30.0.1 unless Rune bumps.
+- `accesskit_windows` / `accesskit_macos` — headings/landmarks reach UIA /
+  VoiceOver and long text keeps its ranges. Linux builds never compile these
+  two; the entries are inert here and required for macOS/Windows builds.
 
-When bumping the Rune revision, re-copy all four vendored directories from
-the new checkout (their `.patch` files show the local changes) and re-check
-the feature list above. `vendor/parley_engine` and `vendor/sctk-adwaita`
-carry `[lints.rust]` allowances for upstream warnings so our lint gate stays
-clean.
+When bumping the Rune revision, change every `rev = "…"` in
+`crates/app/Cargo.toml` and the root `[patch.crates-io]` to the new revision
+in one commit (Rune's `vendor/*.patch` files show what the patches change),
+re-check the feature list above, and re-check the vendored versions against
+the new `Cargo.lock`: a patch whose version no longer satisfies the graph's
+requirements is silently unused with a `was not used in the crate graph`
+warning. No `vendor/` directory exists here anymore; the former local
+`[lints.rust]` allowances on `parley_engine` and `sctk-adwaita` proved
+unnecessary with the git sources (the build shows no warnings without them).
 
 ## Rune notes (learned at the pinned revision)
 
