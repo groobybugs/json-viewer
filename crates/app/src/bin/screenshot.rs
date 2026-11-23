@@ -62,6 +62,7 @@ fn main() {
         SearchOptions::default(),
         &cancel,
     );
+    state.search_edit.replace_text("name");
     state.tabs[0].search_query = "name".into();
     state.update(Msg::SearchDone {
         tab: first,

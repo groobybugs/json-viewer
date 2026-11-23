@@ -201,6 +201,38 @@ fn scripted_search_displays_results() {
 }
 
 #[test]
+fn scripted_clearing_search_clears_results() {
+    let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
+
+    click(&mut rt, "editor-1");
+    rt.paste(r#"{"user":{"name":"Alice","role":"admin"}}"#);
+    pump_until(&mut rt, "input ready for search", |s| {
+        s.active_tab().is_some_and(|t| t.input.contains("Alice"))
+    });
+
+    click(&mut rt, "search");
+    rt.paste("Alice");
+    pump_until(&mut rt, "results before clear", |s| {
+        s.active_tab()
+            .is_some_and(|t| !t.is_processing && !t.search_results.is_empty())
+    });
+
+    click(&mut rt, "clear-search");
+    pump_until(&mut rt, "results cleared", |s| {
+        s.search_edit.text.is_empty()
+            && s.active_tab().is_some_and(|t| {
+                t.search_query.is_empty() && t.search_results.is_empty()
+            })
+    });
+
+    let tree = render_qa_png(&mut rt, "search-cleared");
+    assert!(
+        !tree.to_string().contains("Search Results"),
+        "clearing the query must clear the results panel"
+    );
+}
+
+#[test]
 fn scripted_invalid_json_shows_error() {
     let mut rt = headless::runtime(AppState::default(), headless::DEFAULT_SIZE, 1.0);
 
