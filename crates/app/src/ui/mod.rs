@@ -17,6 +17,7 @@ use rune::{col, Color, Cx, El, KeyEvent, Tx};
 use rune_kit::{Kit, PaletteSeed};
 
 use crate::state::{AppState, Msg};
+use text_view::{apply_fold_action, FoldAction};
 
 /// Window title, also asserted by the headless smoke test.
 pub const TITLE: &str = "JSON Viewer";
@@ -126,6 +127,47 @@ pub fn on_key(state: &mut AppState, event: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn handle_shortcut(state: &mut AppState, event: &KeyEvent, tx: &mut Tx) -> bool {
+    // Folding. `Ctrl+K` is the first half of a two-key chord (Rune hands the
+    // app one KeyEvent at a time), so it arms `AppState::fold_chord` and the
+    // next key completes or cancels it. `Ctrl+Shift+[` / `]` act on the last
+    // hovered line, the cursor-less target of the read-only view.
+    if state.fold_chord {
+        state.fold_chord = false;
+        let chord = if chord_matches("mod+0", event, tx) {
+            Some(FoldAction::FoldAll)
+        } else if chord_matches("mod+j", event, tx) {
+            Some(FoldAction::UnfoldAll)
+        } else if chord_matches("mod+1", event, tx) {
+            Some(FoldAction::Level(1))
+        } else if chord_matches("mod+2", event, tx) {
+            Some(FoldAction::Level(2))
+        } else if chord_matches("mod+3", event, tx) {
+            Some(FoldAction::Level(3))
+        } else {
+            None
+        };
+        if let Some(action) = chord {
+            if !tx.key_repeat() {
+                apply_fold_action(state, action);
+            }
+            return true;
+        }
+    } else if chord_matches("mod+k", event, tx) {
+        state.fold_chord = true;
+        return true;
+    }
+    if chord_matches("mod+shift+bracketleft", event, tx) {
+        if !tx.key_repeat() {
+            apply_fold_action(state, FoldAction::ToggleAtHover);
+        }
+        return true;
+    }
+    if chord_matches("mod+shift+bracketright", event, tx) {
+        if !tx.key_repeat() {
+            apply_fold_action(state, FoldAction::UnfoldAtHover);
+        }
+        return true;
+    }
     let msg = if event.is_command('t') && !event.mods.shift {
         Some(Msg::AddTab)
     } else if event.is_command('w') && !event.mods.shift {
@@ -150,4 +192,9 @@ fn handle_shortcut(state: &mut AppState, event: &KeyEvent, tx: &mut Tx) -> bool 
         return true;
     }
     false
+}
+
+/// Whether `event` is the `pattern` chord on this platform and layout.
+fn chord_matches(pattern: &str, event: &KeyEvent, tx: &Tx) -> bool {
+    rune::Chord::parse(pattern).is_ok_and(|chord| chord.matches_tx(event, tx))
 }

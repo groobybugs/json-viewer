@@ -85,6 +85,10 @@ pub struct LineIndex {
     /// Length of the whole document (may exceed `len` while provisional).
     total_len: usize,
     complete: bool,
+    /// Byte length of the longest line (line endings excluded), computed in
+    /// the same pass as the starts. Lets the editable gate reject very-long-line
+    /// (e.g. minified) documents without a second scan.
+    max_line_len: usize,
 }
 
 /// Snaps `index` down to a UTF-8 boundary without scanning the text.
@@ -107,30 +111,52 @@ impl LineIndex {
         let mut starts = Vec::with_capacity(64);
         starts.push(0);
         let mut i = 0;
+        let mut line_start = 0usize;
+        let mut max_line_len = 0usize;
         while i < bytes.len() {
             match bytes[i..].iter().position(|&b| b == b'\n') {
                 Some(offset) => {
                     i += offset + 1;
                     starts.push(i);
+                    // `i - 1` is the '\n' byte; the line is [line_start, i-1).
+                    max_line_len = max_line_len.max(i.saturating_sub(1).saturating_sub(line_start));
+                    line_start = i;
                 }
                 None => break,
             }
         }
+        max_line_len = max_line_len.max(bytes.len().saturating_sub(line_start));
         Self {
             starts,
             len: bytes.len(),
             total_len: bytes.len(),
             complete: true,
+            max_line_len,
         }
     }
 
     /// A provisional index over `text` (a bounded prefix), remembering the
-    /// whole document's length. O(prefix), never O(document).
+    /// whole document's length. O(prefix), never O(document). `max_line_len`
+    /// covers only the prefix, so [`LineIndex::max_line_len_exact`] returns
+    /// `None` until the full index lands.
     pub fn partial(text: &str, total_len: usize) -> Self {
         let mut index = Self::build(text);
         index.total_len = total_len;
         index.complete = false;
         index
+    }
+
+    /// Byte length of the longest line (line endings excluded) in the scanned
+    /// range. O(1). For a provisional index this is the prefix's maximum,
+    /// which is not the document's; use [`LineIndex::max_line_len_exact`].
+    pub fn max_line_len(&self) -> usize {
+        self.max_line_len
+    }
+
+    /// The document's longest line, or `None` while the index is provisional
+    /// (only a prefix was scanned).
+    pub fn max_line_len_exact(&self) -> Option<usize> {
+        self.complete.then_some(self.max_line_len)
     }
 
     /// Whether the whole document was scanned.
@@ -267,6 +293,12 @@ impl Snapshot {
         self.line(line).map_or(0, str::len)
     }
 
+    /// The whole document's longest line, or `None` while this snapshot holds
+    /// only a bounded prefix (see [`LineIndex::max_line_len_exact`]). O(1).
+    pub fn max_line_len_exact(&self) -> Option<usize> {
+        self.index.max_line_len_exact()
+    }
+
     pub fn key(&self) -> TextKey {
         self.key
     }
@@ -367,7 +399,13 @@ pub fn cached_snapshot(text: &str) -> Option<Arc<Snapshot>> {
 /// owns `text` (the JSON worker's result), so no copy or scan happens on the
 /// UI thread. Join the handle before rendering to keep the first frame O(1).
 pub fn prewarm_off_thread(text: Arc<str>, revision: u64) -> JoinHandle<Arc<Snapshot>> {
-    std::thread::spawn(move || insert(Arc::new(Snapshot::new_for_revision(text, revision))))
+    std::thread::spawn(move || {
+        // Build the fold index in the same off-thread pass, next to the line
+        // index (see fold_index::prewarm). Both are keyed by this revision, so
+        // the Output view finds them already warmed.
+        crate::fold_index::prewarm(Arc::clone(&text), revision);
+        insert(Arc::new(Snapshot::new_for_revision(text, revision)))
+    })
 }
 
 /// Reserves a globally unique document revision. Revisions are never reused,

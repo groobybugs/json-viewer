@@ -139,6 +139,17 @@ pub struct AppState {
     pub tree: HashMap<TabId, TreeUi>,
     /// Messages queued by view handlers, drained by the runner.
     pub pending: Vec<Msg>,
+    /// Invalidation counter for code folding. The fold *set* lives in the
+    /// revision-keyed store in `crate::fold_index` (the view only has
+    /// `&AppState`, but a reveal must be able to unfold a line before
+    /// `scroll_into_view`). Fold handlers bump this so Rune re-runs the view
+    /// after a fold/unfold; the value is not otherwise read by the model.
+    pub fold_epoch: u64,
+    /// First half of the `Ctrl+K` fold chord is pending. Rune key handlers
+    /// receive one `KeyEvent` at a time (no built-in two-key chords), so the
+    /// keyboard layer records the prefix here and completes it on the next
+    /// key; any other key clears it. Presentation-only, like `fold_epoch`.
+    pub fold_chord: bool,
 }
 
 impl Default for AppState {
@@ -154,6 +165,8 @@ impl Default for AppState {
             tree_filter_edit: TextEdit::default(),
             tree: HashMap::new(),
             pending: Vec::new(),
+            fold_epoch: 0,
+            fold_chord: false,
         };
         state.add_tab();
         state

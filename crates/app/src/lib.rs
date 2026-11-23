@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+pub mod fold_index;
 pub mod headless;
 pub mod io;
 pub mod json_ops;
