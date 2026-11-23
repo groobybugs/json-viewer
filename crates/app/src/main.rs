@@ -64,5 +64,6 @@ fn main() {
 
     let mut spec = AppSpec::new("JSON Viewer", headless::DEFAULT_SIZE, boot, ui::view);
     spec.poll = Some(runner::poll);
+    spec.on_key = Some(ui::on_key);
     rune::run(spec);
 }
