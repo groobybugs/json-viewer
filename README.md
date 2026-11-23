@@ -9,7 +9,7 @@ Ported from the original Electron + React app; dark theme by default.
 ## Features
 
 - Multiple document tabs, persisted across restarts
-- Format (pretty-print) and minify JSON on background worker threads
+- Format (pretty-print) and minify JSON on background worker threads, rewriting Input in place as one undo step
 - Full-text search with a results panel; hits jump to lines in the formatted document
 - Open files via dialog or drag-and-drop, export to file, copy to clipboard
 - Virtualized read-only view: only visible lines are built, so large documents stay responsive

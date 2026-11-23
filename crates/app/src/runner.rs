@@ -939,11 +939,23 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
             Effect::SpawnJson { tab, input, action, input_revision } => {
                 let tx = sender();
                 let revision = crate::line_index::next_revision();
+                // rp-format-inplace: O(1) handle on the job input for the
+                // worker-side "output equals input" check below.
+                let job_input = Arc::clone(&input);
                 let handle = json_ops::spawn_process(input, action, move |result| {
                     // Build the full line index off the UI thread from the
                     // worker-owned output before the reducer publishes it.
                     if let Ok(output) = &result {
                         crate::line_index::prewarm_off_thread(Arc::from(output.as_str()), revision);
+                        // rp-format-inplace: build the Input replacement rope
+                        // here, off the UI thread, so the reducer swaps it in
+                        // in O(1). Identical output needs no replacement.
+                        let prepared = if output.as_str() == job_input.as_ref() {
+                            crate::editor::replace::Prepared::Unchanged
+                        } else {
+                            crate::editor::replace::Prepared::Rope(ropey::Rope::from_str(output))
+                        };
+                        crate::editor::replace::stash(revision, prepared);
                     }
                     let _ = tx.send(Msg::JsonDone {
                         tab,

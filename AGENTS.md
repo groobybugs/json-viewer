@@ -566,7 +566,10 @@ elements by key.
 - **Format result.** A successful `Msg::JsonDone` stores `output` and switches
   that tab to `TabView::Output`, matching the original
   `processJsonContent.fulfilled` reducer. Failures leave the current view and
-  previous output untouched.
+  previous output untouched. Since rp-format-inplace a success also rewrites
+  Input itself as ONE undo step in the rope editor (Ctrl+Z restores the exact
+  previous text and caret); stale-revision, failed and identical-output
+  results leave Input untouched.
 - **Search jump.** `search_bar::select_hit` dispatches `SwitchView(Output)` and
   queues `runner::queue_reveal(TextView::row_key("output-text", line - 1))`.
   `hit.line` is 1-based; rows are 0-based. The reveal waits for the next idle

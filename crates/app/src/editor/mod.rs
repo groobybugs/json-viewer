@@ -14,8 +14,9 @@
 pub mod buffer;
 pub mod keys;
 pub mod lex;
+pub mod replace;
 pub mod state;
 pub mod view;
 
-pub use buffer::{Buffer, Edit, EditKind};
+pub use buffer::{Buffer, Edit, EditKind, EditText};
 pub use state::EditorState;
