@@ -8,6 +8,12 @@ use crate::state::{AppState, Msg};
 
 /// Draws the window background, padding, header and body.
 pub fn shell(state: &AppState, cx: &mut Cx<AppState>, header: El, body: El) -> El {
+    let has_results = state
+        .active_tab()
+        .is_some_and(|tab| !tab.search_results.is_empty());
+    // Without a results panel, the tab strip owns the spacing below search and
+    // sits flush on the document card. Results keep the original region gaps.
+    let body = if has_results { body } else { body.gap(0.0) };
     col()
         .w_full()
         .h_full()

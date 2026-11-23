@@ -1,53 +1,115 @@
 //! Tab strip and the active document.
 
-use rune::{col, el, icon, row, text, tok, Cx, El, ScrollSpec, TextStyle};
-use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant};
+use rune::{col, el, icon, row, text, tok, Color, Cx, El, ScrollSpec, TextStyle};
+use rune_kit::{glyphs, ControlSize, IconButton, IconButtonVariant};
 
-use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, TEXT};
+use super::{kit, ACCENT, BORDER, DANGER, DANGER_BG, EDITOR_BG, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
 use crate::ui::text_view::TextView;
 
-/// Horizontal tab strip. The last remaining tab has no close button, matching
-/// the original UI.
+static ADD_ICON: rune::Icon = rune::Icon {
+    name: "json-viewer-add-tab",
+    view: 16.0,
+    body: r#"<path d="M8 3.5V12.5M3.5 8H12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
+};
+
+/// Browser-style tabs connect the active document to its card. The trailing
+/// add button stays reachable while the tab row itself scrolls horizontally.
 pub fn tab_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let kit = kit();
-    let mut strip = row().w_full().gap(6.0).pb(7.0).scroll_x();
+    let closable = state.tabs.len() > 1;
+    let mut strip = row().h(39.0).gap(4.0).shrink().min_w(0.0).scroll_x();
     for tab in &state.tabs {
         let active = tab.id == state.active;
         let id = tab.id;
-        let select = Button::new(tab.title.clone())
-            .variant(if active {
-                ButtonVariant::Neutral
-            } else {
-                ButtonVariant::Ghost
-            })
-            .control_size(ControlSize::Large)
-            .on_press(move |state: &mut AppState| state.dispatch(Msg::SelectTab(id)))
-            .build(&kit)
+        let title = tab.title.clone();
+        let select = row()
             .key(format!("tab-{id}"))
             .role("tab")
-            .focus_selected(active);
-        let mut item = row().gap(2.0).center_y().child(select);
-        if state.tabs.len() > 1 {
-            item = item.child(
+            .label(title.clone())
+            .focusable(true)
+            .focus_selected(active)
+            .grow(1.0)
+            .min_w(0.0)
+            .h_full()
+            .pl(11.0)
+            .center_y()
+            .on_press(move |state: &mut AppState| state.dispatch(Msg::SelectTab(id)))
+            .child(
+                text(title.clone())
+                    .key(format!("tab-title-{id}"))
+                    .font(TextStyle::new(12.0, 500.0))
+                    .color(if active { TEXT } else { MUTED })
+                    .group_color(TEXT)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .help_when_truncated(title.clone())
+                    .a11y_hidden(),
+            );
+        let mut content = row().w_full().grow(1.0).min_h(0.0).center_y().child(select);
+        if closable {
+            content = content.child(
                 IconButton::new(kit.glyph.close)
                     .variant(IconButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .label(format!("Close {}", tab.title))
                     .on_press(move |state: &mut AppState| state.dispatch(Msg::CloseTab(id)))
                     .build(&kit)
-                    .key(format!("close-{id}")),
+                    .key(format!("close-{id}"))
+                    .group_opacity(if active { 1.0 } else { 0.0 }, 1.0),
             );
         }
+        let mut item = col()
+            .key(format!("tab-item-{id}"))
+            .w(148.0)
+            .h(if active { 39.0 } else { 38.0 })
+            .corners([8.0, 8.0, 0.0, 0.0])
+            .hover_group()
+            .fill(if active { PANEL_BG } else { Color::TRANSPARENT })
+            .hover(if active {
+                Color::TRANSPARENT
+            } else {
+                kit.c.hover
+            })
+            .child(
+                el().w_full()
+                    .h(2.0)
+                    .fill(if active { ACCENT } else { Color::TRANSPARENT })
+                    .a11y_hidden(),
+            )
+            .child(content.pr(4.0));
         if active {
-            item = item.border_sides([0.0, 0.0, 2.0, 0.0], ACCENT);
+            // No bottom edge: the tab and card read as one surface. Paint above
+            // the card's top ring at their one-point overlap.
+            item = item
+                .border_sides([0.0, 1.0, 0.0, 1.0], BORDER)
+                .paint_order(1);
         }
-        strip = strip.child(item.key(format!("tab-item-{id}")));
+        strip = strip.child(item);
     }
-    col()
+    let add = IconButton::new(&ADD_ICON)
+        .variant(IconButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .label("New JSON tab")
+        .shortcut("ctrl+t")
+        .on_press(|state: &mut AppState| state.dispatch(Msg::AddTab))
+        .build(&kit)
+        .key("add-tab");
+    let has_results = state
+        .active_tab()
+        .is_some_and(|tab| !tab.search_results.is_empty());
+    row()
+        .key("tab-strip")
         .w_full()
+        .h(38.0)
+        .gap(4.0)
+        .items_start()
+        // Shell removes the region gap when no results intervene. The active
+        // item's extra point overlaps and hides the card's top border.
+        .mt(if has_results { 0.0 } else { 12.0 })
         .child(strip.role("tablist").focus_group())
-        .child(el().w_full().h(1.0).fill(BORDER.alpha(0.8)))
+        .child(row().h(38.0).center().child(add))
 }
 
 /// Input or output for the active tab, plus a prominent parse-error alert.

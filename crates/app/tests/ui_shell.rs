@@ -6,7 +6,7 @@ use json_viewer::headless;
 use json_viewer::json_ops::JsonError;
 use json_viewer::search::SearchHit;
 use json_viewer::state::{AppState, Msg, TabView};
-use rune::{Key, KeyEvent, Mods};
+use rune::{Key, KeyEvent, Mods, Runtime};
 use serde_json::Value;
 
 const SIZE: (f32, f32) = (1280.0, 800.0);
@@ -44,6 +44,47 @@ fn render(state: AppState, name: &str) -> Value {
         .unwrap_or_else(|error| panic!("render {name} failed: {error:#}"));
     assert!(png.metadata().expect("PNG metadata").len() > 0);
     assert!(tree_path.exists());
+    tree
+}
+
+fn render_hovered(state: AppState, hover_key: &str, name: &str) -> Value {
+    let mut runtime = headless::runtime(state, SIZE, 1.0);
+    let (x, y) = runtime.find(hover_key).expect("hover target exists");
+    runtime.pointer_move(x, y);
+    runtime.frame(0.0);
+    runtime.settle_all();
+    runtime.frame(0.0);
+    render_runtime(runtime, name)
+}
+
+fn render_runtime(mut runtime: Runtime<AppState>, name: &str) -> Value {
+    use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
+
+    let directory = target_dir().join("headless/ui-shell");
+    std::fs::create_dir_all(&directory).expect("create evidence directory");
+    let png = directory.join(format!("{name}.png"));
+    let tree_path = directory.join(format!("{name}-tree.json"));
+    let (width, height) = (SIZE.0 as u32, SIZE.1 as u32);
+    let gpu = Gpu::headless();
+    let format = OFFSCREEN_FORMAT.remove_srgb_suffix();
+    let mut renderer = Renderer::new(&gpu.device, format);
+    renderer.set_srgb_blend(true);
+    let target = Offscreen::with_format(&gpu.device, width, height, format);
+    renderer.prepare(
+        &gpu.device,
+        &gpu.queue,
+        &mut runtime.text.atlas,
+        &runtime.instances,
+        (width, height),
+    );
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    renderer.draw(&mut encoder, &target.view, runtime.clear_color());
+    target.copy(&mut encoder);
+    renderer.submit(&gpu.queue, encoder);
+    let pixels = target.read(&gpu.device);
+    write_png(&png, width, height, &pixels).expect("write hover PNG");
+    let tree = headless::element_tree(&runtime);
+    headless::write_tree(&tree, &tree_path).expect("write hover element tree");
     tree
 }
 
@@ -153,6 +194,7 @@ fn six_shell_states_render_with_controls_and_layout() {
     assert_toolbar_present(&empty);
     assert_eq!(tab_count(&empty), 1);
     assert!(find_key(&empty["accessibility"], "close-1").is_none());
+    assert_eq!(a11y(&empty, "add-tab")["name"], "New JSON tab");
     for key in ["format", "minify", "copy", "export", "clear"] {
         assert_disabled(&empty, key, true);
     }
@@ -170,7 +212,7 @@ fn six_shell_states_render_with_controls_and_layout() {
     three.update_input(second, r#"{"second": 2}"#.into());
     let third = three.add_tab();
     three.update_input(third, r#"[1, 2, 3]"#.into());
-    three.set_active(first);
+    three.set_active(second);
     let three = render(three, "02-three-tabs-input");
     assert_toolbar_present(&three);
     assert_eq!(tab_count(&three), 3);
@@ -178,6 +220,9 @@ fn six_shell_states_render_with_controls_and_layout() {
         assert_eq!(a11y(&three, &format!("tab-{id}"))["role"], "tab");
         assert!(find_key(&three["accessibility"], &format!("close-{id}")).is_some());
     }
+    assert!(states(a11y(&three, "tab-2")).contains(&"selected"));
+    assert!(!states(a11y(&three, "tab-1")).contains(&"selected"));
+    assert_eq!(a11y(&three, "add-tab")["name"], "New JSON tab");
     assert_disabled(&three, "format", false);
     assert_disabled(&three, "minify", false);
 
@@ -223,6 +268,49 @@ fn six_shell_states_render_with_controls_and_layout() {
     assert_eq!(a11y(&search, "search-hit-0")["role"], "button");
     assert_eq!(a11y(&search, "search-hit-1")["role"], "button");
     assert!(search.to_string().contains("address → city"));
+}
+
+#[test]
+fn tab_strip_handles_long_titles_overflow_and_hover() {
+    let mut overflow_state = AppState::default();
+    let first = overflow_state.active;
+    let second = overflow_state.add_tab();
+    overflow_state.tab_mut(second).unwrap().title =
+        "A very long JSON document title that must truncate".into();
+    for _ in 3..=12 {
+        overflow_state.add_tab();
+    }
+    let active = overflow_state.tabs[5].id;
+    overflow_state.set_active(active);
+    overflow_state.update_input(active, SAMPLE.into());
+    let overflow = render(overflow_state, "07-twelve-tabs-overflow");
+    assert_eq!(tab_count(&overflow), 12);
+    assert!(states(a11y(&overflow, &format!("tab-{active}"))).contains(&"selected"));
+    let first_rect = &element(&overflow, &format!("tab-item-{first}"))["rect"];
+    let last_rect = &element(&overflow, "tab-item-12")["rect"];
+    assert!(
+        last_rect[0].as_f64().unwrap() > first_rect[0].as_f64().unwrap() + 1000.0,
+        "tabs should overflow the viewport: first={first_rect}, last={last_rect}"
+    );
+    let title_width = element(&overflow, "tab-title-2")["rect"][2]
+        .as_f64()
+        .unwrap();
+    assert!(
+        title_width <= 125.0,
+        "long title escaped its tab: {title_width}"
+    );
+    let add_rect = &element(&overflow, "add-tab")["rect"];
+    assert!(add_rect[0].as_f64().unwrap() + add_rect[2].as_f64().unwrap() <= SIZE.0.into());
+
+    let mut hover_state = AppState::default();
+    let first = hover_state.active;
+    let second = hover_state.add_tab();
+    hover_state.add_tab();
+    hover_state.set_active(first);
+    let hover = render_hovered(hover_state, "tab-2", "08-inactive-tab-hover");
+    assert!(states(a11y(&hover, "tab-1")).contains(&"selected"));
+    assert!(!states(a11y(&hover, "tab-2")).contains(&"selected"));
+    assert!(find_key(&hover["accessibility"], &format!("close-{second}")).is_some());
 }
 
 fn command(key: char, shift: bool) -> KeyEvent {
