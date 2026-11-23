@@ -9,11 +9,16 @@
 //! This crate's own headless mode renders the placeholder, writes the PNG and
 //! dumps the element tree:
 //! `cargo run -p json-viewer -- --headless target/headless`
+//!
+//! Linux window backend: native Wayland by default. `--x11` or
+//! `JSON_VIEWER_BACKEND=x11` selects X11/XWayland so file drag-and-drop works.
+//! See `platform.rs`. macOS and Windows ignore both.
 
 #![allow(dead_code)]
 
 mod fold_index;
 mod line_index;
+mod platform;
 use std::path::PathBuf;
 
 use json_viewer::headless;
@@ -64,6 +69,35 @@ fn main() {
         return;
     }
 
+    // Rune owns the event loop and does not expose `with_x11`. Select the
+    // backend before `App::new` / `run` so winit sees the cleared environment
+    // when it builds the loop. `--help` is left to Rune.
+    let help = args.iter().any(|arg| arg == "--help" || arg == "-h");
+    if !help {
+        let env_value = match platform::backend_env() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("json-viewer: {error}");
+                std::process::exit(2);
+            }
+        };
+        let request = match platform::resolve(&args, env_value.as_deref()) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("json-viewer: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = platform::apply(&request) {
+            eprintln!("json-viewer: {error}");
+            std::process::exit(2);
+        }
+    } else {
+        eprintln!(
+            "json-viewer: --x11 forces the X11/XWayland backend (file drag-and-drop). JSON_VIEWER_BACKEND=x11|wayland|auto"
+        );
+    }
+
     let mut spec = AppSpec::new("JSON Viewer", headless::DEFAULT_SIZE, boot, ui::view);
     // Keep `spec.fonts` empty: Rune already embeds Inter. Only the mono slot
     // name is overridden; the sans slot stays "Inter".
@@ -74,6 +108,10 @@ fn main() {
     let app = rune::App::new(spec)
         .on_close(runner::on_close)
         .on_quit(runner::on_quit);
+    // Stable id for packaging/linux/json-viewer.desktop (StartupWMClass).
+    // No-op for the window on macOS/Windows; Rune only applies it on Linux.
+    rune::set_app_id("json-viewer");
+    let app = app.args(args.into_iter().filter(|arg| arg != "--x11"));
     // Give the tree explorer a way to deliver off-thread results: its
     // index/rows workers call `AppHandle::update` to wake the loop and queue
     // a Msg for `runner::poll` (see tree_index::ensure_index). Without this
