@@ -99,7 +99,12 @@ pub fn status_bar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         }
     });
     let tabs = state.tabs.len();
-    let lines = active.map_or(0, |tab| tab.input.lines().count());
+    let lines = active.map_or(0, |tab| {
+        // O(1) from the rope editor (rp-editor); the old
+        // `tab.input.lines().count()` scanned the whole document on every
+        // view rebuild — 24.6 ms per keystroke frame at 100 MB.
+        crate::editor::state::display_line_count(tab.id, &tab.input, tab.input_revision)
+    });
     row()
         .key("status-bar")
         .w_full()

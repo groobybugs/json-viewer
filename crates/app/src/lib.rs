@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+pub mod editor;
 pub mod fold_index;
 pub mod headless;
 pub mod io;

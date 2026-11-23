@@ -16,7 +16,7 @@ pub mod validation_panel;
 use rune::{col, Color, Cx, El, KeyEvent, Tx};
 use rune_kit::{Kit, PaletteSeed};
 
-use crate::state::{AppState, Msg};
+use crate::state::{AppState, Msg, TabView};
 use text_view::{apply_fold_action, FoldAction};
 
 /// Window title, also asserted by the headless smoke test.
@@ -118,7 +118,22 @@ pub fn view(state: &AppState, cx: &mut Cx<AppState>) -> El {
         .child(search_bar::search_results(state, cx))
         .child(document);
     let header = shell::header(state, cx);
-    crate::io::drop_zone(shell::shell(state, cx, header, body)).on_key(handle_shortcut)
+    crate::io::drop_zone(shell::shell(state, cx, header, body))
+        .on_key(handle_shortcut)
+        // Clipboard paste when no native text field has focus: the rope
+        // editor is the target while the input view is showing (the search
+        // and tree-filter fields take their own pastes when focused).
+        .on_paste(|state: &mut AppState, text: &str, _tx: &mut Tx| {
+            let id = state.active;
+            let input_view = state.tab(id).is_some_and(|t| t.view == TabView::Input)
+                && !state.tree.get(&id).is_some_and(|tree| tree.open);
+            if input_view && !text.is_empty() {
+                state.dispatch(Msg::EditorPaste {
+                    tab: id,
+                    text: text.to_owned(),
+                });
+            }
+        })
 }
 
 /// Window-level keyboard shortcuts, including startup before any control has focus.

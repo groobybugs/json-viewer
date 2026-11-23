@@ -125,34 +125,9 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
     } else {
         match tab.view {
             TabView::Input => {
-                let edit = state.editor(tab.id).expect("every tab has an editor");
-                let error_position = tab
-                    .validation_error()
-                    .map(|error| (error.line, error.column));
-                let input = TextView::editable(&tab.input, edit)
-                    .revision(tab.input_revision)
-                    .line_numbers(true);
-                let input = match error_position {
-                    Some((line, column)) => input.error_marker(line, column),
-                    None => input,
-                };
-                input
-                    .build(&format!("editor-{}", tab.id))
-                    .placeholder("Paste your JSON here or drop a JSON file…", MUTED)
-                    .fill(EDITOR_BG)
-                    .padding(16.0)
-                    .w_full()
-                    .grow(1.0)
-                    .min_h(0.0)
-                    .on_edit(|state: &mut AppState| {
-                        let id = state.active;
-                        state
-                            .editors
-                            .get_mut(&id)
-                            .expect("active tab has an editor")
-                    })
-                    .on_input_change(|state: &mut AppState, _| state.sync_active_editor())
-                    .on_input_key(super::handle_shortcut)
+                // The rope editor (rp-editor): editable at every size, no
+                // native TextEdit and no read-only size/long-line gates.
+                crate::editor::view::build(state, cx, tab, &format!("editor-{}", tab.id))
             }
             TabView::Output => TextView::read_only(&tab.output)
                 .revision(tab.output_revision)

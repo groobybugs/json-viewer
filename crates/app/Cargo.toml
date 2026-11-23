@@ -12,6 +12,8 @@ rune = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750
 # Components (buttons, text fields, scrolling helpers). Markdown/syntax stay off.
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "194126ab55d8fee0e8750535a08ca9650f5b7b9e", default-features = false }
 
+# Rope-backed editor buffer (rp-editor): O(log n) edits, O(1) snapshots.
+ropey = "1.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Deterministic fast fingerprint for persist.rs changed-tab detection.

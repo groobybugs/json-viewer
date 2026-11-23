@@ -313,12 +313,13 @@ fn validate_error_marker_and_go_to_error_use_the_real_position() {
 }
 
 #[test]
-fn go_to_error_reveals_the_read_only_input_fallback() {
+fn go_to_error_reveals_the_error_line_in_the_rope_editor() {
     let mut input = "{\n  \"a\": 1,\n  \"b\": oops,\n  \"c\": 3,\n  \"pad\": \"".to_owned();
     input.push_str(&"x".repeat(6 * MIB));
     input.push_str("\"\n}\n");
     let error = json_ops::validate(&input).expect_err("invalid fixture");
     assert_eq!((error.line, error.column), (3, 8));
+    let expected_caret = input.find("oops").unwrap();
 
     let mut state = AppState::default();
     let id = state.active;
@@ -329,8 +330,10 @@ fn go_to_error_reveals_the_read_only_input_fallback() {
         input_revision: revision,
         result: Err(error),
     });
+    // rp-editor: the 6 MB single-line input is editable in the rope editor;
+    // there is no read-only banner anymore.
     let mut runtime = headless::runtime(state, SIZE, 1.0);
-    assert!(headless::element_tree(&runtime)
+    assert!(!headless::element_tree(&runtime)
         .to_string()
         .contains("Very long line"));
 
@@ -341,8 +344,14 @@ fn go_to_error_reveals_the_read_only_input_fallback() {
         runtime.frame(1.0 / 60.0);
     }
     assert_eq!(runtime.state.active_tab().unwrap().view, TabView::Input);
+    // The error line is revealed and marked, and the caret sits on it.
     assert!(runtime.find("editor-1-row-2").is_some());
     assert!(runtime.find("editor-1-error-dot-2").is_some());
+    let tab = runtime.state.active_tab().unwrap();
+    let caret = json_viewer::editor::state::with(tab.id, &tab.input, tab.input_revision, |ed| {
+        ed.caret
+    });
+    assert_eq!(caret, expected_caret);
 }
 
 #[test]
