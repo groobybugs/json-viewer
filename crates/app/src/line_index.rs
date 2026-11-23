@@ -6,12 +6,13 @@
 //! index build, then O(visible rows) per frame.
 //!
 //! [`snapshot`] memoizes the index by a cheap content fingerprint, so repeated
-//! `TextView::build` calls across frames never rebuild it. Large documents
-//! should be indexed off the UI thread with [`prewarm_off_thread`] (call it
-//! from a background job, e.g. right after a JSON format/minify result arrives,
-//! and join the handle before switching the view to the output). If a caller
-//! does not prewarm, the first `snapshot` builds the index once, synchronously;
-//! every later frame hits the cache.
+//! `TextView::build` calls across frames never rebuild it. A cold miss on a
+//! large document does **no O(document) work on the UI thread**: it copies and
+//! scans only [`PARTIAL_SCAN_BYTES`] (enough to mount the first viewport) and
+//! returns a provisional snapshot. The caller's background job then calls
+//! [`prewarm_off_thread`] with the owned text to build the full index off the
+//! UI thread and replace the provisional entry. Small documents are indexed
+//! synchronously (the cost is bounded by [`LARGE_DOCUMENT_BYTES`]).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +22,9 @@ use std::thread::JoinHandle;
 
 /// Documents at least this big should be indexed off the UI thread.
 pub const LARGE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// How much of a cold large document the UI thread copies/scans for its first
+/// frame. Bounded, so the first render is O(window), not O(document).
+pub const PARTIAL_SCAN_BYTES: usize = 64 * 1024;
 
 /// Cache bounds: a handful of live snapshots, at most 256 MB of source text.
 const MAX_CACHED_DOCS: usize = 8;
@@ -65,27 +69,67 @@ impl TextKey {
 #[derive(Debug)]
 pub struct LineIndex {
     starts: Vec<usize>,
+    /// Bytes actually scanned. For a provisional index this is the prefix len.
     len: usize,
+    /// Length of the whole document (may exceed `len` while provisional).
+    total_len: usize,
+    complete: bool,
+}
+
+/// Snaps `index` down to a UTF-8 boundary without scanning the text.
+fn floor_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 impl LineIndex {
-    /// One linear scan for `\n`. No allocation proportional to line length.
+    /// One vectorizable pass for `\n` (`slice::iter().position` is lowered to a
+    /// SIMD scan), with no separate counting pass and no `push` in the hot
+    /// loop. No allocation proportional to line length.
     pub fn build(text: &str) -> Self {
         let bytes = text.as_bytes();
-        let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
-        let mut starts = Vec::with_capacity(newlines + 1);
+        let mut starts = Vec::with_capacity(64);
         starts.push(0);
         let mut i = 0;
         while i < bytes.len() {
-            if bytes[i] == b'\n' {
-                starts.push(i + 1);
+            match bytes[i..].iter().position(|&b| b == b'\n') {
+                Some(offset) => {
+                    i += offset + 1;
+                    starts.push(i);
+                }
+                None => break,
             }
-            i += 1;
         }
         Self {
             starts,
             len: bytes.len(),
+            total_len: bytes.len(),
+            complete: true,
         }
+    }
+
+    /// A provisional index over `text` (a bounded prefix), remembering the
+    /// whole document's length. O(prefix), never O(document).
+    pub fn partial(text: &str, total_len: usize) -> Self {
+        let mut index = Self::build(text);
+        index.total_len = total_len;
+        index.complete = false;
+        index
+    }
+
+    /// Whether the whole document was scanned.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Length of the whole document, even when only a prefix was scanned.
+    pub fn total_len(&self) -> usize {
+        self.total_len
     }
 
     /// Number of lines (at least one).
@@ -136,18 +180,48 @@ impl LineIndex {
     }
 }
 
-/// Immutable text + index, cheap to clone into Rune's row builders.
+/// Immutable text + index, cheap to clone into Rune's row builders. A
+/// provisional snapshot holds only a bounded prefix (see
+/// [`PARTIAL_SCAN_BYTES`]); `prewarm_off_thread` replaces it with a full one.
 pub struct Snapshot {
     text: Arc<str>,
     index: Arc<LineIndex>,
     key: TextKey,
+    partial: bool,
 }
 
 impl Snapshot {
+    /// Full snapshot: owned text + complete index (off the UI thread for large
+    /// documents, via `prewarm_off_thread`).
     pub fn new(text: Arc<str>) -> Self {
         let key = TextKey::of(&text);
         let index = Arc::new(LineIndex::build(&text));
-        Self { text, index, key }
+        Self {
+            text,
+            index,
+            key,
+            partial: false,
+        }
+    }
+
+    /// Provisional snapshot: copies and scans only the first
+    /// `PARTIAL_SCAN_BYTES` of `text`, so a cold first render is O(window).
+    pub fn provisional(text: &str) -> Self {
+        let key = TextKey::of(text);
+        let end = floor_boundary(text, PARTIAL_SCAN_BYTES.min(text.len()));
+        let prefix: Arc<str> = Arc::from(&text[..end]);
+        let index = Arc::new(LineIndex::partial(&prefix, text.len()));
+        Self {
+            text: prefix,
+            index,
+            key,
+            partial: true,
+        }
+    }
+
+    /// Whether this snapshot covers only a bounded prefix.
+    pub fn is_partial(&self) -> bool {
+        self.partial
     }
 
     pub fn text(&self) -> &str {
@@ -210,8 +284,12 @@ fn lock() -> std::sync::MutexGuard<'static, Cache> {
 fn insert(snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
     let mut guard = lock();
     let key = snapshot.key();
+    // A full snapshot replaces a provisional one built on the UI thread.
+    if let Some(old) = guard.entries.insert(key, Arc::clone(&snapshot)) {
+        guard.bytes = guard.bytes.saturating_sub(old.bytes());
+        guard.order.retain(|k| *k != key);
+    }
     guard.bytes += snapshot.bytes();
-    guard.entries.insert(key, Arc::clone(&snapshot));
     guard.order.push_back(key);
     while (guard.entries.len() > MAX_CACHED_DOCS || guard.bytes > MAX_CACHED_BYTES)
         && guard.order.len() > 1
@@ -228,14 +306,24 @@ fn insert(snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
     snapshot
 }
 
-/// Returns the shared snapshot for `text`, building the index at most once per
-/// distinct document. Cached lookups are O(1) (fingerprint + hash).
+/// Returns the shared snapshot for `text`.
+///
+/// Cached lookups are O(1). A cold miss on a large document is **O(window)**:
+/// a bounded prefix is copied and scanned, and a background job is expected to
+/// replace it with a full index through [`prewarm_off_thread`]. A cold miss on
+/// a small document is indexed synchronously (bounded by
+/// [`LARGE_DOCUMENT_BYTES`]).
 pub fn snapshot(text: &str) -> Arc<Snapshot> {
     let key = TextKey::of(text);
     if let Some(hit) = lock().entries.get(&key).cloned() {
         return hit;
     }
-    insert(Arc::new(Snapshot::new(Arc::from(text))))
+    let built = if text.len() >= LARGE_DOCUMENT_BYTES {
+        Snapshot::provisional(text)
+    } else {
+        Snapshot::new(Arc::from(text))
+    };
+    insert(Arc::new(built))
 }
 
 /// Lookup without ever building. Useful for a view that wants to show a banner
@@ -244,8 +332,9 @@ pub fn cached_snapshot(text: &str) -> Option<Arc<Snapshot>> {
     lock().entries.get(&TextKey::of(text)).cloned()
 }
 
-/// Builds and caches a snapshot on a worker thread. Join the handle before
-/// rendering the document to keep the index build off the UI thread.
+/// Builds the full index and caches it on a worker thread. The caller already
+/// owns `text` (the JSON worker's result), so no copy or scan happens on the
+/// UI thread. Join the handle before rendering to keep the first frame O(1).
 pub fn prewarm_off_thread(text: Arc<str>) -> JoinHandle<Arc<Snapshot>> {
     std::thread::spawn(move || insert(Arc::new(Snapshot::new(text))))
 }
@@ -333,5 +422,31 @@ mod tests {
         let warmed = handle.join().expect("prewarm thread panicked");
         assert!(Arc::ptr_eq(&warmed, &snapshot(&text)));
         assert_eq!(warmed.line_count(), 3);
+    }
+
+    #[test]
+    fn large_cold_miss_is_a_bounded_provisional_snapshot() {
+        let text = "x".repeat(LARGE_DOCUMENT_BYTES + 1024);
+        let snap = snapshot(&text);
+        assert!(snap.is_partial());
+        assert_eq!(snap.text().len(), PARTIAL_SCAN_BYTES);
+        assert_eq!(snap.line_count(), 1);
+        assert_eq!(snap.line(0).map(str::len), Some(PARTIAL_SCAN_BYTES));
+        assert_eq!(snap.index().total_len(), text.len());
+        assert!(!snap.index().is_complete());
+    }
+
+    #[test]
+    fn prewarm_replaces_the_provisional_snapshot() {
+        let text: Arc<str> = Arc::from("y".repeat(LARGE_DOCUMENT_BYTES + 10));
+        let cold = snapshot(&text);
+        assert!(cold.is_partial());
+        let warmed = prewarm_off_thread(Arc::clone(&text))
+            .join()
+            .expect("prewarm thread panicked");
+        assert!(!warmed.is_partial());
+        assert_eq!(warmed.line_count(), 1);
+        assert_eq!(warmed.index().total_len(), text.len());
+        assert!(Arc::ptr_eq(&warmed, &snapshot(&text)));
     }
 }

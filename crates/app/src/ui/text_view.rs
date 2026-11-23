@@ -40,12 +40,23 @@
 //! ## Large documents
 //!
 //! The line index is built once per document and cached by content
-//! fingerprint in [`crate::line_index`]. Above
+//! fingerprint in [`crate::line_index`]. A cold miss on a large document does
+//! no O(document) work on the UI thread: `snapshot` copies and scans only a
+//! bounded prefix ([`crate::line_index::PARTIAL_SCAN_BYTES`]), which is enough
+//! to mount the first viewport, then a background job replaces it with the
+//! full index through `line_index::prewarm_off_thread`. Above
 //! [`EDITABLE_LIMIT_BYTES`] the editable mode falls back to this read-only
-//! virtualized view with [`LARGE_FILE_BANNER`]. A worker can call
-//! `line_index::prewarm_off_thread` to build a large index off the UI thread
-//! before switching to the output view; without a prewarm the first build
-//! pays the one-time index cost synchronously.
+//! virtualized view with [`LARGE_FILE_BANNER`].
+//!
+//! ## Monospace
+//!
+//! `mono()` is `Family::Mono`, i.e. the app's **mono slot**, not
+//! `Family::SystemMono`. `AppSpec::new` and `TextSystem::default()` both put
+//! `"Inter"` (proportional) behind that slot. `headless::APP_FONTS` /
+//! `headless::APP_FAMILIES` register IBM Plex Mono there for both the window
+//! (`AppSpec::fonts`/`families`) and headless (`Runtime::with_text`). See
+//! `NOTES-rp-view.md`. The line-number gutter is a fixed-width box with
+//! `Align::End`, so digits are right-aligned.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -53,7 +64,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use rune::{col, el, oklch, oklcha, row, text, tok, Color, El, GrowthSpec, Span, TextEdit, TextSelection};
+use rune::{col, el, oklch, oklcha, row, text, tok, Align, Color, El, GrowthSpec, Span, TextEdit, TextSelection};
 
 use crate::line_index::{self, Snapshot};
 use crate::state::AppState;
@@ -369,10 +380,15 @@ fn render_row(snapshot: &Snapshot, opts: &RowOpts, index: usize) -> El {
 
     let mut content = row().w_full().gap(12.0);
     if opts.line_numbers {
+        // Fixed-width box + Align::End right-aligns the digits. With a real
+        // monospaced face the `>width` padding is exact too; both together keep
+        // the gutter aligned even if a proportional fallback ever resolves.
         content = content.child(
             text(format!("{:>width$}", index + 1, width = opts.gutter_width))
                 .font(mono())
-                .color(theme.text_secondary),
+                .color(theme.text_secondary)
+                .w(opts.gutter_width as f32 * CHAR_WIDTH)
+                .align(Align::End),
         );
     }
 
