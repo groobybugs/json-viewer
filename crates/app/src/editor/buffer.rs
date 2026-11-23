@@ -635,6 +635,56 @@ mod tests {
     }
 
     #[test]
+    fn slice_bytes_at_mid_char_offsets_snaps_to_whole_chars() {
+        // Audit: slice_bytes maps both ends through byte_to_char, which
+        // floors mid-char offsets to the char start — never a panic, never
+        // a partial char.
+        let buf = Buffer::from_text("a🚀bé");
+        // a=0..1, 🚀=1..5, b=5..6, é=6..8.
+        assert_eq!(buf.slice_bytes(2..4), ""); // both ends inside the emoji
+        assert_eq!(buf.slice_bytes(0..2), "a"); // end floors to the emoji start
+        assert_eq!(buf.slice_bytes(1..5), "🚀"); // exact boundaries
+        assert_eq!(buf.slice_bytes(7..8), "é"); // start inside é floors to 6
+        assert_eq!(buf.slice_bytes(3..3), ""); // empty mid-char window
+    }
+
+    #[test]
+    fn line_byte_range_with_multibyte_and_crlf_stays_on_boundaries() {
+        // Audit: the line-break trim compares raw bytes; continuation bytes
+        // (>= 0x80) never equal \r or \n, so multibyte line ends are safe.
+        let buf = Buffer::from_text("a🚀\r\n中文\né\r");
+        assert_eq!(buf.line_byte_range(0), 0..5); // a + 🚀, CRLF stripped
+        assert_eq!(buf.line_byte_range(1), 7..13); // 中文 (2x3 bytes)
+        assert_eq!(buf.line_byte_range(2), 14..16); // é, lone \r stripped
+        for line in 0..buf.len_lines() {
+            let range = buf.line_byte_range(line);
+            for off in [range.start, range.end] {
+                assert_eq!(buf.char_to_byte(buf.byte_to_char(off)), off);
+            }
+        }
+    }
+
+    #[test]
+    fn edits_at_mid_char_offsets_floor_to_char_starts() {
+        // Audit: insert/delete/replace map through byte_to_char, so a
+        // mid-char offset edits at the char start instead of splitting it.
+        let mut buf = Buffer::from_text("a🚀b");
+        buf.insert(2, "X", EditKind::Typing, 2, 3); // inside the emoji → char start 1
+        assert_eq!(buf.to_string(), "aX🚀b");
+        // Now a=0, X=1, 🚀=2..6, b=6..7.
+        buf.delete(6..7, EditKind::Delete, 7, 6);
+        assert_eq!(buf.to_string(), "aX🚀");
+        // Undo/redo restore whole chars and boundary carets.
+        let mut buf = Buffer::from_text("中文");
+        buf.insert(3, "🚀", EditKind::Paste, 3, 7); // after 中 (byte 3 is a boundary)
+        assert_eq!(buf.to_string(), "中🚀文");
+        assert_eq!(buf.undo(), Some(3));
+        assert_eq!(buf.to_string(), "中文");
+        assert_eq!(buf.redo(), Some(7));
+        assert_eq!(buf.to_string(), "中🚀文");
+    }
+
+    #[test]
     fn hundred_mb_insert_at_middle_is_fast() {
         let chunk = "0123456789abcdef".repeat(64 * 1024); // 1 MiB
         let mut big = String::with_capacity(100 * 1024 * 1024 + 16);

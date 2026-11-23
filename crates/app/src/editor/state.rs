@@ -213,9 +213,11 @@ impl EditorState {
         (line, offset - self.buffer.line_to_byte(line))
     }
 
-    /// Places the caret; `extend` keeps/starts a selection.
+    /// Places the caret; `extend` keeps/starts a selection. The offset is
+    /// snapped to a char boundary: the view splits display text at the
+    /// caret byte, so a mid-char caret would panic the renderer.
     pub fn set_caret(&mut self, offset: usize, extend: bool) {
-        let offset = offset.min(self.buffer.len_bytes());
+        let offset = self.snap(offset);
         if extend {
             if self.anchor.is_none() {
                 self.anchor = Some(self.caret);
@@ -373,7 +375,10 @@ impl EditorState {
     pub fn move_caret(&mut self, mv: Move, extend: bool, page_rows: usize) {
         let len = self.buffer.len_bytes();
         let caret = self.caret.min(len);
-        let (line, col) = self.line_col(caret);
+        let (line, _) = self.line_col(caret);
+        // The goal column counts chars, not bytes: a byte goal drifts the
+        // visual column on every line below a multibyte character (L1).
+        let col = self.buffer.byte_to_char(caret) - self.buffer.line_to_char(line);
         let goal = self.goal_column.unwrap_or(col);
         let offset = match mv {
             Move::Left => {
@@ -463,6 +468,14 @@ impl EditorState {
         self.set_horizontal_window(columns);
     }
 
+    /// Floors a byte offset to the start of its UTF-8 character (clamped to
+    /// the buffer length). Scan windows and caret results go through this
+    /// so no slice or caret ever lands inside a multibyte character.
+    fn snap(&self, byte: usize) -> usize {
+        let byte = byte.min(self.buffer.len_bytes());
+        self.buffer.char_to_byte(self.buffer.byte_to_char(byte))
+    }
+
     /// Byte offset of char column `goal` on line `line`, clamped to the
     /// line's content length.
     fn column_offset(&self, line: usize, goal: usize) -> usize {
@@ -479,7 +492,7 @@ impl EditorState {
     pub(crate) fn word_range(&self, offset: usize) -> Range<usize> {
         const SCAN: usize = 4096;
         let len = self.buffer.len_bytes();
-        let offset = offset.min(len);
+        let offset = self.snap(offset);
         let (line, _) = self.line_col(offset);
         let line_range = self.buffer.line_byte_range(line);
         if offset >= line_range.end {
@@ -494,10 +507,16 @@ impl EditorState {
                 2
             }
         };
-        let at = self.buffer.slice_bytes(offset..(offset + 1).min(len));
-        let c = class(at.as_bytes()[0]);
-        let lo = line_range.start.max(offset.saturating_sub(SCAN));
-        let hi = line_range.end.min(offset + SCAN);
+        // Classify the whole character at the offset: a one-byte slice of a
+        // multibyte char boundary-maps to an empty string (C2). Every byte
+        // of a multibyte char is class 0, so the byte-wise run scan below
+        // still consumes whole characters and lands on boundaries.
+        let at = self.buffer.slice_bytes(offset..(offset + 4).min(len));
+        let c = class(at.as_bytes().first().copied().unwrap_or(b' '));
+        // Snap the scan-window edges: an unsnapped edge shifts `rel` and
+        // can return a mid-char range end (M4).
+        let lo = self.snap(line_range.start.max(offset.saturating_sub(SCAN)));
+        let hi = self.snap(line_range.end.min(offset + SCAN));
         let window = self.buffer.slice_bytes(lo..hi);
         let rel = offset - lo;
         let bytes = window.as_bytes();
@@ -518,11 +537,12 @@ impl EditorState {
     fn word_boundary(&self, offset: usize, forward: bool) -> usize {
         const SCAN: usize = 4096;
         let len = self.buffer.len_bytes();
+        let offset = self.snap(offset);
         if forward {
             if offset >= len {
                 return len;
             }
-            let hi = len.min(offset + SCAN);
+            let hi = self.snap(len.min(offset + SCAN));
             let window = self.buffer.slice_bytes(offset..hi);
             let bytes = window.as_bytes();
             let mut i = 0;
@@ -544,12 +564,12 @@ impl EditorState {
             while i < bytes.len() && is_space(bytes[i]) {
                 i += 1;
             }
-            offset + i
+            self.snap(offset + i)
         } else {
             if offset == 0 {
                 return 0;
             }
-            let lo = offset.saturating_sub(SCAN);
+            let lo = self.snap(offset.saturating_sub(SCAN));
             let window = self.buffer.slice_bytes(lo..offset);
             let bytes = window.as_bytes();
             let mut i = bytes.len();
@@ -567,7 +587,7 @@ impl EditorState {
                     i -= 1;
                 }
             }
-            lo + i
+            self.snap(lo + i)
         }
     }
 }
@@ -818,6 +838,112 @@ mod tests {
         state.caret = 10;
         state.set_horizontal_window(240);
         assert_eq!(state.first_column, 10);
+    }
+
+    #[test]
+    fn select_word_on_non_ascii_does_not_panic() {
+        // C2: double-clicking a multibyte character classified a one-byte
+        // slice, which boundary-maps to an empty string for 2+-byte chars.
+        let mut state = editor(r#"["🚀"]"#);
+        state.select_word(2); // first byte of the emoji
+        assert_eq!(state.selection(), Some(2..6));
+        let mut state = editor(r#"{"k":"café"}"#);
+        let off = state.buffer.to_string().find('é').unwrap();
+        state.select_word(off);
+        assert_eq!(state.selected_text().as_deref(), Some("café"));
+        let mut state = editor("中文 测试");
+        state.select_word(0);
+        assert_eq!(state.selected_text().as_deref(), Some("中文"));
+        // Combining mark: e + U+0301 + x are all word-class (the mark's
+        // bytes are >= 0x80), one run of 4 bytes; no mid-char split.
+        let mut state = editor("e\u{301}x");
+        state.select_word(0);
+        assert_eq!(state.selection(), Some(0..4));
+        state.select_word(1); // on the combining mark itself
+        assert_eq!(state.selection(), Some(0..4));
+    }
+
+    #[test]
+    fn word_motion_stays_on_char_boundaries_across_scan_edges() {
+        // M4: the 4096-byte scan window edge can fall inside a multibyte
+        // char; the unsnapped `lo + i` result was a mid-char caret offset.
+        let mut text = "a".repeat(4093);
+        text.push('🚀'); // bytes 4093..4097
+        text.push_str(&"b".repeat(5000));
+        let mut state = editor(&text);
+        let boundary = |state: &EditorState, off: usize| {
+            assert_eq!(
+                state.buffer.char_to_byte(state.buffer.byte_to_char(off)),
+                off,
+                "caret {off} is not a char boundary"
+            );
+        };
+        // WordLeft from 8190: lo = 4094 lands inside the emoji.
+        state.caret = 8190;
+        state.move_caret(Move::WordLeft, false, 10);
+        boundary(&state, state.caret);
+        // Sweep both directions over edges around the multibyte char.
+        for caret in [0, 1, 4090, 4093, 4097, 8189, 8190, 8191, 8192, 9097] {
+            state.caret = caret;
+            state.move_caret(Move::WordRight, false, 10);
+            boundary(&state, state.caret);
+            state.caret = caret;
+            state.move_caret(Move::WordLeft, false, 10);
+            boundary(&state, state.caret);
+        }
+        // Word selection near the scan edge stays on boundaries too.
+        state.caret = 8190;
+        let range = state.word_range(8190);
+        boundary(&state, range.start);
+        boundary(&state, range.end);
+    }
+
+    #[test]
+    fn vertical_goal_column_counts_chars_not_bytes() {
+        // L1: after "a🚀" the caret is at char column 2 (byte column 5);
+        // Down must land at char column 2 of the next line, not byte 5.
+        let mut state = editor("a🚀b\nabcde");
+        state.caret = 5; // after the emoji (a=1, 🚀=4)
+        state.move_caret(Move::Down, false, 10);
+        assert_eq!(state.caret, 7 + 2); // line 1 starts at byte 7 (a🚀b\n)
+        state.move_caret(Move::Up, false, 10);
+        assert_eq!(state.caret, 5); // goal column restored
+        // Page motion uses the same goal column.
+        state.move_caret(Move::PageDown, false, 1);
+        assert_eq!(state.caret, 7 + 2);
+    }
+
+    #[test]
+    fn set_caret_snaps_mid_char_offsets() {
+        // Audit: external caret placement (mouse math, runner reveals, IME)
+        // must never leave a mid-char caret; the view splits display text
+        // at the caret byte.
+        let mut state = editor("a🚀b");
+        state.set_caret(3, false); // inside the emoji
+        assert_eq!(state.caret, 1); // floored to the char start
+        state.set_caret(100, false); // past the end
+        assert_eq!(state.caret, 6);
+    }
+
+    #[test]
+    fn crlf_and_multibyte_neighbors_do_not_panic() {
+        // Audit: the CRLF lookarounds slice single bytes next to multibyte
+        // chars; boundary mapping must keep them safe and correct.
+        let mut state = editor("🚀\r\né");
+        state.caret = 6; // after \r\n (🚀=4, \r\n=2)
+        state.backspace(); // deletes the CRLF pair as one
+        assert_eq!(state.buffer.to_string(), "🚀é");
+        state.caret = 4;
+        state.delete_forward(); // deletes é (2 bytes), not a \r pair
+        assert_eq!(state.buffer.to_string(), "🚀");
+        state.caret = 4;
+        state.move_caret(Move::Left, false, 10);
+        assert_eq!(state.caret, 0); // one char back over the emoji
+        state.move_caret(Move::Right, false, 10);
+        assert_eq!(state.caret, 4);
+        // Lone \r after a multibyte char is still one line break.
+        let state = editor("🚀\ré");
+        assert_eq!(state.buffer.len_lines(), 2);
     }
 
     #[test]

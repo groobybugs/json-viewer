@@ -146,8 +146,14 @@ pub fn on_ime(state: &mut AppState, ime: &Ime, _tx: &mut Tx) -> bool {
         }
         Ime::Select(range) => {
             state::with(id, &tab.input, tab.input_revision, |ed| {
-                ed.anchor = Some(range.start);
-                ed.caret = range.end.min(ed.buffer.len_bytes());
+                // Snap to char boundaries: the view splits display text at
+                // these offsets, and an IME range may name bytes inside a
+                // multibyte character.
+                let len = ed.buffer.len_bytes();
+                let start = ed.buffer.byte_to_char(range.start.min(len));
+                let end = ed.buffer.byte_to_char(range.end.min(len));
+                ed.anchor = Some(ed.buffer.char_to_byte(start));
+                ed.caret = ed.buffer.char_to_byte(end);
             });
             true
         }

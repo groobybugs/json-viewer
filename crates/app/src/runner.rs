@@ -44,6 +44,10 @@ struct Inbox {
 thread_local! {
     static INBOX: RefCell<Option<Inbox>> = const { RefCell::new(None) };
     static JOBS: RefCell<HashMap<TabId, JobHandle>> = RefCell::new(HashMap::new());
+    /// Per-tab cancel flags for detached search walks (H3): a superseded
+    /// search stops early instead of walking a stale document to the end.
+    static SEARCH_CANCEL: RefCell<HashMap<TabId, Arc<AtomicBool>>> =
+        RefCell::new(HashMap::new());
     /// I/O jobs spawned on this UI thread that have not yet delivered a `Msg`.
     static IO_JOBS: Cell<usize> = const { Cell::new(0) };
     /// Key of a row to reveal on the next idle poll. The view for the
@@ -99,13 +103,17 @@ fn io_pending() -> bool {
     IO_JOBS.with(|jobs| jobs.get() > 0)
 }
 
-fn spawn_read(path: std::path::PathBuf) {
+/// Reads a file for the tab that requested it (M3): the destination is
+/// captured at request time, so switching tabs while a large read is in
+/// flight cannot redirect the content into the newly active tab.
+fn spawn_read(path: std::path::PathBuf, tab: TabId) {
     track_io_job();
     let tx = io_sender();
     let reported = path.clone();
     io::spawn_read_json(path, move |result| {
         let msg = match result {
-            Ok(content) => Msg::FileLoaded {
+            Ok(content) => Msg::FileLoadedFor {
+                tab,
                 path: reported,
                 content,
             },
@@ -140,14 +148,19 @@ fn queue_arboard_copy(text: String) {
     });
 }
 
-fn on_open_picked(state: &mut AppState, result: rune::FileDialogResult, tx: &mut Tx) {
+fn on_open_picked(
+    state: &mut AppState,
+    result: rune::FileDialogResult,
+    tx: &mut Tx,
+    tab: TabId,
+) {
     match result {
         Ok(Some(path)) => {
             state.dispatch(Msg::Status(format!(
                 "Reading {}...",
                 io::display_name(&path)
             )));
-            spawn_read(path);
+            spawn_read(path, tab);
             tx.wake_after(Duration::from_millis(16));
         }
         Ok(None) => {}
@@ -671,7 +684,9 @@ pub fn poll(state: &mut AppState, _clock: f64, tx: &mut Tx) -> bool {
         messages.extend(io_done);
         for message in messages {
             let opened = match &message {
-                Msg::FileLoaded { path, .. } => Some(io::display_name(path)),
+                Msg::FileLoaded { path, .. } | Msg::FileLoadedFor { path, .. } => {
+                    Some(io::display_name(path))
+                }
                 _ => None,
             };
             let effects = state.update(message);
@@ -799,7 +814,7 @@ fn reveal_editor_line(state: &mut AppState, tx: &mut Tx, id: u64, line: Option<u
 pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
-            Effect::SpawnJson { tab, input, action } => {
+            Effect::SpawnJson { tab, input, action, input_revision } => {
                 let tx = sender();
                 let revision = crate::line_index::next_revision();
                 let handle = json_ops::spawn_process(input, action, move |result| {
@@ -811,6 +826,7 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     let _ = tx.send(Msg::JsonDone {
                         tab,
                         revision,
+                        input_revision,
                         result,
                     });
                 });
@@ -843,19 +859,38 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     jobs.insert(tab, handle);
                 });
             }
-            Effect::Search { tab, input, query } => {
+            Effect::Search { tab, input, query, input_revision } => {
                 let tx = sender();
+                // H3: cancel the tab's previous walk; its late result would
+                // be dropped by the reducer's revision/query gate anyway.
+                let cancel = Arc::new(AtomicBool::new(false));
+                SEARCH_CANCEL.with(|flags| {
+                    if let Some(previous) = flags.borrow_mut().insert(tab, Arc::clone(&cancel)) {
+                        previous.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                let worker_cancel = Arc::clone(&cancel);
+                let searched_query = query.clone();
                 std::thread::Builder::new()
                     .name("json-viewer-search".into())
                     .spawn(move || {
-                        let cancel = AtomicBool::new(false);
                         let hits = search::search(
                             &input,
                             &query,
                             search::SearchOptions::default(),
-                            &cancel,
+                            &worker_cancel,
                         );
-                        let _ = tx.send(Msg::SearchDone { tab, hits });
+                        if worker_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            // Superseded: the newer walk owns the results;
+                            // partial hits from this one must not land.
+                            return;
+                        }
+                        let _ = tx.send(Msg::SearchDoneFor {
+                            tab,
+                            input_revision,
+                            query: searched_query,
+                            hits,
+                        });
                     })
                     .expect("spawn search worker thread");
             }
@@ -879,10 +914,13 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                 });
             }
             Effect::Open => {
+                // M3: capture the requesting tab now; the dialog may stay
+                // open (and the read run) while the user switches tabs.
+                let tab = state.active;
                 tx.open_file(
                     io::open_dialog_options(),
-                    |state: &mut AppState, result, tx| {
-                        on_open_picked(state, result, tx);
+                    move |state: &mut AppState, result, tx| {
+                        on_open_picked(state, result, tx, tab);
                     },
                 );
             }
@@ -891,7 +929,10 @@ pub fn execute(state: &mut AppState, tx: &mut Tx, effects: Vec<Effect>) {
                     "Reading {}...",
                     io::display_name(&path)
                 )));
-                spawn_read(path);
+                // M3: the drop was requested on the currently active tab;
+                // effects run immediately after the reducer that emitted
+                // them, before any later tab switch is applied.
+                spawn_read(path, state.active);
             }
             Effect::MaterializeRope { tab, input, job } => {
                 // O(1) snapshot in, String out on a worker thread: the UI
