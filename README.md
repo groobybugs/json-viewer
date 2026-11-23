@@ -1,96 +1,82 @@
-# Modern JSON Viewer
+# JSON Viewer
 
-A clean and modern desktop application for viewing, formatting, and manipulating JSON data. Built with Electron, React, and TypeScript.
-
-![App Screenshot](docs/img.png)
+A native desktop app for viewing, formatting, and searching JSON, built in Rust
+with [Rune](https://github.com/anomalyco/rune), a GPU-rendered UI framework.
+Ported from the original Electron + React app; dark theme by default.
 
 ## Features
 
-- 🎨 Clean, modern interface
-- 📝 Multiple tabs support
-- 🔄 Format and minify JSON
-- 📋 Copy formatted JSON to clipboard
-- 🌙 Dark mode by default
-- 💻 Cross-platform (Windows, macOS, Linux)
+- Multiple document tabs, persisted across restarts
+- Format (pretty-print) and minify JSON on background worker threads
+- Full-text search with a results panel; hits jump to lines in the formatted document
+- Open files via dialog or drag-and-drop, export to file, copy to clipboard
+- Virtualized read-only view: only visible lines are built, so large documents stay responsive
+- Cross-platform: Linux, macOS, Windows
 
-## Development
+## Requirements
 
-### Prerequisites
+- **Rust 1.99.1** — pinned by `rust-toolchain.toml`; rustup installs/selects it automatically.
+- **Linux build dependencies** — Rune links `libxkbcommon` and `libwayland-client`:
+  - Debian/Ubuntu: `sudo apt-get install libxkbcommon-dev libwayland-dev`
+  - Fedora: `sudo dnf install libxkbcommon-devel wayland-devel`
+  - Arch: `sudo pacman -S libxkbcommon wayland`
+- **Linux runtime (windowed)** — the XKB X11 library:
+  `libxkbcommon-x11-0` (Debian/Ubuntu), `libxkbcommon-x11` (Fedora/Arch).
+  Without it the window panics at startup with `Library libxkbcommon-x11.so could not be loaded`.
+- **Vulkan driver** — rendering uses wgpu/Vulkan. Without a physical GPU, install a
+  software driver (lavapipe): `mesa-vulkan-drivers` (Debian/Ubuntu, Fedora) or
+  `vulkan-swrast` (Arch), then run with
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+- File dialogs use `xdg-desktop-portal` over D-Bus (no GTK required).
+- Headless rendering needs no display server, only a working Vulkan backend.
+- macOS and Windows need no extra system packages.
 
-- Node.js (v18 or higher)
-- npm (v9 or higher)
+## Build and run
 
-### Installation
-
-1. Clone the repository
-```bash
-git clone https://github.com/groobybugs/json-viewer.git
-cd json-viewer
+```sh
+cargo run --release -p json-viewer
 ```
 
-2. Install dependencies
-```bash
-npm install
+The first build compiles the full Rune dependency tree and takes a while;
+incremental builds are fast. For a debug build: `cargo run -p json-viewer`.
+
+## Headless snapshots
+
+Render offscreen to a PNG and dump the element tree (debug builds; release
+builds need Rune's `tooling` feature for `--snap`/`--tree`):
+
+```sh
+cargo run -p json-viewer -- --snap target/headless/app.png --tree target/headless/tree.json
 ```
 
-3. Start the development server
-```bash
-npm run electron:dev
+The crate's own headless mode (works in debug and release):
+
+```sh
+cargo run -p json-viewer -- --headless target/headless
+# -> target/headless/placeholder.png and placeholder-tree.json
 ```
 
-### Building
+## Tests
 
-To create a production build for your current platform:
-
-```bash
-npm run electron:build
+```sh
+cargo test                              # unit + integration tests
+cargo test -p json-viewer --test smoke  # headless PNG smoke test
+cargo clippy --all-targets
 ```
 
-The built application will be available in the `release` directory.
+The smoke test writes `target/headless/smoke.png` and `smoke-tree.json` and
+asserts the rendered tree contains the app header.
 
-## Project Structure
+## Wayland
 
-```
-json-viewer/
-├── src/                   # Source code
-│   ├── components/        # UI components
-│   └── lib/              # Utilities and helpers
-├── electron/              # Electron main process
-└── dist/                  # Built files
-```
+File drag-and-drop is not available on Wayland (winit 0.30 reports no file
+drags); use the Open button instead. See Wayland section.
 
-## Technology Stack
+## Project layout
 
-- [Electron](https://www.electronjs.org/) - Cross-platform desktop framework
-- [React](https://reactjs.org/) - UI framework
-- [TypeScript](https://www.typescriptlang.org/) - Type safety
-- [Vite](https://vitejs.dev/) - Build tool
-- [Tailwind CSS](https://tailwindcss.com/) - Styling
-- [Radix UI](https://www.radix-ui.com/) - UI primitives
-- [Lucide Icons](https://lucide.dev/) - Icons
-
-## Scripts
-
-- `npm run electron:dev` - Start the development server
-- `npm run electron:build` - Create a production build
-- `npm run lint` - Run ESLint
-- `npm run build` - Build the application without packaging
-- `npm run preview` - Preview the built application
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+- `crates/app/` — the Rust application (model, workers, persistence, UI, headless helpers)
+- `AGENTS.md` — architecture, data-flow rules, and Rune notes for contributors
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Design inspired by modern development tools
-- Built using [electron-vite](https://github.com/electron-vite/electron-vite)
-- Icons from [Lucide](https://lucide.dev/)
+MIT — see [LICENSE](LICENSE).
