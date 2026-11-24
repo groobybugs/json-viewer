@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "JSON Viewer ported from Electron + React to Rust + Rune"
+default-run = "json-viewer"
 
 [dependencies]
 # Pinned dev revision of Rune. Every Rune crate must come from this same git source.
