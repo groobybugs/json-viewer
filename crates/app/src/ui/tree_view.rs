@@ -77,7 +77,7 @@ pub fn tree_body(state: &AppState, tab: TabId) -> El {
         .fill(PANEL_BG)
         .child(tree_toolbar(state, tab, tree).sticky_top(0.0))
         .child(tree_list(state, tab, tree))
-        .child(tree_footer(tab, tree).sticky_bottom(0.0))
+        .child(tree_footer(state, tab, tree).sticky_bottom(0.0))
 }
 
 /// Expand all / Collapse all / Sort A→Z / filter box / status, pinned.
@@ -396,9 +396,10 @@ fn render_row(s: &AppState, tab: TabId, i: usize) -> El {
 }
 
 /// Selected node's path plus Copy path / Copy value, pinned to the bottom.
-fn tree_footer(tab: TabId, tree: Option<&TreeUi>) -> El {
+fn tree_footer(state: &AppState, tab: TabId, tree: Option<&TreeUi>) -> El {
     let kit = kit();
     let selection = tree.and_then(|t| t.selected.as_ref());
+    let editable = selection.is_some_and(|s| !s.is_container);
     let path_el = match selection {
         Some(selection) => text(selection.path.clone())
             .font(mono())
@@ -423,20 +424,60 @@ fn tree_footer(tab: TabId, tree: Option<&TreeUi>) -> El {
         .on_press(|state: &mut AppState| state.dispatch(Msg::TreeCopyValue))
         .build(&kit)
         .key("tree-copy-value");
-    row()
-        .key(format!("tree-footer-{tab}"))
+    let path_row = row()
         .w_full()
         .h(32.0)
         .px(12.0)
         .gap(10.0)
         .center_y()
-        .fill(WINDOW_BG)
-        .border_sides([0.0, 1.0, 0.0, 0.0], BORDER)
         .child(text("Path").font(tok::type_::LABEL).color(MUTED))
         .child(path_el)
         .child(spacer())
         .child(copy_path)
-        .child(copy_value)
+        .child(copy_value);
+    let mut footer = col()
+        .key(format!("tree-footer-{tab}"))
+        .w_full()
+        .fill(WINDOW_BG)
+        .border_sides([0.0, 1.0, 0.0, 0.0], BORDER)
+        .child(path_row);
+    if editable {
+        // Edit the selected scalar as raw JSON ("text", 42, true, null).
+        // Return or Apply writes it into the document as one undo step.
+        let field = rune::text_input(&state.tree_value_edit, tok::type_::BODY)
+            .key("tree-value")
+            .label("Edit value")
+            .single_line()
+            .font(mono())
+            .min_w(140.0)
+            .grow(1.0)
+            .fill(EDITOR_BG)
+            .color(TEXT)
+            .caret(ACCENT, ACCENT)
+            .on_edit(|state: &mut AppState| &mut state.tree_value_edit)
+            .on_submit(move |state: &mut AppState, _tx| {
+                state.dispatch(Msg::TreeEditValue { tab });
+            })
+            .on_input_key(super::handle_shortcut);
+        let apply = Button::new("Apply")
+            .variant(ButtonVariant::Contrast)
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut AppState| state.dispatch(Msg::TreeEditValue { tab }))
+            .build(&kit)
+            .key("tree-apply-value");
+        footer = footer.child(
+            row()
+                .w_full()
+                .h(36.0)
+                .px(12.0)
+                .gap(10.0)
+                .center_y()
+                .child(text("Value").font(tok::type_::LABEL).color(MUTED))
+                .child(field)
+                .child(apply),
+        );
+    }
+    footer
 }
 
 /// Centered stand-in while building, or for hints.

@@ -16,7 +16,7 @@ pub mod validation_panel;
 use rune::{col, Color, Cx, El, KeyEvent, Tx};
 use rune_kit::{Kit, PaletteSeed};
 
-use crate::state::{AppState, Msg, TabView};
+use crate::state::{AppState, Msg};
 use text_view::{apply_fold_action, FoldAction};
 
 /// Window title, also asserted by the headless smoke test.
@@ -125,7 +125,7 @@ pub fn view(state: &AppState, cx: &mut Cx<AppState>) -> El {
         // and tree-filter fields take their own pastes when focused).
         .on_paste(|state: &mut AppState, text: &str, _tx: &mut Tx| {
             let id = state.active;
-            let input_view = state.tab(id).is_some_and(|t| t.view == TabView::Input)
+            let input_view = state.tab(id).is_some()
                 && !state.tree.get(&id).is_some_and(|tree| tree.open);
             if input_view && !text.is_empty() {
                 state.dispatch(Msg::EditorPaste {

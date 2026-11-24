@@ -870,10 +870,9 @@ fn parse_editor_row_key(key: &str) -> Option<(u64, usize)> {
 /// (minimal scroll; nothing when it already is). Returns whether it moved.
 fn reveal_editor_caret(state: &mut AppState, tx: &mut Tx) -> bool {
     let id = state.active;
-    let input_view = state
-        .tab(id)
-        .is_some_and(|tab| tab.view == crate::state::TabView::Input);
-    if !input_view {
+    let text_view = state.tab(id).is_some()
+        && !state.tree.get(&id).is_some_and(|tree| tree.open);
+    if !text_view {
         return false;
     }
     let Some((line, scroll_y, viewport_h)) = crate::editor::state::take_reveal(id) else {

@@ -135,6 +135,8 @@ pub struct AppState {
     pub search_edit: TextEdit,
     /// Rune text field backing the tree filter box.
     pub tree_filter_edit: TextEdit,
+    /// Rune text field holding the selected tree value's raw JSON for editing.
+    pub tree_value_edit: TextEdit,
     /// Per-tab tree explorer state (see `tree_index::TreeUi`). A tab is in
     /// tree mode when its entry exists and `open` is set; the entry, index
     /// and rows are runtime-only and never persisted with `Tab`.
@@ -168,6 +170,7 @@ impl Default for AppState {
             editors: HashMap::new(),
             search_edit: TextEdit::default(),
             tree_filter_edit: TextEdit::default(),
+            tree_value_edit: TextEdit::default(),
             tree: HashMap::new(),
             pending: Vec::new(),
             fold_epoch: 0,
@@ -668,6 +671,10 @@ impl AppState {
                     tree.save_filter_base();
                     self.start_tree_job(id, TreeJob::Filter(filter));
                 }
+                let pending = self.tree.get_mut(&id).and_then(|tree| tree.pending_reveal.take());
+                if let Some(path) = pending {
+                    self.tree_reveal_path(id, &path);
+                }
             }
             IndexOutcome::Failed(error) => {
                 tree.error = Some(error.to_string());
@@ -705,6 +712,69 @@ impl AppState {
         if let Some(tree) = self.tree.get_mut(&id) {
             tree.select(&index, input, node);
         }
+        self.sync_tree_value_field(id);
+    }
+
+    /// Shows the selected scalar's raw JSON in the tree value field (empty
+    /// for containers or no selection).
+    fn sync_tree_value_field(&mut self, id: TabId) {
+        let text = self
+            .tree
+            .get(&id)
+            .and_then(|tree| tree.selected.as_ref())
+            .filter(|selection| !selection.is_container)
+            .and_then(|selection| {
+                let start = selection.value_off as usize;
+                let end = start + selection.value_len as usize;
+                self.tab(id)?.input.get(start..end).map(str::to_owned)
+            })
+            .unwrap_or_default();
+        if self.tree_value_edit.text != text {
+            self.tree_value_edit.replace_text(text);
+        }
+    }
+
+    /// Writes `tree_value_edit` over the selected scalar in the document as
+    /// one undo step (Ctrl+Z in Input/Output restores it). The text must be
+    /// one JSON value; the tree rebuilds and re-selects the edited path.
+    fn tree_edit_value(&mut self, id: TabId) {
+        let new_text = self.tree_value_edit.text.trim().to_owned();
+        let selection = self.tree.get(&id).and_then(|tree| tree.selected.clone());
+        let fresh = self.tree.get(&id).is_some_and(|tree| {
+            tree.index_revision == self.tab(id).map_or(0, |tab| tab.input_revision)
+        });
+        let Some(selection) = selection.filter(|s| fresh && !s.is_container) else {
+            self.status = Some("Select a value to edit".into());
+            return;
+        };
+        if let Err(error) = tree_index::TreeIndex::build(&new_text) {
+            self.status = Some(format!("Invalid JSON value: {}", error.message));
+            return;
+        }
+        let start = selection.value_off as usize;
+        let end = start + selection.value_len as usize;
+        let Some(old) = self.tab(id).and_then(|tab| tab.input.get(start..end)) else {
+            self.status = Some("Value no longer available".into());
+            return;
+        };
+        if old == new_text {
+            return;
+        }
+        use crate::editor::state::EditorAction;
+        if let Some(tree) = self.tree.get_mut(&id) {
+            tree.pending_reveal = Some(selection.path.clone());
+        }
+        self.apply_editor_action(id, EditorAction::SetCaret(start, false));
+        self.apply_editor_action(id, EditorAction::SetCaret(end, true));
+        self.apply_editor_action(
+            id,
+            EditorAction::Insert(new_text, crate::editor::EditKind::Paste),
+        );
+        self.materialize_input(id);
+        // A synchronous rebuild already ran inside the edit; make sure the
+        // index exists for the new revision either way.
+        self.ensure_tree_index(id);
+        self.status = Some(format!("Updated {}", selection.path));
     }
 
     /// Starts an off-thread rows job (expand-all on a big doc, sort rebuild,
@@ -962,11 +1032,9 @@ impl AppState {
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
                 };
-                let text = if tab.output.is_empty() {
-                    tab.input.clone()
-                } else {
-                    tab.output.clone()
-                };
+                // Input and Output both show the live document (Format and
+                // Minify rewrite it in place), so copy what the user sees.
+                let text = tab.input.clone();
                 if text.is_empty() {
                     self.status = Some("Nothing to copy".into());
                     Vec::new()
@@ -979,11 +1047,7 @@ impl AppState {
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
                 };
-                let content = if tab.output.is_empty() {
-                    tab.input.clone()
-                } else {
-                    tab.output.clone()
-                };
+                let content = tab.input.clone();
                 if content.is_empty() {
                     self.status = Some("Nothing to export".into());
                     return Vec::new();
@@ -1133,6 +1197,11 @@ impl AppState {
                         tree.select(&index, input, node);
                     }
                 }
+                self.sync_tree_value_field(tab);
+                Vec::new()
+            }
+            Msg::TreeEditValue { tab } => {
+                self.tree_edit_value(tab);
                 Vec::new()
             }
             Msg::TreeRevealPath { tab, path } => {
@@ -1511,6 +1580,9 @@ pub enum Msg {
     TreeCopyPath,
     /// Copy the selected node's value (its whole subtree for containers).
     TreeCopyValue,
+    /// Replace the selected scalar's value with `tree_value_edit`'s text
+    /// (one undo step in the document editor).
+    TreeEditValue { tab: TabId },
     /// A tree index build finished (revision-gated).
     TreeIndexDone {
         tab: TabId,
@@ -2207,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn export_uses_output_then_input() {
+    fn export_uses_the_live_document() {
         let mut state = AppState::default();
         let id = state.active;
         state.update_input(id, "in".into());
@@ -2217,9 +2289,10 @@ mod tests {
             [Effect::Export { default_name, content }]
                 if default_name == "JSON-1.json" && content == "in"
         ));
+        // A stale Output (edited after Format) must not win over the document.
         state.tab_mut(id).unwrap().output = "out".into();
         let effects = state.update(Msg::Export);
-        assert!(matches!(effects.as_slice(), [Effect::Export { content, .. }] if content == "out"));
+        assert!(matches!(effects.as_slice(), [Effect::Export { content, .. }] if content == "in"));
     }
 
     #[test]
@@ -2262,6 +2335,52 @@ mod tests {
         assert!(tree.is_ready(), "sync path built the index inline");
         assert_eq!(tree.rows.len(), 3); // root + 2 members
         (state, id)
+    }
+
+    #[test]
+    fn tree_edit_value_rewrites_the_document_and_undo_restores_it() {
+        let (mut state, id) = tree_ready_state();
+        let path = "scripts → name";
+        state.update(Msg::TreeRevealPath { tab: id, path: path.into() });
+        assert_eq!(state.tree_value_edit.text, r#""simple-json-viewer""#);
+
+        state.tree_value_edit.replace_text(r#""renamed""#);
+        state.update(Msg::TreeEditValue { tab: id });
+        state.materialize_input(id);
+        let expected = r#"{"scripts":{"name":"renamed","items":[12,"x"]},"n":-4.5}"#;
+        assert_eq!(state.tab(id).unwrap().input, expected);
+        // The rebuilt tree re-selects the edited path.
+        let tree = &state.tree[&id];
+        assert_eq!(tree.index_revision, state.tab(id).unwrap().input_revision);
+        assert_eq!(tree.selected.as_ref().map(|s| s.path.as_str()), Some(path));
+        assert_eq!(state.tree_value_edit.text, r#""renamed""#);
+
+        // One undo step in the document editor restores the old value.
+        state.update(Msg::EditorEdit {
+            tab: id,
+            action: crate::editor::state::EditorAction::Undo,
+        });
+        state.materialize_input(id);
+        assert_eq!(state.tab(id).unwrap().input, TREE_DOC);
+    }
+
+    #[test]
+    fn tree_edit_value_rejects_invalid_json_and_containers() {
+        let (mut state, id) = tree_ready_state();
+        state.update(Msg::TreeRevealPath { tab: id, path: "n".into() });
+        state.tree_value_edit.replace_text("not json");
+        state.update(Msg::TreeEditValue { tab: id });
+        state.materialize_input(id);
+        assert_eq!(state.tab(id).unwrap().input, TREE_DOC);
+        assert!(state.status.as_deref().unwrap_or("").starts_with("Invalid JSON value"));
+
+        state.update(Msg::TreeRevealPath { tab: id, path: "scripts".into() });
+        assert_eq!(state.tree_value_edit.text, "");
+        state.tree_value_edit.replace_text("1");
+        state.update(Msg::TreeEditValue { tab: id });
+        state.materialize_input(id);
+        assert_eq!(state.tab(id).unwrap().input, TREE_DOC);
+        assert_eq!(state.status.as_deref(), Some("Select a value to edit"));
     }
 
     #[test]

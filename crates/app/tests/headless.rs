@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use json_viewer::json_ops::{self, JsonAction};
 use json_viewer::search::{self, SearchOptions};
 use json_viewer::state::{AppState, Msg, TabView};
-use json_viewer::ui::text_view::TextView;
 use json_viewer::{headless, runner};
 use rune::render::{write_png, Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
 use rune::Runtime;
@@ -154,13 +153,22 @@ fn scripted_type_format_and_switch_to_output() {
     let tree = render_qa_png(&mut rt, "formatted-output");
     let tree_json = tree.to_string();
     assert!(
-        tree_json.contains("output-text"),
-        "expected output-text in tree"
+        tree_json.contains("editor-1-row-0"),
+        "expected the editable document in Output"
     );
     assert!(
         tree_json.contains("needle"),
         "expected formatted output content in tree"
     );
+
+    // Output is editable: click into the document, then paste.
+    click(&mut rt, "editor-1");
+    rt.paste("\"pasted\"");
+    pump_until(&mut rt, "output edit applied", |s| {
+        s.active_tab().is_some_and(|t| {
+            t.view == TabView::Output && t.input.contains("\"pasted\"") && t.input.contains("needle")
+        })
+    });
 }
 
 #[test]
@@ -323,11 +331,13 @@ fn scripted_large_single_line_format_from_open_and_paste() {
         let tree = render_qa_png(&mut rt, &format!("large-format-{label}"));
         let tree_json = tree.to_string();
         assert!(
-            tree_json.contains("output-text-row-0"),
+            tree_json.contains("editor-") && tree_json.contains("-row-"),
             "{label}: output view did not mount"
         );
+        // Output is the live editor; it reveals the caret, which keeps its
+        // relative place after Format, so any formatted row may be on screen.
         assert!(
-            tree_json.contains("model-00000"),
+            tree_json.contains("model-"),
             "{label}: formatted output content missing from the tree"
         );
     }
@@ -428,7 +438,7 @@ fn scripted_search_hit_scrolls_output_to_line() {
         s.active_tab().is_some_and(|t| t.view == TabView::Output)
     });
 
-    let row = TextView::row_key("output-text", line - 1);
+    let row = format!("editor-{tab}-row-{}", line - 1);
     let mut mounted = false;
     for _ in 0..30 {
         rt.update_if(|state, tx| runner::poll(state, 0.0, tx));

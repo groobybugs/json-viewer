@@ -1,11 +1,10 @@
 //! Document actions: validate, format, minify, copy, export, open, clear.
 
-use rune::{col, row, spacer, text, tok, Cx, El, Icon};
+use rune::{row, spacer, text, tok, Cx, El, Icon};
 use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 
 use super::{kit, BORDER, MUTED, TEXT, WINDOW_BG};
 use crate::state::{AppState, Msg, TabView};
-use crate::ui::text_view::{apply_fold_action, FoldAction};
 
 static VALIDATE_ICON: Icon = Icon {
     name: "json-viewer-validate",
@@ -41,7 +40,6 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let kit = kit();
     let tab = state.active_tab();
     let has_input = tab.is_some_and(|tab| !tab.input.trim().is_empty());
-    let has_output = tab.is_some_and(|tab| !tab.output.is_empty());
     let has_content = tab
         .is_some_and(|tab| !tab.input.is_empty() || !tab.output.is_empty() || tab.error.is_some());
     let processing = tab.is_some_and(|tab| tab.is_processing);
@@ -127,14 +125,14 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
     let copy = Button::new("Copy")
         .control_size(ControlSize::Regular)
         .icon(kit.glyph.copy)
-        .disabled(processing || !has_output)
+        .disabled(processing || !has_input)
         .on_press(|state: &mut AppState| state.dispatch(Msg::Copy))
         .build(&kit)
         .key("copy");
     let export = Button::new("Export")
         .control_size(ControlSize::Regular)
         .icon(&EXPORT_ICON)
-        .disabled(processing || !has_output)
+        .disabled(processing || !has_input)
         .on_press(|state: &mut AppState| state.dispatch(Msg::Export))
         .build(&kit)
         .key("export");
@@ -164,43 +162,6 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
         .child(export)
         .child(open)
         .child(clear);
-    // Folding controls for the formatted Output. They live in the document
-    // card header and act on the active tab's Output revision; see
-    // `text_view::apply_fold_action` and `fold_index`.
-    let foldable = has_output && !processing;
-    let fold_actions = row()
-        .gap(2.0)
-        .center_y()
-        .child(fold_button(
-            "Fold all",
-            "fold-all",
-            FoldAction::FoldAll,
-            foldable,
-        ))
-        .child(fold_button(
-            "Unfold all",
-            "unfold-all",
-            FoldAction::UnfoldAll,
-            foldable,
-        ))
-        .child(fold_button(
-            "L1",
-            "fold-level-1",
-            FoldAction::Level(1),
-            foldable,
-        ))
-        .child(fold_button(
-            "L2",
-            "fold-level-2",
-            FoldAction::Level(2),
-            foldable,
-        ))
-        .child(fold_button(
-            "L3",
-            "fold-level-3",
-            FoldAction::Level(3),
-            foldable,
-        ));
     let mut bar = row()
         .w_full()
         .h(52.0)
@@ -229,34 +190,5 @@ pub fn toolbar(state: &AppState, _cx: &mut Cx<AppState>) -> El {
                 ),
         );
     }
-    let bar = bar.child(spacer()).child(actions);
-    if !tree_open && tab.is_some_and(|tab| tab.view == TabView::Output) {
-        // A separate Output sub-bar keeps the seven actions and view switch
-        // within the window at narrow widths; Tree has its own sub-bar too.
-        col().w_full().child(bar).child(
-            row()
-                .key("fold-toolbar")
-                .w_full()
-                .h(38.0)
-                .px(12.0)
-                .center_y()
-                .border_sides([0.0, 0.0, 1.0, 0.0], BORDER)
-                .child(fold_actions),
-        )
-    } else {
-        bar
-    }
-}
-
-/// One small folding button. `action` runs against the active tab's Output;
-/// disabled while there is nothing to fold or a worker is running.
-fn fold_button(label: &str, key: &str, action: FoldAction, enabled: bool) -> El {
-    let kit = kit();
-    Button::new(label)
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Small)
-        .disabled(!enabled)
-        .on_press(move |state: &mut AppState| apply_fold_action(state, action))
-        .build(&kit)
-        .key(key)
+    bar.child(spacer()).child(actions)
 }

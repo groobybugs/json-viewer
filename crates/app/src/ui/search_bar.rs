@@ -5,7 +5,6 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 
 use super::{kit, ACCENT, BORDER, EDITOR_BG, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
-use crate::ui::text_view::TextView;
 
 /// Search box. Typing emits [`Msg::SearchChanged`]; the reducer decides when a
 /// search actually starts (two characters, matching the old debounce guard).
@@ -216,17 +215,18 @@ fn select_hit(state: &mut AppState, tx: &mut Tx, line: Option<usize>, path: Stri
         // has exactly one row, so its format-independent target is row zero
         // rather than a pretty-printed row key that can never mount.
         let line = if state.tab(state.active).is_some_and(|tab| {
-            !tab.output.is_empty() && !tab.output.contains('\n')
+            crate::editor::state::display_line_count(tab.id, &tab.input, tab.input_revision) <= 1
         }) {
             1
         } else {
             line
         };
-        let row = TextView::row_key("output-text", line.saturating_sub(1));
+        let id = state.active;
+        let row = crate::editor::view::row_key(&format!("editor-{id}"), line.saturating_sub(1));
         crate::runner::queue_reveal(row);
         state.dispatch(Msg::Status(format!("{path} · line {line}")));
     } else {
-        tx.scroll_into_view("output-text");
+        tx.scroll_into_view(format!("editor-{}", state.active));
         state.dispatch(Msg::Status(path));
     }
 }

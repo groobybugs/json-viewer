@@ -315,13 +315,6 @@ fn toolbar_groups_fit_wide_and_narrow_windows() {
         for key in ["input-view", "output-view", "tree-view"]
             .into_iter()
             .chain(actions)
-            .chain([
-                "fold-all",
-                "unfold-all",
-                "fold-level-1",
-                "fold-level-2",
-                "fold-level-3",
-            ])
         {
             let rect = &element(&tree, key)["rect"];
             let x = rect[0].as_f64().unwrap();
@@ -352,6 +345,8 @@ fn toolbar_groups_fit_wide_and_narrow_windows() {
             "{name}: view switch and actions overlap"
         );
         assert!(!has_element(&tree, "tree-toolbar"));
+        // Output is the editable document: no read-only fold sub-bar.
+        assert!(!has_element(&tree, "fold-toolbar"));
     }
 
     let input = render_at(document_state(), (1024.0, 700.0), "toolbar-input-1024");

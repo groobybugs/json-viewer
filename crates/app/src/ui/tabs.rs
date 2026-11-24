@@ -5,7 +5,6 @@ use rune_kit::{ControlSize, IconButton, IconButtonVariant};
 
 use super::{kit, ACCENT, BORDER, MUTED, PANEL_BG, TEXT};
 use crate::state::{AppState, Msg, TabView};
-use crate::ui::text_view::TextView;
 
 static ADD_ICON: rune::Icon = rune::Icon {
     name: "json-viewer-add-tab",
@@ -125,8 +124,8 @@ pub(crate) fn document_scroll_key(id: u64, view: TabView, tree_open: bool) -> St
         "tree"
     } else {
         match view {
-            TabView::Input => "input",
-            TabView::Output => "output",
+            // Input and Output are both the editable document: one viewport.
+            TabView::Input | TabView::Output => "input",
         }
     };
     format!("document-scroll-{id}-{view}")
@@ -144,20 +143,12 @@ pub fn tab_content(state: &AppState, cx: &mut Cx<AppState>) -> El {
         super::tree_view::tree_body(state, tab.id)
     } else {
         match tab.view {
-            TabView::Input => {
-                // The rope editor (rp-editor): editable at every size, no
-                // native TextEdit and no read-only size/long-line gates.
+            // The rope editor (rp-editor): editable at every size. Output is
+            // the same live document (Format/Minify rewrite it in place), so
+            // both views edit with undo/redo.
+            TabView::Input | TabView::Output => {
                 crate::editor::view::build(state, cx, tab, &format!("editor-{}", tab.id))
             }
-            TabView::Output => TextView::read_only(&tab.output)
-                .revision(tab.output_revision)
-                .line_numbers(true)
-                .visible_lines(200)
-                .highlight(&tab.search_query)
-                .build("output-text")
-                .w_full()
-                .grow(1.0)
-                .fill(PANEL_BG),
         }
     };
     let scroll_key = document_scroll_key(

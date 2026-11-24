@@ -40,7 +40,7 @@ crates/app/
       mod.rs                   fn view + composition
       shell.rs                 page frame, header, status line
       tabs.rs                  tab strip + active document
-      toolbar.rs               view switch, Validate/actions, Output fold controls
+      toolbar.rs               view switch, Validate/actions
       search_bar.rs            search field + results panel
       text_view.rs             TextView: editable or virtualized read-only
       tree_view.rs             tree explorer toolbar, rows and footer
@@ -261,11 +261,17 @@ and IME is weaker. `packaging/linux/json-viewer.desktop` launches with
 The Input view is a self-drawn, Zed-style editor over a `ropey` rope
 (`crates/app/src/editor/`), editable at **every** size — the 5 MiB
 `EDITABLE_LIMIT_BYTES` gate, the 128 KiB long-line gate and the read-only
-banners no longer apply to tab input. `ui/text_view.rs` is untouched: it
-remains the read-only Output component and its frozen `TextView::editable`
-legacy component (with its gates) still exists for its own tests
-(`tests/text_view.rs`, `tests/folding.rs`); the app simply never mounts it
-for input anymore.
+banners no longer apply to tab input.
+
+**Edit in every view (2026-11-24):** Output mounts the same rope editor as
+Input (one shared `document-scroll-{id}-input` viewport, one undo history);
+Format/Minify rewrite the document in place, so Output always shows the live
+document and Copy/Export use it. The Output fold sub-bar is gone. The Tree
+footer edits the selected scalar as raw JSON (`Msg::TreeEditValue`, one undo
+step in the editor; the rebuilt tree re-selects the path via
+`TreeUi::pending_reveal`). `ui/text_view.rs` (read-only TextView + folding)
+is no longer mounted by the app; it stays for its own tests
+(`tests/text_view.rs`, `tests/folding.rs`).
 
 ### Buffer and state
 

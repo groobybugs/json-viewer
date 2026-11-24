@@ -113,44 +113,36 @@ fn draw(rt: &mut Runtime<AppState>, name: &str) {
 }
 
 #[test]
-fn input_and_output_offsets_survive_view_and_tab_switches() {
+fn document_offsets_survive_view_and_tab_switches() {
+    // Input and Output show the same editable document, so they share one
+    // viewport per tab; each tab keeps its own offset.
     let (state, first, second) = state_with_two_tabs();
     let mut rt = headless::runtime(state, SIZE, 1.0);
 
-    let first_input_row = format!("editor-{first}-row-10");
-    let second_input_row = format!("editor-{second}-row-15");
+    let first_row = format!("editor-{first}-row-10");
+    let second_row = format!("editor-{second}-row-15");
     scroll(&mut rt, format!("document-scroll-{first}-input"), 160.0);
-    let first_input_y = row_y(&rt, &first_input_row);
+    let first_y = row_y(&rt, &first_row);
     draw(&mut rt, "first-input-scrolled");
 
     dispatch(&mut rt, Msg::SwitchView(TabView::Output));
-    scroll(&mut rt, format!("document-scroll-{first}-output"), 480.0);
-    let first_output_y = row_y(&rt, "output-text-row-30");
-    draw(&mut rt, "first-output-scrolled");
-
+    assert_restored(&rt, &first_row, first_y);
+    draw(&mut rt, "first-output-same-offset");
     dispatch(&mut rt, Msg::SwitchView(TabView::Input));
-    assert_restored(&rt, &first_input_row, first_input_y);
-    dispatch(&mut rt, Msg::SwitchView(TabView::Output));
-    assert_restored(&rt, "output-text-row-30", first_output_y);
+    assert_restored(&rt, &first_row, first_y);
 
     dispatch(&mut rt, Msg::SelectTab(second));
     scroll(&mut rt, format!("document-scroll-{second}-input"), 240.0);
-    let second_input_y = row_y(&rt, &second_input_row);
-    dispatch(&mut rt, Msg::SwitchView(TabView::Output));
-    scroll(&mut rt, format!("document-scroll-{second}-output"), 640.0);
-    let second_output_y = row_y(&rt, "output-text-row-40");
+    let second_y = row_y(&rt, &second_row);
 
     dispatch(&mut rt, Msg::SelectTab(first));
-    assert_restored(&rt, "output-text-row-30", first_output_y);
-    dispatch(&mut rt, Msg::SwitchView(TabView::Input));
-    assert_restored(&rt, &first_input_row, first_input_y);
+    assert_restored(&rt, &first_row, first_y);
     draw(&mut rt, "first-input-restored");
 
     dispatch(&mut rt, Msg::SelectTab(second));
-    assert_restored(&rt, "output-text-row-40", second_output_y);
-    dispatch(&mut rt, Msg::SwitchView(TabView::Input));
-    assert_restored(&rt, &second_input_row, second_input_y);
-    draw(&mut rt, "second-input-restored");
+    dispatch(&mut rt, Msg::SwitchView(TabView::Output));
+    assert_restored(&rt, &second_row, second_y);
+    draw(&mut rt, "second-restored");
 }
 
 #[test]

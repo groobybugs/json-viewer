@@ -13,7 +13,7 @@
 
 use rune::{Ime, Key, KeyEvent, Tx};
 
-use crate::state::{AppState, Msg, TabView};
+use crate::state::{AppState, Msg};
 
 use super::buffer::EditKind;
 use super::state::{self, EditorAction, Move};
@@ -24,7 +24,7 @@ pub fn handle(state: &mut AppState, event: &KeyEvent, tx: &mut Tx) -> bool {
     let Some(tab) = state.tab(id) else {
         return false;
     };
-    if tab.view != TabView::Input || state.tree.get(&id).is_some_and(|tree| tree.open) {
+    if state.tree.get(&id).is_some_and(|tree| tree.open) {
         return false;
     }
     let mods = event.mods;
@@ -121,7 +121,7 @@ pub fn on_ime(state: &mut AppState, ime: &Ime, _tx: &mut Tx) -> bool {
     let Some(tab) = state.tab(id) else {
         return false;
     };
-    if tab.view != TabView::Input || state.tree.get(&id).is_some_and(|tree| tree.open) {
+    if state.tree.get(&id).is_some_and(|tree| tree.open) {
         return false;
     }
     match ime {

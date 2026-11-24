@@ -455,7 +455,7 @@ fn tree_png_switches_with_code_view() {
     state.update(Msg::SwitchView(json_viewer::state::TabView::Output));
     assert!(!state.tree[&id].open);
     let code = render_png(state.clone(), "tree-code-output.png").to_string();
-    assert!(code.contains("output-text"), "code output view missing");
+    assert!(code.contains(&format!("editor-{id}")), "code output view missing");
     state.update(Msg::TreeOpen);
     assert!(state.tree[&id].open);
     let tree = render_png(state, "tree-after-switch-back.png").to_string();
@@ -732,4 +732,30 @@ fn tree_7mb_perf_evidence() {
     );
     let tree = draw(&mut rt, &gpu, &target_dir().join("tree-7mb-expanded.png"));
     assert!(tree.to_string().contains("tree-row-"));
+}
+
+/// Selecting a scalar shows the value editor in the footer; applying it
+/// rewrites the document and the tree re-selects the edited node.
+#[test]
+fn tree_value_editor_applies_to_the_document() {
+    let _guard = serial();
+    let mut state = tree_state(SMALL);
+    let id = state.active;
+    let before = render_png(state.clone(), "tree-value-none.png").to_string();
+    assert!(!before.contains("tree-apply-value"), "no editor without a scalar selection");
+
+    state.update(Msg::TreeRevealPath { tab: id, path: "scripts → build".into() });
+    assert_eq!(state.tree_value_edit.text, r#""cargo build""#);
+    let shown = render_png(state.clone(), "tree-value-editor.png").to_string();
+    assert!(shown.contains("tree-value"), "value field missing");
+    assert!(shown.contains("tree-apply-value"), "apply button missing");
+
+    state.tree_value_edit.replace_text(r#""cargo build --release""#);
+    state.update(Msg::TreeEditValue { tab: id });
+    state.materialize_input(id);
+    assert!(state.tabs[0].input.contains(r#""build": "cargo build --release""#));
+    let selected = state.tree[&id].selected.as_ref().map(|s| s.path.clone());
+    assert_eq!(selected.as_deref(), Some("scripts → build"));
+    let after = render_png(state, "tree-value-applied.png").to_string();
+    assert!(after.contains("cargo build --release"), "tree shows the new value");
 }

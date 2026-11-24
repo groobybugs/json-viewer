@@ -869,6 +869,9 @@ pub struct TreeUi {
     pub job_pending: bool,
     /// What the in-flight job is, for the status label.
     pub job_kind: &'static str,
+    /// Path to reveal and select once the next index is installed (set by a
+    /// tree value edit, whose rebuild resets the rows). Kept by `invalidate`.
+    pub pending_reveal: Option<String>,
 }
 
 impl TreeUi {
@@ -892,6 +895,7 @@ impl TreeUi {
             jobs_gen: 0,
             job_pending: false,
             job_kind: "",
+            pending_reveal: None,
         }
     }
 
