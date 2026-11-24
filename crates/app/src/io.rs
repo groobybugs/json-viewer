@@ -8,7 +8,7 @@
 //! [`spawn_write_file`] and [`spawn_clipboard_copy`].
 //!
 //! Window drops go through [`drop_zone`]. rp-shell wraps its root element with
-//! that function; see `NOTES-rp-io.md`. Wayland in winit 0.30 reports no file
+//! that function; see the Wayland section of `README.md`. Wayland in winit 0.30 reports no file
 //! drags, so the handlers only run on macOS, Windows, X11 and headless scripts.
 
 use std::cell::Cell;
@@ -348,7 +348,7 @@ fn drop_highlight(reject: bool) -> El {
 
 /// Makes `el` the window drop target.
 ///
-/// rp-shell calls this on the root element (see `NOTES-rp-io.md`). Accepted
+/// rp-shell calls this on the root element (see the Wayland section of `README.md`). Accepted
 /// files are `.json` only; the first one is queued as [`Msg::FileDropped`].
 /// Anything else sets a status line and does not start a read. A drag paints
 /// an absolute overlay (`drop-highlight`) without taking pointer events away

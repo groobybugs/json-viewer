@@ -12,7 +12,8 @@ Ported from the original Electron + React app; dark theme by default.
 - Format (pretty-print) and minify JSON on background worker threads, rewriting Input in place as one undo step
 - Full-text search with a results panel; hits jump to lines in the formatted document
 - Open files via dialog or drag-and-drop, export to file, copy to clipboard
-- Virtualized read-only view: only visible lines are built, so large documents stay responsive
+- Edit in every view: Input and Output share a rope editor (any file size, undo/redo); Tree edits values inline
+- Only visible lines are built, so large documents stay responsive
 - Cross-platform: Linux, macOS, Windows
 
 ## Requirements
