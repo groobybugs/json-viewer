@@ -618,3 +618,32 @@ fn app_switch_to_output_and_back_keeps_rope() {
     rt.frame(1.0 / 60.0);
     assert_eq!(buffer_text(&rt), "Z{\"a\":1}");
 }
+
+/// Caret moves and typing must not spring the text runs: the after-caret run
+/// is already at its final x on the frame right after the key (regression:
+/// glyphs slid/overlapped for ~12 frames on every edit).
+#[test]
+fn caret_moves_and_typing_do_not_animate_text() {
+    let state = doc_state(r#"{"id":"zai-org/glm-5.3-flash","name":"GLM"}"#.into());
+    let mut rt = app_runtime(state);
+    rt.settle_all();
+    rt.frame(0.0);
+    let after_x = |rt: &Runtime<AppState>| {
+        rt.elements()
+            .iter()
+            .find(|e| e.key.as_deref() == Some("editor-1-line-0-after"))
+            .map(|e| e.rect[0])
+            .expect("after-caret run mounted")
+    };
+    for key in [Key::Right, Key::Right, Key::Text("x".into()), Key::Right] {
+        press(&mut rt, key, Mods::default());
+        let mid = after_x(&rt);
+        rt.settle_all();
+        rt.frame(0.0);
+        let settled = after_x(&rt);
+        assert!(
+            (mid - settled).abs() < 0.01,
+            "after-caret text still moving: x={mid} one frame after the key, settles at {settled}"
+        );
+    }
+}

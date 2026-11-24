@@ -105,6 +105,9 @@ pub fn build(_state: &AppState, cx: &mut Cx<AppState>, tab: &Tab, base: &str) ->
         .focusable(true)
         // The inline caret already shows focus; do not draw a separate box ring.
         .no_focus_ring()
+        // Text must land at once: otherwise Rune springs the before/after-caret
+        // runs to their new x on every edit or caret move (glyphs slide/overlap).
+        .instant_changes()
         .ime_cursor()
         .on_key(super::keys::handle)
         .w_full()
